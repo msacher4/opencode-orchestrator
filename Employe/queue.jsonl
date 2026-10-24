@@ -1,0 +1,4 @@
+{"ts":"2026-10-21T13:55:00","action":"Après find_reddit_leads : livrer les DM brouillons à Marc (Telegram 👤) + ajouter les leads qualifiés dans prospection.xlsx","source":"planner-plan20"}
+{"ts":"2026-10-21T13:55:00","action":"Après reddit_reply_tracker : si réponse positive → relance DM ; si silence 24h → marquer relance dans le tableau","source":"planner-plan20"}
+{"ts":"2026-10-21T18:52:00","action":"Après find_x_leads (p-20261021-18) : livrer DM brouillons X à Marc (Telegram 👤, [BROUILLON — NON ENVOYÉ]) + ajouter les leads qualifiés dans prospection.xlsx via gsheet_append.py","source":"planner-plan30"}
+{"ts":"2026-10-21T18:52:00","action":"Après find_reddit_karma_posts (p-20261021-17) : livrer les 15+ idées de posts formatées à Marc (Telegram 👤, [BROUILLON — NON ENVOYÉ]) et alimenter la carte Inbox « Générer 15 idées de posts Reddit »","source":"planner-plan30"}

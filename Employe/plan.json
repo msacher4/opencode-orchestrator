@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "updatedAt": "2026-10-21T18:51:03",
+  "reason": "Milestones +Contacter-50-Leads-Manuel toujours en retard (DM X 0/20, Karma posts 2/10, deadline aujourd'hui) : je cale le 1er passage du skill posts karma (jamais fait, pending depuis le plan précédent) et un 2e scan X pour alimenter le DM X à 0/20 ; la chasse Reddit vient de tourner (18:39), pas de doublon.",
+  "tasks": [
+    {
+      "id": "p-20261021-17",
+      "kind": "skill",
+      "skill": "find_reddit_karma_posts",
+      "params": "Focus r/shopify + r/ecommerce, questions neutres et informatives (jamais de « why do you », jamais de politique), titres anti-ratio, formats et détection de doublons ; alimenter la carte Inbox « Générer 15 idées de posts Reddit » ; brouillons [BROUILLON — NON ENVOYÉ], Marc poste tout lui-même.",
+      "why": "Jamais exécuté et pending depuis le plan précédent (p-20261021-15) ; milestone Posts Karma Farming 2/10 en retard (échéance 2026-10-20) ; la note du Shift 14 a livré 15 idées, le skill doit les valider/formatées proprement.",
+      "priority": 88,
+      "status": "pending"
+    },
+    {
+      "id": "p-20261021-18",
+      "kind": "skill",
+      "skill": "find_x_leads",
+      "params": "Focus opérateurs Shopify/CRO avec pain concret (dépenses, conversion), fenêtre 48 h ; shortlist + DM brouillons prêts à copier-coller. Google Sheet « prospection » = source de vérité unique des leads : chaque nouveau prospect qualifié = une ligne ajoutée via mcp/opencode-employee/gsheet_append.py --rows '[...]' (colonnes par en-tête, dédup automatique, jamais les colonnes de Marc) ; leads.md ne liste plus les leads.",
+      "why": "Milestone DM X 0/20 = le plus en retard (échéance aujourd'hui) ; dernier scan X il y a 5 h (13:51) avec 0 DM envoyé ; il faut une shortlist fraîche pour que Marc puisse envoyer.",
+      "priority": 85,
+      "status": "pending"
+    }
+  ],
+  "questions": [],
+  "notes": "Bro, le scan Reddit vient de tourner et tes 3 DM d'hier sont suivis, donc je ne le relance pas. En attendant je cale les idées de posts karma (jamais faites) et un 2e scan X : c'est le DM X à 0/20 qui tire le milestone le plus en retard aujourd'hui."
+}

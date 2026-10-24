@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/media/marcs/Linux_Apps/Projets_AI/Opencodev2"
+
+export XDG_CONFIG_HOME="$BASE/config"
+export XDG_DATA_HOME="$BASE/data"
+export XDG_STATE_HOME="$BASE/state"
+export XDG_CACHE_HOME="$BASE/cache"
+export OPENCODE_DB="$BASE/data/opencode/opencode.db"
+
+# V2 is isolated from the v1 plugin configuration on purpose:
+# the project declares v1-format plugins in .opencode/opencode.json, which v2
+# cannot execute (different plugin API). Everything v2 needs from the project is
+# mirrored in $XDG_CONFIG_HOME/opencode (config, agents, commands, plugins).
+export OPENCODE_DISABLE_PROJECT_CONFIG=1
+
+cd "${OPENCODE_WORKDIR:-/media/marcs/Linux_Apps/Projets_AI}"
+
+case "${1:-}" in
+  "")
+    exec "$BASE/opencode" --standalone
+    ;;
+  run|mini)
+    exec "$BASE/opencode" "$1" --standalone "${@:2}"
+    ;;
+  *)
+    exec "$BASE/opencode" "$@"
+    ;;
+esac
