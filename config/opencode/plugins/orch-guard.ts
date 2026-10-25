@@ -1069,6 +1069,8 @@ const POOL = {
   // 0 = pas de cap par modèle (le fournisseur s'en charge).
   modelCap(model) {
     const m = String(model || "").toLowerCase()
+    // ornith1.5-9b tourne en llama.cpp avec --parallel 2 : 2 sessions async max.
+    if (m === "llama-local/ornith1.5-9b") return 2
     if (m === "llama-local/qwen-opus") return 2
     if (/^llama-local\//.test(m)) return 1
     if (/^llama-proxy\//.test(m)) return 1
@@ -1130,7 +1132,8 @@ const POOL = {
     if (mcap > 0) {
       const n = live.filter((s) => String(s.model || "").toLowerCase() === m.toLowerCase()).length
       if (n >= mcap) {
-        const hint = m.toLowerCase() === "llama-local/qwen-opus" ? "" : " — attends la libération ou choisis qwen-opus (2 slots)"
+        const twoSlots = m.toLowerCase() === "llama-local/qwen-opus" || m.toLowerCase() === "llama-local/ornith1.5-9b"
+        const hint = twoSlots ? "" : " — attends la libération ou choisis qwen-opus / ornith1.5-9b (2 slots chacun)"
         return { ok: false, why: "pool plein : " + m + " " + n + "/" + mcap + hint }
       }
     }
