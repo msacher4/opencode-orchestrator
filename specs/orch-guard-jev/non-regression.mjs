@@ -41,5 +41,11 @@ t("merger non-git bloqué", check("merger","shell",{command:"cat /tmp/x"}).block
 // vérifier que execAllowed existe et fonctionne
 t("execAllowed free", typeof G.check==="function");
 
+// 8. Veto dur : vecteurs d'exécution et arguments destructeurs (t16-veto-dur)
+t("awk system() bloqué → exécution de code", check("orchestrator","shell",{command:"awk 'BEGIN{system(\"touch /tmp/x\")}'"}).blocked.some(b => b.includes("exécution de code")));
+t("find -delete bloqué → argument destructeur", check("orchestrator","shell",{command:"find /tmp -name 'x' -delete"}).blocked.some(b => b.includes("argument destructeur")));
+t("sort -o bloqué", check("orchestrator","shell",{command:"sort -o /tmp/x /etc/hostname"}).blocked.some(b => b.includes("sort -o")));
+t("ls -la toujours autorisé", check("orchestrator","shell",{command:"ls -la"}).blocked.length===0);
+
 console.log("\nNON-REGRESSION:", pass, "pass", fail, "fail");
 process.exit(fail>0?1:0);

@@ -415,11 +415,11 @@ function tokenize(seg) {
     const ch = s[i]
     if (quote === "'") {
       if (ch === "'") quote = null
-      else cur += ch
+      else { cur += ch; has = true }
     } else if (quote === '"') {
       if (ch === '"') quote = null
-      else if (ch === "\\" && (s[i + 1] === '"' || s[i + 1] === "\\")) { cur += s[i + 1]; i++ }
-      else cur += ch
+      else if (ch === "\\" && (s[i + 1] === '"' || s[i + 1] === "\\")) { cur += s[i + 1]; i++; has = true }
+      else { cur += ch; has = true }
     } else if (ch === "'" || ch === '"') {
       quote = ch
     } else if (ch === "\\") {
@@ -639,6 +639,38 @@ export function mutating(cmd) {
   if (!c) return ""
   if (hasExecSub(c)) return "substitution exécutable"
   const tokens = tokenize(c)
+
+  // Veto dur : vecteurs d'exécution arbitraire (jamais consultables par le second avis)
+  const EXEC_VECTORS = [
+    /\bsystem\s*\(/i,
+    /\bexec(Sync)?\s*\(/i,
+    /\bpopen\s*\(/i,
+    /\bspawn(Sync)?\s*\(/i,
+    /\bchild_process\b/i,
+    /\bos\.system\b/i,
+    /\bRuntime\.getRuntime\b/i,
+  ]
+  for (const re of EXEC_VECTORS) {
+    if (re.test(c)) return "exécution de code"
+  }
+
+  // Veto dur : arguments destructeurs (find -delete/-exec, sort -o, xargs)
+  const DESTRUCTIVE_ARGS = new Set([
+    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+    "-fprint", "-fprintf", "-fls", "-output",
+  ])
+  for (const i in tokens) {
+    const t = tokens[i]
+    if (DESTRUCTIVE_ARGS.has(t)) return "argument destructeur"
+    if (t === "sort" && tokens[Number(i) + 1] === "-o") return "sort -o"
+    if (t === "xargs") return "xargs"
+  }
+
+  // Veto dur : awk ne doit jamais être considéré comme une simple lecture
+  // (il peut exécuter via system(), écrire via print >, lire des fichiers)
+  // → il n'est autorisé QUE sans appel de fonction système et sans redirection,
+  //   ce que les deux contrôles ci-dessus garantissent déjà.
+
   for (let i = 0; i < tokens.length; i++) {
     if (isWriteRedir(tokens, i)) return "redirection d'écriture"
   }

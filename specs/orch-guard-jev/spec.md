@@ -46,3 +46,26 @@ git -C Opencodev2 status --short | grep -v '^??' | wc -l
 
 `done` si le rapport existe, le commit est sur la branche, et aucun push n'a eu lieu
 (`git log origin/orch/guard-jev` doit échouer).
+
+## Veto dur sur les vecteurs d'exécution (2026-10-25)
+
+### Constat
+
+Deux failles ont été prouvées en test live (2026-10-25) :
+
+1. **`awk 'BEGIN{system("touch /tmp/x")}'`** — le modèle Typesafe a répondu "lecture" et le `touch` a tourné. `awk` n'est pas une commande de lecture simple : elle peut exécuter du code via `system()` et écrire via `print >`.
+
+2. **`find /tmp -name 'x' -delete`** — autorisée sans même consulter le modèle, l'argument `-delete` n'étant pas inspecté par `mutating()`.
+
+### Principe
+
+Un vecteur d'exécution ou de destruction ne doit JAMAIS pouvoir être autorisé, ni par le code déterministe, ni par un avis de modèle. Ces cas sont bloqués en amont par un veto dur dans `mutating()`, avant toute consultation du second avis Typesafe.
+
+### Motifs bloqués
+
+- `exécution de code` — `system(`, `exec(`, `popen(`, `spawn(`, `child_process`, `os.system`, `Runtime.getRuntime`
+- `argument destructeur` — `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fprint`, `-fprintf`, `-fls`, `-output`
+- `sort -o` — `sort` suivi de `-o`
+- `xargs` — toute présence du mot `xargs`
+
+Ces motifs sont retournés par `mutating()` et court-circuitent `jevSecondOpinion` : le déclencheur du second avis ne s'active que sur le motif "premier mot inconnu", qui ne correspond à aucun de ces veto.
