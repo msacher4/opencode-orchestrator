@@ -56,6 +56,8 @@ function execAllowed(model, nightActive) {
   // nvidia : tout le catalogue NIM est gratuit, aucun id ne porte « -free ».
   if (/^nvidia\//i.test(m)) return true
   if (/^cline-pass\//i.test(m)) return true
+  // opencode-go : provider qui fait tourner l'agent lui-même (ni « free » dans l'id, ni llama/nvidia).
+  if (/^opencode-go\//i.test(m)) return true
   // openrouter : seuls les modèles explicitement gratuits (:free / -free) passent.
   if (/^openrouter\//i.test(m)) return /:free|-free/i.test(m)
   return false
@@ -935,7 +937,7 @@ function normalizeManifest(txt) {
 export function parseSteps(txt) {
   const steps = []
   const seen = {}
-  for (const block of normalizeManifest(String(txt)).split(/^## /m).slice(1)) {
+  for (const block of normalizeManifest(String(txt)).split(/^#{2,3} /m).slice(1)) {
     const get = (re) => {
       const m = block.match(re)
       return m ? m[1].trim() : ""
@@ -1080,7 +1082,7 @@ const POOL = {
   providerCap(provider) {
     const p = String(provider || "").toLowerCase()
     if (p === "llama-local" || p === "llama-proxy") return 0
-    if (["opencode", "opencode-cloud", "cline-pass", "nvidia", "openrouter"].includes(p)) return 2
+    if (["opencode", "opencode-cloud", "opencode-go", "cline-pass", "nvidia", "openrouter"].includes(p)) return 2
     return 1
   },
   load() {
@@ -1208,6 +1210,10 @@ const POOL = {
           const step = parseSteps(txt).find((st) => st.id === s.step)
           if (step) {
             purge = !OPEN_STATUS.has(step.statut)
+            // Filet pour un spawn interrompu sans erreur exploitable : étape encore ouverte
+            // mais slot plus vieux que 1/3 du TTL (15 min) → libéré. Le TTL de 45 min reste
+            // le filet final. Aucune observabilité disque/API n'est disponible ici.
+            if (!purge && Date.now() - s.since > SLOT_TTL / 3) purge = true
           }
           // étape introuvable → on ne purge pas
         }
@@ -1681,20 +1687,30 @@ export default {
     // tool.execute.after sur subagent : si le runtime refuse/interrompt le spawn,
     // on libère le slot qu'il occupait (sinon bloqué 45 min par le TTL).
     await ctx.tool.hook("execute.after", async (input) => {
-      const tool = String((input && input.tool) || "")
-      if (!SPAWN_TOOL.test(tool)) return
-      const output = (input && input.output) || {}
-      const outText = String(output.title || output.output || output.metadata || "")
-      const failed = /error|fail|interrupt|refus|bloqué|exception/i.test(outText)
-      if (!failed) return
-      const sid = sessionId(input)
-      const args = (input && input.args) || {}
-      const manifest = manifestFor(sid)
-      const txt = manifest ? readText(manifest) : ""
-      const sub = String(args.agent || args.subagent || args.name || "").toLowerCase()
-      const step = txt ? openStepFor(txt, sub) : null
-      if (sid && step && manifest) {
-        POOL.removeSlot(sid, step.id, manifest)
+      // Ce hook ne doit JAMAIS lever : une exception ici casserait l'agent.
+      try {
+        const tool = String((input && input.tool) || "")
+        if (!SPAWN_TOOL.test(tool)) return
+        const output = (input && input.output) || {}
+        const outText = String(output.title || output.output || output.metadata || "")
+        // Détection défensive : le runtime peut throw (output vide) ou signaler l'échec
+        // dans error/status ; sinon motif élargi (modèle invalide, indisponible, introuvable).
+        const failed =
+          Boolean((input && input.error) || output.error) ||
+          (output && output.status === "error") ||
+          /error|fail|interrupt|refus|bloqu|exception|invalid model|model format|not found|unavailable|no such|introuvable/i.test(outText)
+        if (!failed) return
+        const sid = sessionId(input)
+        const args = (input && input.args) || {}
+        const manifest = manifestFor(sid)
+        const txt = manifest ? readText(manifest) : ""
+        const sub = String(args.agent || args.subagent || args.name || "").toLowerCase()
+        const step = txt ? openStepFor(txt, sub) : null
+        if (sid && step && manifest) {
+          POOL.removeSlot(sid, step.id, manifest)
+        }
+      } catch {
+        // jamais casser l'agent : la libération du slot est best-effort (TTL en filet)
       }
     })
   },
