@@ -13,6 +13,10 @@ Contexte déjà acquis (session du jour, manifest : `.opencode/orch/ses_e918bc6d
   par la session du jour — **précondition de la nuit : voir son statut dans le
   manifest du jour**. La nuit ne relance JAMAIS t2.
 
+## Seuil de confiance (révision 2026-10-25)
+
+Seuil de confiance abaissé de 0,90 à 0,75 sur décision de Marc ; probabilité du choix maintenue à 0,90. Justification : calibration mesurée de l'API Typesafe (confidence 0,80-0,84 sur un cas trivial de lecture), un seuil à 0,90 rendait le second avis structurellement inopérant ; fail-closed inchangé.
+
 ## Non-objectifs
 
 - Aucune modification des caps du pool, de la politique d'offre, des rôles.
