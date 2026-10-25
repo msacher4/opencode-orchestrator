@@ -1,0 +1,945 @@
+{
+  "candidates": 117,
+  "okCount": 0,
+  "httpErr": 117,
+  "timeout": 0,
+  "networkErr": 0,
+  "results": [
+    {
+      "cmd": "git diff --stat HEAD~1 HEAD 2>/dev/null || git show --stat HEAD | head -60; echo \"---\"; ls ~/.nvm 2>/dev/null; command -v node; node --version",
+      "agent": "reviewer",
+      "hash": "73109d282254",
+      "via": "http",
+      "status": 404,
+      "latency": 307
+    },
+    {
+      "cmd": "gh auth status 2>&1 | head -8; echo '---'; git config --get user.email; git config --get user.name; echo '---'; git ls-remote https://github.com/msacher4/opencode-orchestrator 2>&1 | head -5",
+      "agent": "orchestrator",
+      "hash": "9c354a2554f7",
+      "via": "http",
+      "status": 404,
+      "latency": 249
+    },
+    {
+      "cmd": "/media/marcs/Linux_Apps/Projets_AI/.opencode/skills/contact_telegram/scripts/send_telegram.sh --title \"Automated SEO — étape t2 close\" \"Ton moteur d'audit est mergé (main, commit a2c64ac) et opérationnel. 3 rapports réels prêts à coller en DM :\n• cuisineaddict.com (PrestaShop) — 76/100 : alts manquants 10/10, titles hors gabarit 10/10, JSON-LD Product incomplet, meta trop longues\n• ohmycream.com (Shopify) — 95/100 : 2 manques légers\n• lesateliersdart.fr (WooCommerce) — 78/100 : 4 manques\n\nRapports complets : Automated SEO/output/audits/*.md (verdict 1 ligne, score, manques hiérarchisés avec exemples d'URL — collables tels quels). Prochaine étape lancée : t3 pages core + images. Je te recontacte pour le domaine + le déploiement (paiement/publication = toi).\"",
+      "agent": "orchestrator",
+      "hash": "b19ab216878b",
+      "via": "http",
+      "status": 404,
+      "latency": 162
+    },
+    {
+      "cmd": "for p in index \"agents/enrichissement-catalogue\" \"agents/seo-multilingue\" audit; do f=\"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client/$p/index.html\"; echo \"=== $p ===\"; grep -o '<title>[^<]*</title>' \"$f\"; grep -o 'name=\"description\" content=\"[^\"]*\"' \"$f\" | head -1; grep -o 'rel=\"canonical\" href=\"[^\"]*\"' \"$f\"; grep -o 'property=\"og:image\" content=\"[^\"]*\"' \"$f\"; done",
+      "agent": "reviewer",
+      "hash": "22f24a0ba9b9",
+      "via": "http",
+      "status": 404,
+      "latency": 142
+    },
+    {
+      "cmd": "D=\"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client\"; for p in index.html audit/index.html agents/enrichissement-catalogue/index.html agents/seo-multilingue/index.html; do F=\"$D/$p\"; if [ -f \"$F\" ]; then echo \"=== $p ===\"; grep -o '<meta property=\"og:image\" content=\"[^\"]*\" />' \"$F\"; grep -o '<meta property=\"og:image:width\" content=\"[^\"]*\" />' \"$F\"; grep -o '<meta property=\"og:image:height\" content=\"[^\"]*\" />' \"$F\"; else echo \"=== $p : ABSENT ===\"; fi; done",
+      "agent": "reviewer",
+      "hash": "8390e1fac0ae",
+      "via": "http",
+      "status": 404,
+      "latency": 156
+    },
+    {
+      "cmd": "ss -ltnp 2>/dev/null | grep 8787; echo \"---\"; ps aux | grep -i \"8787\\|recap\" | grep -v grep | head",
+      "agent": "orchestrator",
+      "hash": "abbac248670e",
+      "via": "http",
+      "status": 404,
+      "latency": 172
+    },
+    {
+      "cmd": "crontab -l | grep pusher; echo \"grep rc=$?\"",
+      "agent": "reviewer",
+      "hash": "2900f606ee5a",
+      "via": "http",
+      "status": 404,
+      "latency": 140
+    },
+    {
+      "cmd": "crontab -l | wc -l; crontab -l",
+      "agent": "reviewer",
+      "hash": "13390ec3c905",
+      "via": "http",
+      "status": 404,
+      "latency": 142
+    },
+    {
+      "cmd": "crontab -l 2>&1 | cat -n",
+      "agent": "reviewer",
+      "hash": "c560d402a900",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "curl -s http://127.0.0.1:8787/api/milestones",
+      "agent": "reviewer",
+      "hash": "2fa4ff300ff9",
+      "via": "http",
+      "status": 404,
+      "latency": 158
+    },
+    {
+      "cmd": "cd \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO\" && for f in src/content/seo/*.md; do w=$(sed '/^---$/,/^---$/d' \"$f\" | wc -w); echo \"$w $f\"; done | sort -n",
+      "agent": "reviewer",
+      "hash": "3e9522c27c2d",
+      "via": "http",
+      "status": 404,
+      "latency": 154
+    },
+    {
+      "cmd": "for f in \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/src/content/seo/\"*.md; do w=$(sed '/^---$/,/^---$/d' \"$f\" | wc -w); echo \"$w $(basename \"$f\")\"; done | sort -n",
+      "agent": "reviewer",
+      "hash": "b12f766a079d",
+      "via": "http",
+      "status": 404,
+      "latency": 142
+    },
+    {
+      "cmd": "grep -rho 'href=\"/seo/[^\"]*\"' dist/client/seo/ | sed 's|href=\"/seo/||' | sort -u | xargs -I{} ls -d dist/client/seo/{} ; echo \"exit=$?\"",
+      "agent": "reviewer",
+      "hash": "c72ce809caa4",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "for u in \"http://[::ffff:127.0.0.1]/\" \"http://[::ffff:7f00:1]/\" \"http://0177.0.0.1/\" \"http://2130706433/\" \"http://127.1/\" \"http://0x7f.0.0.1/\" \"http://[::ffff:a00:1]/\" \"http://[fe90::1]/\" \"http://[fd12::1]/\" \"http://[fc00::1]/\"; do echo \"== $u\"; node \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/tools/audit/audit.mjs\" \"$u\" 2>&1 | tail -1; done",
+      "agent": "reviewer",
+      "hash": "acb184883364",
+      "via": "http",
+      "status": 404,
+      "latency": 171
+    },
+    {
+      "cmd": "command -v pytest python3 python; ls /usr/local/bin ~/.local/bin 2>/dev/null | grep -i -E 'pytest|py\\.test' ; echo fin",
+      "agent": "reviewer",
+      "hash": "93cad03045e6",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "uvx --with-editable /media/marcs/Linux_Apps/jev-ultrafast pytest -q",
+      "agent": "reviewer",
+      "hash": "75cab7931cfd",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "curl -s -m 4 http://127.0.0.1:9222/json/version 2>&1 | head -c 400; echo; echo \"---\"; pgrep -af \"remote-debugging-port\" 2>&1 | head -3; echo \"---fin---\"",
+      "agent": "orchestrator",
+      "hash": "94696de0d494",
+      "via": "http",
+      "status": 404,
+      "latency": 156
+    },
+    {
+      "cmd": "curl -s -m 4 http://127.0.0.1:9222/json/version; echo \"EXIT=$?\"",
+      "agent": "reviewer",
+      "hash": "98044bd7e353",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"r4b\",\"version\":\"1\"}}}' '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}' '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jev_run\",\"arguments\":{\"url\":\"https://example.com\",\"goal\":\"Open the More information link.\",\"max_steps\":3,\"screenshots\":false}}}' | timeout 90 env BU_NAME=jev BU_CDP_URL=http://127.0.0.1:9222 /media/marcs/Linux_Apps/Projets_AI/mcp/jev-browser/venv/bin/python /media/marcs/Linux_Apps/Projets_AI/mcp/jev-browser/server.py",
+      "agent": "reviewer",
+      "hash": "1768d01709c5",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "curl -s -m 3 http://127.0.0.1:9333/json/version; echo \"EXIT9333=$?\"; curl -s -m 3 http://127.0.0.1:9222/json/version; echo \"EXIT9222=$?\"; ls -ld /tmp/jev-chrome-profile 2>/dev/null",
+      "agent": "reviewer",
+      "hash": "410abe498ca8",
+      "via": "http",
+      "status": 404,
+      "latency": 158
+    },
+    {
+      "cmd": "ls -la /tmp/org.chromium.Chromium.rGnGa1 /tmp/org.chromium.Chromium.E3aFEn 2>/dev/null; echo \"=== DevToolsActivePort candidates ===\"; for d in /tmp/jev-chrome-profile /tmp/org.chromium.Chromium.rGnGa1 /tmp/org.chromium.Chromium.E3aFEn; do echo \"-- $d\"; ls -la \"$d\" 2>/dev/null | head -8; done",
+      "agent": "reviewer",
+      "hash": "cb82fbb11c5d",
+      "via": "http",
+      "status": 404,
+      "latency": 144
+    },
+    {
+      "cmd": "strings -a /tmp/jev-chrome-profile/Default/History-wal | grep -i \"incompleteness\\|godel\" | head -20",
+      "agent": "reviewer",
+      "hash": "925bafe75fb8",
+      "via": "http",
+      "status": 404,
+      "latency": 157
+    },
+    {
+      "cmd": "cmp -s /tmp/opencode/jev/004437.jpg /tmp/opencode/jev/004484.jpg; echo \"CMP_4437_4484=$?\"; cmp -s /tmp/opencode/jev/005961.jpg /tmp/opencode/jev/005971.jpg; echo \"CMP_5961_5971=$?\"",
+      "agent": "reviewer",
+      "hash": "3f26dc74e79e",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "grep -o '\"lane\": \"[a-z]*\"' /media/marcs/Linux_Apps/Projets_AI/Employe/push/queue.json | sort | uniq -c; free -g | head -3",
+      "agent": "orchestrator",
+      "hash": "f1d6479ef318",
+      "via": "http",
+      "status": 404,
+      "latency": 155
+    },
+    {
+      "cmd": "sqlite3 \"file:///home/marcs/.local/share/opencode/opencode.db?mode=ro\" \".tables\" 2>&1 | head -5",
+      "agent": "reviewer",
+      "hash": "47b21cf1416c",
+      "via": "http",
+      "status": 404,
+      "latency": 152
+    },
+    {
+      "cmd": "grep -rn -A6 \"llama-local\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/opencode.json* 2>/dev/null | head -40; echo \"---\"; ps aux | grep -iE \"llama-server|llama-switch|llama_proxy\" | grep -v grep | head -20; echo \"--- listening:\"; ss -ltnp 2>/dev/null | grep -E \"8080|8081|8090|9000|11434|5000\" | head -20",
+      "agent": "orchestrator",
+      "hash": "678b7b778a65",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "grep -rn -A6 \"llama-local\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/*.json 2>/dev/null | head -40; echo \"--- ports:\"; ss -ltn 2>/dev/null | head -20",
+      "agent": "orchestrator",
+      "hash": "f7efb2edfd1c",
+      "via": "http",
+      "status": 404,
+      "latency": 153
+    },
+    {
+      "cmd": "curl -s -m 8 http://127.0.0.1:8080/v1/models | head -c 600; echo; echo \"exit=$?\"",
+      "agent": "orchestrator",
+      "hash": "eb9ffa8fffaa",
+      "via": "http",
+      "status": 404,
+      "latency": 153
+    },
+    {
+      "cmd": "cd \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO\" && for w in enrichissement programmatique hreflang JSON-LD canonical métadonnées CMS; do echo \"=== $w ===\"; grep -n -i -- \"$w\" src/pages/index.astro src/pages/agents/enrichissement-catalogue.astro src/pages/agents/seo-multilingue.astro; done; echo \"--- variante enrichi- ---\"; grep -n -i \"enrichi\" src/pages/index.astro src/pages/agents/enrichissement-catalogue.astro src/pages/agents/seo-multilingue.astro",
+      "agent": "reviewer",
+      "hash": "0c7fe74ed218",
+      "via": "http",
+      "status": 404,
+      "latency": 141
+    },
+    {
+      "cmd": "grep -o \"<title>[^<]*</title>\" \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client/agents/enrichissement-catalogue/index.html\"; grep -c -i \"enrichissement\" \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client/agents/enrichissement-catalogue/index.html\"; grep -rli \"enrichissement\" \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client/\"*/index.html 2>/dev/null | head; echo \"---\"; for f in \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client/\"*/index.html \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/dist/client/index.html\"; do t=$(grep -o \"<title>[^<]*</title>\" \"$f\" 2>/dev/null); echo \"$f :: $t\"; done | grep -i enrichissement; echo \"done\"",
+      "agent": "reviewer",
+      "hash": "2462c141d091",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "command -v pytest; command -v python3; command -v node; command -v npm; echo \"done\"",
+      "agent": "reviewer",
+      "hash": "3925631da1ff",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "ls /media/marcs/Linux_Apps/CloakBrowser-Agent/.venv/bin/ 2>&1 | tr ' ' '\\n' | grep -iE 'pytest|python|pip' ; echo \"EXIT=$?\"",
+      "agent": "reviewer",
+      "hash": "949b2acf2721",
+      "via": "http",
+      "status": 404,
+      "latency": 150
+    },
+    {
+      "cmd": "echo \"=== HOME ===\"; echo $HOME; echo \"=== /home/marcs/.cloakbrowser ===\"; ls -la /home/marcs/.cloakbrowser/ 2>&1; echo \"=== cache marker files ===\"; for f in /media/marcs/Linux_Apps/cloakbrowser-cache/.last_update_check /media/marcs/Linux_Apps/cloakbrowser-cache/.welcome_shown /media/marcs/Linux_Apps/cloakbrowser-cache/.font_warning_shown; do echo \"--- $f ---\"; cat \"$f\" 2>&1; echo; done; echo \"=== latest_version markers in cache ===\"; ls -la /media/marcs/Linux_Apps/cloakbrowser-cache/latest_version* 2>&1; echo \"=== chromium-146 dir ===\"; ls -la /media/marcs/Linux_Apps/cloakbrowser-cache/chromium-146.0.7680.177.5/ 2>&1",
+      "agent": "reviewer",
+      "hash": "dc4a80e04dfa",
+      "via": "http",
+      "status": 404,
+      "latency": 166
+    },
+    {
+      "cmd": "ldd /media/marcs/Linux_Apps/cloakbrowser-cache/chromium-155.0.8059.39.1-pro/chrome | grep -i 'not found'; echo \"---fin ldd (code=$?)---\"",
+      "agent": "reviewer",
+      "hash": "3581e2c35397",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "/media/marcs/Linux_Apps/cloakbrowser-cache/chromium-155.0.8059.39.1-pro/chrome --version 2>&1; echo \"---code=$?---\"",
+      "agent": "reviewer",
+      "hash": "b4fdefa9616f",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "BASE_URL=http://127.0.0.1:4321 timeout 60 node \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/tools/audit/test-api.mjs\" 2>&1 | tail -5; echo \"exit=$?\"",
+      "agent": "reviewer",
+      "hash": "2ca274ba77b2",
+      "via": "http",
+      "status": 404,
+      "latency": 158
+    },
+    {
+      "cmd": "curl -s -X POST http://127.0.0.1:4321/api/audit -H \"content-type: application/json\" -d '{\"url\":\"https://example.com\"}' | head -c 400; echo; echo \"--- share dir:\"; ls \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/output/audits/share\" 2>&1",
+      "agent": "reviewer",
+      "hash": "a56e1bcc05a0",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "fuser -k 4321/tcp 2>/dev/null; sleep 1; nohup node ./dist/server/entry.mjs > /tmp/opencode/t12-server.log 2>&1 & sleep 4; curl -s -o /dev/null -w \"%{http_code}\" http://localhost:4321/",
+      "agent": "reviewer",
+      "hash": "a231d0965eb0",
+      "via": "http",
+      "status": 404,
+      "latency": 160
+    },
+    {
+      "cmd": "curl -s -o /dev/null -w \"%{http_code}\" http://localhost:4321/ || echo \"server-down\"",
+      "agent": "reviewer",
+      "hash": "57b2b85a558b",
+      "via": "http",
+      "status": 404,
+      "latency": 151
+    },
+    {
+      "cmd": "ss -ltnp 2>/dev/null | grep 4321",
+      "agent": "reviewer",
+      "hash": "942751d97a81",
+      "via": "http",
+      "status": 404,
+      "latency": 154
+    },
+    {
+      "cmd": "ls -la \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/output/audits/share/\" | head -8; echo \"---\"; for f in \"/media/marcs/Linux_Apps/Projets_AI/Automated SEO/output/audits/share/\"*.json; do echo \"== $f\"; head -c 600 \"$f\"; echo; break; done",
+      "agent": "reviewer",
+      "hash": "6f829e755617",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "curl -s -o /dev/null -w \"%{http_code} %{url_effective}\\n\" --max-time 15 https://www.iana.org/help/example-domains",
+      "agent": "reviewer",
+      "hash": "218fceed1fe8",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "cd /media/marcs/Linux_Apps/LLM && ls -d */ 2>/dev/null | head -20; echo \"=== checkouts llama.cpp\"; for d in */ ; do if [ -d \"$d/.git\" ]; then echo \"--- $d\"; git -C \"$d\" log --oneline -3 -- common/json-schema-to-grammar.cpp 2>/dev/null; git -C \"$d\" status --porcelain 2>/dev/null | head -5; fi; done",
+      "agent": "orchestrator",
+      "hash": "1e9cb98f1811",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "curl -sS -m 300 -w '\\nHTTP_STATUS=%{http_code}\\n' -X POST http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"qwen-opus\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"traptool\",\"parameters\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"\\\\S\",\"maxLength\":1048576}}}}}]}' | tail -4",
+      "agent": "reviewer",
+      "hash": "e7afc88ce733",
+      "via": "http",
+      "status": 404,
+      "latency": 170
+    },
+    {
+      "cmd": "tr '\\0' '\\n' < /proc/21446/environ | grep -n 'PROXY\\|llama\\|LLM' ; echo \"---cmdline---\"; tr '\\0' ' ' < /proc/21446/cmdline; echo",
+      "agent": "reviewer",
+      "hash": "85eecc8b2774",
+      "via": "http",
+      "status": 404,
+      "latency": 163
+    },
+    {
+      "cmd": "curl -sS -m 300 -w '\\nHTTP_CODE=%{http_code}\\n' -X POST http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"qwen-opus\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"trap_tool\",\"description\":\"test\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\",\"pattern\":\"\\\\S\",\"maxLength\":1048576}}}}}]}' | head -c 800",
+      "agent": "reviewer",
+      "hash": "3e383023e5b6",
+      "via": "http",
+      "status": 404,
+      "latency": 152
+    },
+    {
+      "cmd": "which node bun tsc npx; echo ===; node --version; echo ===; git -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode rev-parse --is-inside-work-tree 2>&1 | head -3; echo ===; git -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2 rev-parse --is-inside-work-tree 2>&1 | head -3",
+      "agent": "orchestrator",
+      "hash": "f9c75079f1d8",
+      "via": "http",
+      "status": 404,
+      "latency": 142
+    },
+    {
+      "cmd": "tr '\\0' ' ' < /proc/25431/cmdline; echo; tr '\\0' ' ' < /proc/25807/cmdline; echo",
+      "agent": "reviewer",
+      "hash": "2f28847317cc",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "tr '\\0' '\\n' < /proc/25431/environ | grep -c PROXY_DUMP_TOOLS; tr '\\0' '\\n' < /proc/25807/environ | grep -c PROXY_DUMP_TOOLS",
+      "agent": "reviewer",
+      "hash": "83951aaa28f6",
+      "via": "http",
+      "status": 404,
+      "latency": 153
+    },
+    {
+      "cmd": "timeout 600 opencode run -m llama-local/qwen-opus \"Utilise l'outil bash pour exécuter exactement: echo OK-R3\"; echo \"EXIT_R3=$?\"",
+      "agent": "reviewer",
+      "hash": "4865ce2b8888",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "opencode run -m llama-local/qwen-opus \"Utilise l'outil bash pour exécuter exactement: echo OK-R3\"",
+      "agent": "reviewer",
+      "hash": "715b314edf08",
+      "via": "http",
+      "status": 404,
+      "latency": 156
+    },
+    {
+      "cmd": "which opencode-v2 opencode 2>/dev/null; timeout 600 opencode-v2 run -m llama-local/qwen-opus \"Utilise l'outil bash pour exécuter exactement: echo OK-R3\"; echo \"EXIT_R3=$?\"",
+      "agent": "reviewer",
+      "hash": "3b58e3876ef4",
+      "via": "http",
+      "status": 404,
+      "latency": 152
+    },
+    {
+      "cmd": "opencode-v2 run -m llama-local/qwen-opus \"Utilise l'outil bash pour exécuter exactement: echo OK-R3\"; echo \"EXIT_R3=$?\"",
+      "agent": "reviewer",
+      "hash": "804d4fe5c846",
+      "via": "http",
+      "status": 404,
+      "latency": 160
+    },
+    {
+      "cmd": "grep -o \"^function [a-zA-Z]*\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts | sort | tr '\\n' ' '",
+      "agent": "orchestrator",
+      "hash": "9b7ce79d95bd",
+      "via": "http",
+      "status": 404,
+      "latency": 162
+    },
+    {
+      "cmd": "cmp /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts.bak-20261023-141231 && echo \"IDENTICAL-BYTES\" ; echo \"---DIFF 135015 vs current---\"; diff /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts.bak-20261023-135015 /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts | head -100",
+      "agent": "reviewer",
+      "hash": "3cd6145c2118",
+      "via": "http",
+      "status": 404,
+      "latency": 141
+    },
+    {
+      "cmd": "for f in readText readJson writeJson fileExists sessionId sessionManifest absPath manifestFor claim orchestratorWrite parseSteps scopeList inScope activeStep openStepFor bindWorker rememberSpawn audit mutating firstPath cmdOf segments firstWord execAllowed modelAllowed paidDeclared; do a=$(grep -n \"^function $f\\|^  $f(\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts.bak-20261023-135015 | head -1 | cut -d: -f2-); b=$(grep -n \"^function $f\\|^  $f(\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts | head -1 | cut -d: -f2-); if [ \"$a\" = \"$b\" ]; then echo \"OK   $f\"; else echo \"DIFF $f | old:[$a] new:[$b]\"; fi; done",
+      "agent": "reviewer",
+      "hash": "48168762d6b0",
+      "via": "http",
+      "status": 404,
+      "latency": 166
+    },
+    {
+      "cmd": "node <<'NODESCRIPT'\nconst segs = [\n  'A=1 B=2 C=3 node script.mjs',\n  'A=1 rm -rf /tmp/x',\n  'ORCH_DIR=/x ORCH_STATE=/y node script.mjs'\n];\nsegs.forEach(s => {\n  const clean = s.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)/, '');\n  const m = clean.match(/^([^\\s]+)/);\n  console.log(s, '→', m ? m[1] : '');\n});\nNODESCRIPT\n",
+      "agent": "reviewer",
+      "hash": "b4d0a581b40a",
+      "via": "http",
+      "status": 404,
+      "latency": 161
+    },
+    {
+      "cmd": "echo '#!/bin/bash\nsegs=(\n  \"A=1 B=2 C=3 node script.mjs\"\n  \"A=1 rm -rf /tmp/x\"\n  \"ORCH_DIR=/x ORCH_STATE=/y node script.mjs\"\n)\nfor s in \"${segs[@]}\"; do\n  clean=$(echo \"$s\" | sed -E \"s/^(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)//\")\n  m=$(echo \"$clean\" | grep -o \"^[^ ]*\" | head -1)\n  echo \"$s → $m\"\ndone' > /tmp/test_firstword.sh && bash /tmp/test_firstword.sh\n",
+      "agent": "reviewer",
+      "hash": "9350db44c71b",
+      "via": "http",
+      "status": 404,
+      "latency": 153
+    },
+    {
+      "cmd": "grep -h 'segs=' /tmp/test_firstword.sh 2>/dev/null || echo 'segs=(\"A=1 B=2 C=3 node script.mjs\",\"A=1 rm -rf /tmp/x\",\"ORCH_DIR=/x ORCH_STATE=/y node script.mjs\")' | while IFS= read -r s; do clean=$(echo \"$s\" | sed -E 's/^(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)//'); m=$(echo \"$clean\" | grep -o '^[^ ]*' | head -1); echo \"$s → $m\"; done\n",
+      "agent": "reviewer",
+      "hash": "e298972477a1",
+      "via": "http",
+      "status": 404,
+      "latency": 155
+    },
+    {
+      "cmd": "ls /home/marcs/.opencode/bin/; echo \"--- find bun ---\"; ls /media/marcs/Linux_Apps/.opencode/bin/ 2>/dev/null; command -v bunx bun 2>/dev/null; find /home/marcs/.bun /media/marcs/Linux_Apps -maxdepth 3 -name \"bun\" -type f 2>/dev/null | head -5",
+      "agent": "orchestrator",
+      "hash": "88f0c31c6cad",
+      "via": "http",
+      "status": 404,
+      "latency": 154
+    },
+    {
+      "cmd": "ls -la /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/loop-guard.ts /media/marcs/Linux_Apps/Projets_AI/specs/loop-guard/test-loop-guard.mjs; echo \"--- run verif ---\"; node /media/marcs/Linux_Apps/Projets_AI/specs/loop-guard/test-loop-guard.mjs; echo \"EXIT=$?\"",
+      "agent": "orchestrator",
+      "hash": "d1ba9c7187fc",
+      "via": "http",
+      "status": 404,
+      "latency": 166
+    },
+    {
+      "cmd": "zgrep -c \"loopBadgeEl\" /media/marcs/Linux_Apps/backups/llama-server-20261023-173300.tar.gz",
+      "agent": "reviewer",
+      "hash": "de4d279f8b43",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "gzip -cd /media/marcs/Linux_Apps/backups/llama-server-20261023-173300.tar.gz | wc -l",
+      "agent": "reviewer",
+      "hash": "c1d4043c9d09",
+      "via": "http",
+      "status": 404,
+      "latency": 143
+    },
+    {
+      "cmd": "curl -s -m 10 http://127.0.0.1:8080/v1/models",
+      "agent": "orchestrator",
+      "hash": "aa4d97086553",
+      "via": "http",
+      "status": 404,
+      "latency": 146
+    },
+    {
+      "cmd": "export PATH=\"/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin:$PATH\" && node --experimental-strip-types /tmp/opencode/orch-ui/harness.mjs 2>&1; echo \"EXIT_CODE=$?\"",
+      "agent": "reviewer",
+      "hash": "411b53a2ce78",
+      "via": "http",
+      "status": 404,
+      "latency": 155
+    },
+    {
+      "cmd": "NODE=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin/node; HARNESS=/tmp/opencode/orch-ui/harness.mjs; $NODE --experimental-strip-types \"$HARNESS\"; echo \"exit=$?\"",
+      "agent": "reviewer",
+      "hash": "b51f197ac4e4",
+      "via": "http",
+      "status": 404,
+      "latency": 157
+    },
+    {
+      "cmd": "curl -sIL --max-time 30 \"https://huggingface.co/lavendercomputing/Ornith-1.5-35B-A3B-Heretic-MTP-APEX-GSQ-RCO-GGUF/resolve/main/Ornith-1.5-35B-A3B-Heretic-MTP-APEX-GSQ-RCO-IQ3_XXS.gguf\" 2>&1 | grep -iE \"^(HTTP|content-length|location|x-linked-size)\" ; echo \"---MANIFEST---\"; ls -la /media/marcs/Linux_Apps/Projets_AI/.opencode/orchestration.md /media/marcs/Linux_Apps/Projets_AI/.opencode/orch 2>&1",
+      "agent": "orchestrator",
+      "hash": "b02a97e698ff",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "cd /tmp/opencode/orch-ui\nNODE=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin/node\necho \"=== AVANT régénération (état laissé par la revue interrompue) ===\"\nmd5sum loaded.mjs loaded.ts stub-tui.mjs test-state.json\necho \"=== RUN 1 (régénération) ===\"\n$NODE --experimental-strip-types harness.mjs; echo \"exit=$?\"\necho \"=== ligne 7 de loaded.mjs après régénération ===\"\nsed -n '7p' loaded.mjs\necho \"=== md5 après régénération ===\"\nmd5sum loaded.mjs loaded.ts",
+      "agent": "reviewer",
+      "hash": "6c95e97577bd",
+      "via": "http",
+      "status": 404,
+      "latency": 150
+    },
+    {
+      "cmd": "NODE=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin/node\necho \"=== AVANT régénération (état laissé par la revue interrompue) ===\"\nmd5sum /tmp/opencode/orch-ui/loaded.mjs /tmp/opencode/orch-ui/loaded.ts /tmp/opencode/orch-ui/stub-tui.mjs /tmp/opencode/orch-ui/test-state.json\necho \"=== RUN 1 (régénération) ===\"\n$NODE --experimental-strip-types /tmp/opencode/orch-ui/harness.mjs; echo \"exit=$?\"\necho \"=== ligne 7 de loaded.mjs après régénération ===\"\nsed -n '7p' /tmp/opencode/orch-ui/loaded.mjs\necho \"=== md5 après régénération ===\"\nmd5sum /tmp/opencode/orch-ui/loaded.mjs /tmp/opencode/orch-ui/loaded.ts",
+      "agent": "reviewer",
+      "hash": "8614424ab038",
+      "via": "http",
+      "status": 404,
+      "latency": 162
+    },
+    {
+      "cmd": "nvidia-smi 2>&1 | head -20; echo \"=== CPU/RAM ===\"; lscpu | grep -E \"Model name|^CPU\\(s\\)|Socket\" ; free -h; echo \"=== DISQUES ===\"; df -h | grep -vE \"tmpfs|loop\"",
+      "agent": "orchestrator",
+      "hash": "cec78fd54edd",
+      "via": "http",
+      "status": 404,
+      "latency": 155
+    },
+    {
+      "cmd": "echo \"=== GPU (proc) ===\"; cat /proc/driver/nvidia/version 2>&1 | head -3; ls /dev/nvidia* 2>&1\necho \"=== PCI VGA ===\"; lspci 2>/dev/null | grep -iE \"vga|3d|display\"\necho \"=== CPU ===\"; lscpu | grep -E \"Nom de mod|Model name|^CPU\\(s\\)|Thread|Core\"\necho \"=== RAM ===\"; free -h\necho \"=== DISQUES ===\"; df -h | grep -vE \"tmpfs|loop|snap\"\necho \"=== CIBLE ===\"; ls -la \"/media/marcs/06428AF2428AE5B1/AI Projects/\" 2>&1 | head\necho \"=== TOOLS ===\"; which nvcc cmake git gcc g++ python3 2>&1; echo \"cuda:\"; ls -d /usr/local/cuda* 2>&1",
+      "agent": "orchestrator",
+      "hash": "0ebd078bdb4a",
+      "via": "http",
+      "status": 404,
+      "latency": 156
+    },
+    {
+      "cmd": "echo \"=== RAM ===\"; free -h\necho \"=== CPU ===\"; lscpu | grep -E \"Nom de mod|Model name|^CPU\\(s\\)|Thread|Core|MHz\"\necho \"=== DISQUES ===\"; df -h | grep -vE \"tmpfs|loop|snap|udev\"\necho \"=== CIBLE ===\"; ls -la \"/media/marcs/06428AF2428AE5B1/AI Projects/\" 2>&1\necho \"=== OUTILS ===\"; which cmake git gcc g++ python3 nvcc hf 2>&1",
+      "agent": "orchestrator",
+      "hash": "413ab617ae0f",
+      "via": "http",
+      "status": 404,
+      "latency": 152
+    },
+    {
+      "cmd": "echo \"=== DRM cards ===\"; ls /sys/class/drm/\necho \"=== uevent ===\"; for d in /sys/class/drm/card*/device; do echo \"-- $d\"; cat \"$d/uevent\" 2>/dev/null | head -12; cat \"$d/vendor\" 2>/dev/null; cat \"$d/device\" 2>/dev/null; done\necho \"=== product_name ===\"; cat /sys/class/drm/card*/device/product_name 2>&1\necho \"=== mem_info ===\"; ls /sys/class/drm/card*/device/ | grep -i mem",
+      "agent": "orchestrator",
+      "hash": "29b735597f71",
+      "via": "http",
+      "status": 404,
+      "latency": 150
+    },
+    {
+      "cmd": "echo \"=== RAM ===\"; head -4 /proc/meminfo\necho \"=== CPU ===\"; lscpu | grep -E \"Nom de mod|Model name|^CPU\\(s\\)|Thread|Core\"\necho \"=== ROCm ===\"; ls -d /opt/rocm* 2>&1\necho \"=== DISQUES ===\"; df -h | grep -vE \"tmpfs|loop|snap|udev\"\necho \"=== CIBLE ===\"; ls -la \"/media/marcs/06428AF2428AE5B1/AI Projects/\" 2>&1\necho \"=== OUTILS ===\"; which cmake git gcc g++ python3 nvcc 2>&1",
+      "agent": "orchestrator",
+      "hash": "849e941089a1",
+      "via": "http",
+      "status": 404,
+      "latency": 153
+    },
+    {
+      "cmd": "head -c 3000000 \"/media/marcs/06428AF2428AE5B1/AI/LLM/Ornith1.5 35b/Ornith-1.5-35B-A3B-Heretic-MTP-APEX-GSQ-RCO-IQ3_XXS.gguf\" | strings -n 6 | head -80",
+      "agent": "orchestrator",
+      "hash": "f4c4390208b7",
+      "via": "http",
+      "status": 404,
+      "latency": 154
+    },
+    {
+      "cmd": "for d in ~/.local/share/opencode ~/.config/opencode /media/marcs/Linux_Apps/Projets_AI/.opencode; do echo \"### $d\"; ls -d \"$d\" 2>/dev/null && find \"$d\" -maxdepth 6 -name \"*e957e83a7ffe*\" -printf \"%T@ %TH:%TM:%TS %p\\n\" 2>/dev/null | head -20; done",
+      "agent": "orchestrator",
+      "hash": "c64093f1730f",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "export PATH=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin:$PATH; node --experimental-strip-types /media/marcs/Linux_Apps/Projets_AI/specs/night-mode/test-night-lock.mjs 2>&1 | tail -30",
+      "agent": "reviewer",
+      "hash": "38f5fb407625",
+      "via": "http",
+      "status": 404,
+      "latency": 151
+    },
+    {
+      "cmd": "echo \"=== device de la cible ===\"; df -h \"/media/marcs/06428AF2428AE5B1/AI/LLM/Ornith1.5 35b/\" | tail -1\necho \"=== rotational ===\"; cat /sys/block/sda/queue/rotational 2>&1\necho \"=== transport ===\"; cat /sys/block/sda/device/../../../../ 2>/dev/null; ls -l /sys/block/sda 2>&1 | head -2\necho \"=== model ===\"; cat /sys/block/sda/device/model 2>&1; cat /sys/block/sda/device/vendor 2>&1\necho \"=== tout les disques ===\"; lsblk -o NAME,SIZE,ROTA,TRAN,MOUNTPOINT 2>&1",
+      "agent": "orchestrator",
+      "hash": "bfecd9bebc91",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "N22=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin/node; $N22 --experimental-strip-types /tmp/opencode/orch-ui/harness.mjs 2>&1; echo \"EXIT_CODE=$?\"",
+      "agent": "reviewer",
+      "hash": "c1eceab570e3",
+      "via": "http",
+      "status": 404,
+      "latency": 153
+    },
+    {
+      "cmd": "md5sum /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-ui/tui.ts 2>&1 || cksum /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-ui/tui.ts 2>&1 || wc -c /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-ui/tui.ts",
+      "agent": "reviewer",
+      "hash": "db8969309d39",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "curl -s --max-time 300 http://127.0.0.1:8080/api/models",
+      "agent": "reviewer",
+      "hash": "d1b933e994ea",
+      "via": "http",
+      "status": 404,
+      "latency": 169
+    },
+    {
+      "cmd": "/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin/node --experimental-strip-types /tmp/opencode/orch-ui/harness.mjs",
+      "agent": "orchestrator",
+      "hash": "b03ce33fc703",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "export PATH=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin:$PATH; node --experimental-strip-types /media/marcs/Linux_Apps/Projets_AI/specs/night-mode/test-bind.mjs 2>&1 | tail -30",
+      "agent": "reviewer",
+      "hash": "59c292a2e2dc",
+      "via": "http",
+      "status": 404,
+      "latency": 151
+    },
+    {
+      "cmd": "PATH=/media/marcs/Linux_Apps/Projets_AI/Opencodev2:/usr/bin:/bin opencode-v2 --help 2>&1 | tail -30",
+      "agent": "reviewer",
+      "hash": "3b89eff220e4",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "command -v jq; stat -c '%n %s %Y' /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.log /media/marcs/Linux_Apps/Projets_AI/.opencode/night/queue.jsonl /media/marcs/Linux_Apps/Projets_AI/.opencode/night/night-mode.json /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/opencode.json 2>&1",
+      "agent": "reviewer",
+      "hash": "b31cc07b11f3",
+      "via": "http",
+      "status": 404,
+      "latency": 151
+    },
+    {
+      "cmd": "cksum /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/opencode.json",
+      "agent": "reviewer",
+      "hash": "ee7efe05d65d",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "cd /media/marcs/Linux_Apps/Projets_AI\necho \"== NOW ==\"; date '+%F %T %z'\necho \"== SYNTAX ==\"; bash -n .opencode/night/run.sh && echo SYNTAX_OK\necho \"== NIGHT DIR ==\"; ls -la .opencode/night/\necho \"== NIGHT DIR (recursif, taille+mtime) ==\"; find .opencode/night .opencode/night-private -printf '%s %T@ %p\\n' 2>/dev/null | sort -k3\necho \"== LIVE CONFIG ==\"; stat -c '%s %Y %n' Opencodev2/config/opencode/opencode.json; md5sum Opencodev2/config/opencode/opencode.json\necho \"== /tmp QUEUE ==\"; cat /tmp/opencode/night-q.jsonl; stat -c '%s %Y %n' /tmp/opencode/night-q.jsonl\necho \"== REAL QUEUE ==\"; stat -c '%s %Y %n' .opencode/night/queue.jsonl",
+      "agent": "reviewer",
+      "hash": "1ef93d25e058",
+      "via": "http",
+      "status": 404,
+      "latency": 161
+    },
+    {
+      "cmd": "P=/media/marcs/Linux_Apps/Projets_AI\necho \"== NOW ==\"; date '+%F %T %z'\necho \"== SYNTAX ==\"; bash -n $P/.opencode/night/run.sh && echo SYNTAX_OK\necho \"== NIGHT DIR ==\"; ls -la $P/.opencode/night/\necho \"== NIGHT DIR (recursif, taille+mtime) ==\"; find $P/.opencode/night $P/.opencode/night-private -printf '%s %T@ %p\\n' 2>/dev/null | sort -k3\necho \"== LIVE CONFIG ==\"; stat -c '%s %Y %n' $P/Opencodev2/config/opencode/opencode.json; md5sum $P/Opencodev2/config/opencode/opencode.json\necho \"== /tmp QUEUE ==\"; cat /tmp/opencode/night-q.jsonl; stat -c '%s %Y %n' /tmp/opencode/night-q.jsonl\necho \"== REAL QUEUE ==\"; stat -c '%s %Y %n' $P/.opencode/night/queue.jsonl",
+      "agent": "reviewer",
+      "hash": "a4d117176da3",
+      "via": "http",
+      "status": 404,
+      "latency": 151
+    },
+    {
+      "cmd": "date '+%F %T %z'; bash -n /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh && echo SYNTAX_OK; ls -la /media/marcs/Linux_Apps/Projets_AI/.opencode/night/",
+      "agent": "reviewer",
+      "hash": "8099225da5f9",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "bash -n /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "34b2fb3e7e4a",
+      "via": "http",
+      "status": 404,
+      "latency": 157
+    },
+    {
+      "cmd": "/bin/bash -n /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "3013eddc7269",
+      "via": "http",
+      "status": 404,
+      "latency": 144
+    },
+    {
+      "cmd": "NIGHT_NOW_EPOCH=1792877400 NIGHT_DRY=1 NIGHT_QUEUE=/tmp/opencode/night-q.jsonl bash /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "ecf3f60566fc",
+      "via": "http",
+      "status": 404,
+      "latency": 154
+    },
+    {
+      "cmd": "NIGHT_NOW_EPOCH=1792877400 NIGHT_DRY=1 NIGHT_QUEUE=/tmp/opencode/night-q.jsonl /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "61a1d479d6e5",
+      "via": "http",
+      "status": 404,
+      "latency": 147
+    },
+    {
+      "cmd": "bash -n /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh && echo \"✓ Syntaxe valide\"",
+      "agent": "reviewer",
+      "hash": "ce4299d421ad",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "bash -n /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh && echo \"SYNTAX-OK\"",
+      "agent": "reviewer",
+      "hash": "56ee9372b04b",
+      "via": "http",
+      "status": 404,
+      "latency": 150
+    },
+    {
+      "cmd": "sh -n /media/marcs/Linux_Apps/Projets_AI/.opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "96799c1862dd",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "bash -n .opencode/night/run.sh && echo BASH_N_OK; env grep -n '^## `/night' .opencode/commands/night.md; wc -c < .opencode/night/queue.jsonl",
+      "agent": "reviewer",
+      "hash": "6137a376e81a",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "NIGHT_DRY=1 bash .opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "3caf714a094f",
+      "via": "http",
+      "status": 404,
+      "latency": 146
+    },
+    {
+      "cmd": "bash -n .opencode/night/run.sh",
+      "agent": "reviewer",
+      "hash": "9a04b8a28472",
+      "via": "http",
+      "status": 404,
+      "latency": 156
+    },
+    {
+      "cmd": "bash .opencode/night/run.sh +syntax --version 2>&1 || true",
+      "agent": "reviewer",
+      "hash": "2356544e0696",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "echo '[graphify] knowledge graphs available: graphify-out/ (ZeroClaw). For focused questions, run graphify query --graph <path>/graph.json. Read GRAPH_REPORT.md for broad architecture context.' && cd /media/marcs/Linux_Apps/Projets_AI && echo \"=== ORIG lines 1-15 ===\"; sed -n '1,15p' Opencodev2/config/opencode/agents/orchestrator.md; echo \"=== ORIG lines 68-90 ===\"; sed -n '68,90p' Opencodev2/config/opencode/agents/orchestrator.md; echo \"=== MIROIR state ===\"; diff -q Opencodev2/config/opencode/agents/orchestrator.md .opencode/agents/orchestrator.md && echo MIROIRS_OK; echo \"=== grep step7 frontmatter markers (2 files) ===\"; grep -n \"gtd-kanban_\\*\\|gtd_set_objective\\|Valider la clôture\\|extract_memory\" Opencodev2/config/opencode/agents/orchestrator.md .opencode/agents/orchestrator.md | hea",
+      "agent": "orchestrator",
+      "hash": "4125ebcc5f32",
+      "via": "http",
+      "status": 404,
+      "latency": 164
+    },
+    {
+      "cmd": "python3 - <<'PY'\np='/media/marcs/Linux_Apps/Projets_AI/.opencode/orch/ses_e922831faffeCt88rLqmqm97QO/orchestration.md'\ns=open(p).read()\nprint(repr(s[s.find('**Statut** :'):s.find('**Statut** :')+30]))\nPY",
+      "agent": "orchestrator",
+      "hash": "4f8c6bb90d64",
+      "via": "http",
+      "status": 404,
+      "latency": 163
+    },
+    {
+      "cmd": "sed -n '20,24p' /media/marcs/Linux_Apps/Projets_AI/.opencode/orch/ses_e922831faffeCt88rLqmqm97QO/orchestration.md | od -c | tail -8",
+      "agent": "orchestrator",
+      "hash": "81ea6f6abf73",
+      "via": "http",
+      "status": 404,
+      "latency": 162
+    },
+    {
+      "cmd": "python3 - <<'PY'\np='/media/marcs/Linux_Apps/Projets_AI/.opencode/orch/ses_e922831faffeCt88rLqmqm97QO/orchestration.md'\ns=open(p).read()\nprint(repr(s[s.find('**Statut** :'):s.find('**Statut** :')+40]))\nPY",
+      "agent": "orchestrator",
+      "hash": "f315f69a70fb",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "R=/media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts\npython3 -m json.tool \"$R/MANIFEST.json\" | head -30\nls -la \"$R\" \"$R/dumps\" | sed 's/marcs marcs//'\nstat -c '%s %n' \"$R/dumps/plugin-opencode-v2.txt\"\ncmp \"$R/dumps/plugin-opencode-v2.txt\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/opencode-v2-plugins-prompt.txt && echo \"COPY_IDENTICAL\"",
+      "agent": "orchestrator",
+      "hash": "bd79c609ab65",
+      "via": "http",
+      "status": 404,
+      "latency": 182
+    },
+    {
+      "cmd": "python3 -m json.tool /media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts/MANIFEST.json | head -40",
+      "agent": "orchestrator",
+      "hash": "06d3ee416081",
+      "via": "http",
+      "status": 404,
+      "latency": 148
+    },
+    {
+      "cmd": "command -v jq; echo \"jq:$?\"; command -v shellcheck; echo \"sc:$?\"; command -v python3; python3 --version 2>&1",
+      "agent": "reviewer",
+      "hash": "ed89cb78df1d",
+      "via": "http",
+      "status": 404,
+      "latency": 152
+    },
+    {
+      "cmd": "bash -n /media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts/build-plugin-opencode-v2.sh && echo SYNTAX_OK",
+      "agent": "reviewer",
+      "hash": "0e05df40dd79",
+      "via": "http",
+      "status": 404,
+      "latency": 146
+    },
+    {
+      "cmd": "/media/marcs/Linux_Apps/Projets_AI/files-to-prompt/venv/bin/files-to-prompt --help 2>&1 | head -40",
+      "agent": "reviewer",
+      "hash": "6f9dadf7f701",
+      "via": "http",
+      "status": 404,
+      "latency": 156
+    },
+    {
+      "cmd": "cd /media/marcs/Linux_Apps/Projets_AI/.opencode\n# 1. Archive vs draft\ncmp context-prompts/ORCHESTRATOR-CONTEXT-PROMPTS.md context-prompts/archive/ORCHESTRATOR-CONTEXT-PROMPTS-2026-10-24.md && echo \"CMP_ARCHIVE_VS_DRAFT: IDENTIQUES\"\n# 2. Section insérée (lignes 83-191) vs draft\nsed -n '83,191p' agents/orchestrator.md > /tmp/opencode/section_inserted.md\ncmp /tmp/opencode/section_inserted.md context-prompts/ORCHESTRATOR-CONTEXT-PROMPTS.md && echo \"CMP_SECTION_VS_DRAFT: IDENTIQUES\"\necho \"---\"\nwc -l context-prompts/ORCHESTRATOR-CONTEXT-PROMPTS.md /tmp/opencode/section_inserted.md\n# 3. Nombre d'occurrences du titre\ngrep -cn '^# Réserve de context-prompts$' agents/orchestrator.md\ngrep -n 'Réserve de context-prompts' agents/orchestrator.md | head -5\n# 4. Dernière ligne du draft vs fin de section\nt",
+      "agent": "reviewer",
+      "hash": "044264171163",
+      "via": "http",
+      "status": 404,
+      "latency": 164
+    },
+    {
+      "cmd": "cmp /media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts/ORCHESTRATOR-CONTEXT-PROMPTS.md /media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts/archive/ORCHESTRATOR-CONTEXT-PROMPTS-2026-10-24.md && echo \"CMP_ARCHIVE_VS_DRAFT: IDENTIQUES\"\nsed -n '83,191p' /media/marcs/Linux_Apps/Projets_AI/.opencode/agents/orchestrator.md > /tmp/opencode/section_inserted.md\ncmp /tmp/opencode/section_inserted.md /media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts/ORCHESTRATOR-CONTEXT-PROMPTS.md && echo \"CMP_SECTION_VS_DRAFT: IDENTIQUES\"\necho \"---\"\nwc -l /media/marcs/Linux_Apps/Projets_AI/.opencode/context-prompts/ORCHESTRATOR-CONTEXT-PROMPTS.md /tmp/opcode/section_inserted.md 2>/dev/null; wc -l /tmp/opencode/section_inserted.md\necho \"---titre---\"\ngrep -c '^# Réserve de context-prompts$",
+      "agent": "reviewer",
+      "hash": "bc5eca3a0b05",
+      "via": "http",
+      "status": 404,
+      "latency": 145
+    },
+    {
+      "cmd": "set -o pipefail\nprintf '%s\\n' '=== MANIFEST ==='\nsed -n '1,240p' /media/marcs/Linux_Apps/Projets_AI/.opencode/orch/ses_e9142d634ffefTifiRQAiX4HKz/orchestration.md\nprintf '%s\\n' '=== STATUS ==='\ngit -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2 status --short --branch\nprintf '%s\\n' '=== HEAD ==='\ngit -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2 rev-parse --verify HEAD\ngit -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2 log -5 --oneline --decorate\nprintf '%s\\n' '=== TARGET COMMIT ==='\ngit -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2 show --no-ext-diff --stat --summary --format=fuller ca1284c\nprintf '%s\\n' '=== FILES IN TARGET COMMIT ==='\ngit -C /media/marcs/Linux_Apps/Projets_AI/Opencodev2 diff-tree --no-commit-id --name-status -r ca1284c\nprintf '%s\\n' '=== SIZE ==='\ngit -C /medi",
+      "agent": "reviewer",
+      "hash": "f6d36db4a1cd",
+      "via": "http",
+      "status": 404,
+      "latency": 149
+    },
+    {
+      "cmd": "cmp -s /tmp/opencode/orch-t1/new.mjs /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/orch-guard.ts && echo \"IDENTIQUES\" || echo \"DIFFERENTS\"; grep -n \"t2-jev-seconde-main\\|PROMPT T2\\|## Étape 2\" /media/marcs/Linux_Apps/Projets_AI/.opencode/orch/ses_e918bc6d8ffeKgbycYQkXlk1S9/orchestration.md | head -5",
+      "agent": "orchestrator",
+      "hash": "9d65314c68d1",
+      "via": "http",
+      "status": 404,
+      "latency": 162
+    },
+    {
+      "cmd": "opencode run --help 2>&1 | head -30",
+      "agent": "orchestrator",
+      "hash": "b35edea18a98",
+      "via": "http",
+      "status": 404,
+      "latency": 155
+    },
+    {
+      "cmd": "opencode run --help 2>&1 | grep -iA1 \"prompt\\|message\\|POSITIONAL\\|usage\" | head -12",
+      "agent": "orchestrator",
+      "hash": "a6ecffbe2c52",
+      "via": "http",
+      "status": 404,
+      "latency": 157
+    },
+    {
+      "cmd": "grep -o '\"llama-proxy\"[^}]*' /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/opencode.json | head -2; grep -c \"provider\" /media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/opencode.json; echo ===; opencode models 2>/dev/null | grep -i \"llama\" | head -5 || echo \"opencode CLI non lisible au frontière\"",
+      "agent": "orchestrator",
+      "hash": "512344d88a3f",
+      "via": "http",
+      "status": 404,
+      "latency": 165
+    },
+    {
+      "cmd": "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -i \":1F90\" | head -3; echo \"1F90 = port 8080\"; curl -s -m 3 http://127.0.0.1:8080/health 2>&1 | head -3 || echo \"PAS DE REPONSE\"",
+      "agent": "orchestrator",
+      "hash": "13687fafb7aa",
+      "via": "http",
+      "status": 404,
+      "latency": 170
+    }
+  ]
+}

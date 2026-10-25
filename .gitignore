@@ -16,3 +16,6 @@ config/**/tmp/
 config/menus/
 opencode-v2-plugins-prompt.txt
 
+# Exception orch-guard : le plugin vit sous config/opencode (ignoré par le motif générique « opencode »)
+!config/opencode/
+!config/opencode/**
