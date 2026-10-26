@@ -253,6 +253,66 @@ function checkModel(raw: string): Check {
   return { value: canonical }
 }
 
+function listModelOptions(ctx: Ctx): Array<{ title: string; value: string; description: string }> {
+  let models = ctx.location.model.list?.() ?? []
+  if (!models.length) {
+    try {
+      await ctx.location.model.sync()
+    } catch {
+      // ignore sync errors
+    }
+    models = ctx.location.model.list?.() ?? []
+  }
+  return models
+    .filter((m: any) => m.enabled !== false && m.status !== "deprecated")
+    .sort((a: any, b: any) => {
+      if (a.providerID !== b.providerID) return a.providerID.localeCompare(b.providerID)
+      return a.modelID.localeCompare(b.modelID)
+    })
+    .map((m: any) => {
+      const id = `${m.providerID}/${m.modelID}`
+      const ctxLimit = Math.round((m.limit?.context ?? 0) / 1000)
+      const desc = m.name ? `${m.name} · ${ctxLimit}k ctx` : id
+      return { title: id, value: id, description: desc }
+    })
+}
+
+async function askModel(ctx: Ctx, title: string, current: string): Promise<string | undefined> {
+  const modelOptions = listModelOptions(ctx)
+  const options = [
+    { title: "✎ Saisir à la main…", value: "__manual__", description: "provider/model (ou provider/model#variant)" },
+    ...modelOptions,
+  ]
+
+  if (modelOptions.length === 0) {
+    return await ask(ctx, { title, placeholder: "provider/model", value: current || "" }, checkModel)
+  }
+
+  for (;;) {
+    const choice = await ctx.ui.dialog.select<string>({
+      title,
+      placeholder: "recherche : tape un morceau de provider ou de modèle",
+      options,
+      current: current || undefined,
+      search: (q: string, opts: any[]) => {
+        const s = q.trim().toLowerCase()
+        if (!s) return opts
+        return opts.filter(o => `${o.title} ${o.description ?? ""}`.toLowerCase().includes(s))
+      },
+    })
+    if (choice === undefined) return undefined
+    if (choice === "__manual__") {
+      return await ask(ctx, { title, placeholder: "provider/model", value: current || "" }, checkModel)
+    }
+    const checked = checkModel(choice)
+    if (checked.error) {
+      await ctx.ui.dialog.alert({ title: "Valeur invalide", message: checked.error })
+      continue
+    }
+    return checked.value
+  }
+}
+
 function checkManifest(raw: string): Check {
   const value = raw.trim()
   if (!value) return { value: undefined }
@@ -434,63 +494,40 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
 
     if (execMode === "goal") {
       // Mode goal : un seul modèle pour la session
-      const modelChoice = await ask(
-        ctx,
-        {
-          title: "Modèle (provider/model, vide = défaut de l'agent)",
-          placeholder: "nvidia/nemotron-3-ultra",
-          value: prefill?.goal?.model || "",
-        },
-        checkModel,
-      )
+      const goalModelLegacy = prefill?.goal?.model || ""
+      const modelChoice = await askModel(ctx, "Modèle de la session", goalModelLegacy)
       if (modelChoice === undefined) return
       if (modelChoice) goalModel = modelChoice
     } else {
       // Mode orchestrator : 4 modèles distincts
-      const orchestratorModel = await ask(
+      const orchestratorModel = await askModel(
         ctx,
-        {
-          title: "Modèle orchestrator (session)",
-          placeholder: "nvidia/nemotron-3-ultra",
-          value: prefill?.goal?.agents?.orchestrator || prefill?.goal?.model || "",
-        },
-        checkModel,
+        "Modèle orchestrator (session)",
+        prefill?.goal?.agents?.orchestrator || prefill?.goal?.model || ""
       )
       if (orchestratorModel === undefined) return
       if (orchestratorModel) goalAgents.orchestrator = orchestratorModel
 
-      const workerModel = await ask(
+      const workerModel = await askModel(
         ctx,
-        {
-          title: "Modèle worker",
-          placeholder: "nvidia/qwen-opus",
-          value: prefill?.goal?.agents?.worker || "",
-        },
-        checkModel,
+        "Modèle worker",
+        prefill?.goal?.agents?.worker || ""
       )
       if (workerModel === undefined) return
       if (workerModel) goalAgents.worker = workerModel
 
-      const reviewerModel = await ask(
+      const reviewerModel = await askModel(
         ctx,
-        {
-          title: "Modèle reviewer",
-          placeholder: "cline-pass/glm-5.3-flash",
-          value: prefill?.goal?.agents?.reviewer || "",
-        },
-        checkModel,
+        "Modèle reviewer",
+        prefill?.goal?.agents?.reviewer || ""
       )
       if (reviewerModel === undefined) return
       if (reviewerModel) goalAgents.reviewer = reviewerModel
 
-      const mergerModel = await ask(
+      const mergerModel = await askModel(
         ctx,
-        {
-          title: "Modèle merger",
-          placeholder: "nvidia/nemotron-3-ultra",
-          value: prefill?.goal?.agents?.merger || "",
-        },
-        checkModel,
+        "Modèle merger",
+        prefill?.goal?.agents?.merger || ""
       )
       if (mergerModel === undefined) return
       if (mergerModel) goalAgents.merger = mergerModel
