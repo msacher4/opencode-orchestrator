@@ -253,32 +253,178 @@ function checkModel(raw: string): Check {
   return { value: canonical }
 }
 
-async function listModelOptions(ctx: Ctx): Promise<Array<{ title: string; value: string; description: string }>> {
-  let models = ctx.location.model.list?.() ?? []
-  if (!models.length) {
-    try {
-      await ctx.location.model.sync()
-    } catch {
-      // ignore sync errors
-    }
-    models = ctx.location.model.list?.() ?? []
+/* ───────── model catalogue (copied from orch-ui/tui.ts) ───────── */
+
+const FALLBACK_MODELS = [
+  "llama-local/qwen-opus",
+  "llama-local/qwen3.6q4",
+  "llama-local/qwen3.6iq3-150k",
+  "llama-local/ornith1.5-9b",
+  "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b",
+  "nvidia/z-ai/glm-5.3-flash",
+  "cline-pass/cline-pass/glm-5.3-flash",
+  "opencode/deepseek-v4.1-flash-free",
+]
+
+type ModelOption = { id: string; description: string }
+
+function providerLabel(providerID: string): string {
+  const known: { [k: string]: string } = {
+    "llama-local": "llama-local (local)",
+    "llama-proxy": "llama-proxy (local)",
+    nvidia: "NVIDIA NIM",
+    "cline-pass": "Cline Pass",
+    openrouter: "OpenRouter",
+    opencode: "OpenCode Zen",
+    anthropic: "Anthropic",
+    openai: "OpenAI",
+    google: "Google",
   }
-  return models
-    .filter((m: any) => m.enabled !== false && m.status !== "deprecated")
-    .sort((a: any, b: any) => {
-      if (a.providerID !== b.providerID) return a.providerID.localeCompare(b.providerID)
-      return a.modelID.localeCompare(b.modelID)
-    })
-    .map((m: any) => {
-      const id = `${m.providerID}/${m.modelID}`
-      const ctxLimit = Math.round((m.limit?.context ?? 0) / 1000)
-      const desc = m.name ? `${m.name} · ${ctxLimit}k ctx` : id
-      return { title: id, value: id, description: desc }
-    })
+  return known[providerID] || providerID
 }
 
-async function askModel(ctx: Ctx, title: string, current: string): Promise<string | undefined> {
-  const modelOptions = await listModelOptions(ctx)
+function isFreeModel(id: string): boolean {
+  return /free/i.test(id)
+}
+
+function isLocalModel(id: string): boolean {
+  return id.startsWith("llama-local/") || id.startsWith("llama-proxy/")
+}
+
+// Mirror of the guard's policy: the popup must never offer a model the guard
+// would refuse at spawn time.
+//   worker / merger → execution models: free, local, nvidia, cline-pass,
+//                   openrouter only when :free / -free.
+//   reviewer        → review pool + free + local.
+function modelAllowedFor(role: string, id: string): boolean {
+  // orchestrator role (session model) is not subject to the execution pool
+  if (role === "orchestrator") return true
+
+  const free = isFreeModel(id)
+  const local = isLocalModel(id)
+  if (role === "reviewer") {
+    return free || local
+      || id.startsWith("cline-pass/")
+      || id === "opencode/glm-5.3-flash-free"
+      || id === "opencode/claude-sonnet-5"
+      || id === "opencode/gpt-5.6-sol"
+  }
+  if (free || local) return true
+  if (id.startsWith("nvidia/") || id.startsWith("cline-pass/")) return true
+  if (id.startsWith("openrouter/")) return /:free|-free/i.test(id)
+  return false
+}
+
+async function readCatalog(ctx: Ctx): Promise<ModelOption[] | null> {
+  try {
+    const client: any = ctx?.client
+    if (!client || !client.model) return null
+    const listFn = client.model.list
+    if (typeof listFn !== "function") return null
+    const res: any = await listFn.call(client.model)
+    const data: any[] = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : [])
+    if (!data.length) return null
+
+    const labels: { [k: string]: string } = {}
+    try {
+      const provFn = client.provider && client.provider.list
+      if (typeof provFn === "function") {
+        const pres: any = await provFn.call(client.provider)
+        const providers: any[] = Array.isArray(pres?.data) ? pres.data : (Array.isArray(pres) ? pres : [])
+        for (const p of providers) {
+          if (p && p.id) labels[String(p.id)] = String(p.name || p.id)
+        }
+      }
+    } catch { /* provider names are cosmetic */ }
+
+    const seen: { [k: string]: boolean } = {}
+    const out: ModelOption[] = []
+    for (const m of data) {
+      const providerID = String(m?.providerID ?? "")
+      const id = String(m?.id ?? "")
+      if (!providerID || !id) continue
+      const full = `${providerID}/${id}`
+      if (seen[full]) continue
+      seen[full] = true
+      out.push({ id: full, description: labels[providerID] || providerLabel(providerID) })
+    }
+    return out.length ? out : null
+  } catch {
+    return null
+  }
+}
+
+async function listModelOptions(ctx: Ctx, role: string): Promise<Array<{ title: string; value: string; description: string }>> {
+  const sortByValue = (list: Array<{ title: string; value: string; description: string }>) =>
+    list.slice().sort((a, b) => a.value.localeCompare(b.value))
+
+  // a) ctx.client.model.list
+  try {
+    const client: any = ctx?.client
+    if (client && client.model && typeof client.model.list === "function") {
+      const res: any = await client.model.list.call(client.model)
+      const data: any[] = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : [])
+      if (data.length) {
+        const seen: { [k: string]: boolean } = {}
+        const out: Array<{ title: string; value: string; description: string }> = []
+        for (const m of data) {
+          const providerID = String(m?.providerID ?? "")
+          const id = String(m?.id ?? "")
+          if (!providerID || !id) continue
+          const full = `${providerID}/${id}`
+          if (seen[full]) continue
+          seen[full] = true
+          if (!modelAllowedFor(role, full)) continue
+          out.push({
+            title: full,
+            value: full,
+            description: providerLabel(providerID) + (m.name ? ` · ${m.name}` : ""),
+          })
+        }
+        if (out.length) return sortByValue(out)
+      }
+    }
+  } catch { /* ignore, fall through */ }
+
+  // b) ctx.location.model.list
+  try {
+    const models = ctx.location?.model?.list?.() ?? []
+    if (models.length) {
+      const seen: { [k: string]: boolean } = {}
+      const out: Array<{ title: string; value: string; description: string }> = []
+      for (const m of models) {
+        const providerID = String(m?.providerID ?? "")
+        const modelID = String(m?.modelID ?? "")
+        if (!providerID || !modelID) continue
+        const full = `${providerID}/${modelID}`
+        if (seen[full]) continue
+        seen[full] = true
+        if (!modelAllowedFor(role, full)) continue
+        const ctxLimit = Math.round((m.limit?.context ?? 0) / 1000)
+        const desc = m.name ? `${m.name} · ${ctxLimit}k ctx` : full
+        out.push({ title: full, value: full, description: providerLabel(providerID) + (m.name ? ` · ${m.name}` : "") })
+      }
+      if (out.length) return sortByValue(out)
+    }
+  } catch { /* ignore, fall through */ }
+
+  // c) FALLBACK_MODELS
+  const fallback = FALLBACK_MODELS
+    .filter((id) => modelAllowedFor(role, id))
+    .map((id) => ({
+      title: id,
+      value: id,
+      description: providerLabel(id.split("/")[0]),
+    }))
+  return sortByValue(fallback.length ? fallback : FALLBACK_MODELS.map((id) => ({
+    title: id,
+    value: id,
+    description: providerLabel(id.split("/")[0]),
+  })))
+}
+
+async function askModel(ctx: Ctx, title: string, current: string, role: string): Promise<string | undefined> {
+  const modelOptions = await listModelOptions(ctx, role)
   const options = [
     { title: "✎ Saisir à la main…", value: "__manual__", description: "provider/model (ou provider/model#variant)" },
     ...modelOptions,
@@ -495,7 +641,7 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
     if (execMode === "goal") {
       // Mode goal : un seul modèle pour la session
       const goalModelLegacy = prefill?.goal?.model || ""
-      const modelChoice = await askModel(ctx, "Modèle de la session", goalModelLegacy)
+      const modelChoice = await askModel(ctx, "Modèle de la session", goalModelLegacy, "orchestrator")
       if (modelChoice === undefined) return
       if (modelChoice) goalModel = modelChoice
     } else {
@@ -503,7 +649,8 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       const orchestratorModel = await askModel(
         ctx,
         "Modèle orchestrator (session)",
-        prefill?.goal?.agents?.orchestrator || prefill?.goal?.model || ""
+        prefill?.goal?.agents?.orchestrator || prefill?.goal?.model || "",
+        "orchestrator"
       )
       if (orchestratorModel === undefined) return
       if (orchestratorModel) goalAgents.orchestrator = orchestratorModel
@@ -511,7 +658,8 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       const workerModel = await askModel(
         ctx,
         "Modèle worker",
-        prefill?.goal?.agents?.worker || ""
+        prefill?.goal?.agents?.worker || "",
+        "worker"
       )
       if (workerModel === undefined) return
       if (workerModel) goalAgents.worker = workerModel
@@ -519,7 +667,8 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       const reviewerModel = await askModel(
         ctx,
         "Modèle reviewer",
-        prefill?.goal?.agents?.reviewer || ""
+        prefill?.goal?.agents?.reviewer || "",
+        "reviewer"
       )
       if (reviewerModel === undefined) return
       if (reviewerModel) goalAgents.reviewer = reviewerModel
@@ -527,7 +676,8 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       const mergerModel = await askModel(
         ctx,
         "Modèle merger",
-        prefill?.goal?.agents?.merger || ""
+        prefill?.goal?.agents?.merger || "",
+        "merger"
       )
       if (mergerModel === undefined) return
       if (mergerModel) goalAgents.merger = mergerModel
