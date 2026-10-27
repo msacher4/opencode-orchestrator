@@ -253,7 +253,7 @@ function checkModel(raw: string): Check {
   return { value: canonical }
 }
 
-function listModelOptions(ctx: Ctx): Array<{ title: string; value: string; description: string }> {
+async function listModelOptions(ctx: Ctx): Promise<Array<{ title: string; value: string; description: string }>> {
   let models = ctx.location.model.list?.() ?? []
   if (!models.length) {
     try {
@@ -278,7 +278,7 @@ function listModelOptions(ctx: Ctx): Array<{ title: string; value: string; descr
 }
 
 async function askModel(ctx: Ctx, title: string, current: string): Promise<string | undefined> {
-  const modelOptions = listModelOptions(ctx)
+  const modelOptions = await listModelOptions(ctx)
   const options = [
     { title: "✎ Saisir à la main…", value: "__manual__", description: "provider/model (ou provider/model#variant)" },
     ...modelOptions,
