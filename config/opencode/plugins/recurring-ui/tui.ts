@@ -244,13 +244,11 @@ function checkYearly(raw: string): Check {
 function checkModel(raw: string): Check {
   const value = raw.trim()
   if (!value) return { value: undefined }
-  const re = /^([a-z0-9][a-z0-9._-]*)\/([a-z0-9][a-z0-9._-]*)(\/([a-z0-9._-]+))?$/i
+  const re = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)+(#[a-z0-9._-]+)?$/i
   if (!re.test(value)) {
-    return { error: "Format attendu : provider/model ou provider/model#variant (ex : nvidia/nemotron-3-ultra ou nvidia/nemotron-3-ultra#main)" }
+    return { error: "Format attendu : provider/model, provider/model/sous-modele ou provider/model#variant (ex : opencode/deepseek-v4.1-flash-free ou nvidia/nvidia/nemotron-3-ultra-550b-a55b)" }
   }
-  // Convert /variant to #variant for engine compatibility
-  const canonical = value.replace(/\/([a-z0-9._-]+)$/, '#$1')
-  return { value: canonical }
+  return { value }
 }
 
 /* ───────── model catalogue (copied from orch-ui/tui.ts) ───────── */
