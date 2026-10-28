@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenCode Headless Server
+Documentation=https://opencode.ai/docs/server
+After=network.target
+
+[Service]
+Type=simple
+User=marcs
+Group=marcs
+WorkingDirectory=/media/marcs/Linux_Apps/Projets_AI
+Environment=OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true
+Environment=OPENCODE_DISABLE_AUTOUPDATE=true
+Environment=XDG_DATA_HOME=/media/marcs/Linux_Apps/.local/share
+ExecStart=/home/marcs/.opencode/bin/opencode serve --port 4096 --hostname 127.0.0.1
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
