@@ -171,6 +171,36 @@ def _save_state(state: dict):
 
 
 state = _load_state()
+
+_INSTANCES = None
+
+
+def instances():
+    global _INSTANCES
+    if _INSTANCES is None:
+        _INSTANCES = parse_instances()
+    return _INSTANCES
+
+
+def default_instance():
+    return next(iter(instances()))
+
+
+def _cur(chat_id):
+    """Session courante du chat, migrée depuis l'ancien format str."""
+    cid = str(chat_id)
+    c = state.get(cid, {}).get("current")
+    if isinstance(c, str):
+        c = {"instance": default_instance(), "sid": c}
+        state.setdefault(cid, {})["current"] = c
+        _save_state(state)
+    return c
+
+
+def _set_cur(chat_id, instance, sid):
+    cid = str(chat_id)
+    state.setdefault(cid, {})["current"] = {"instance": instance, "sid": sid}
+    _save_state(state)
 log.info("Chats suivis: %d", len(state))
 
 
