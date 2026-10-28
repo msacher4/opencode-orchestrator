@@ -526,46 +526,94 @@ async def send_message(chat_id: int, text: str):
         )
 
 
-async def handle_sessions_list(chat_id: int):
+def _resolve_instances(arg: str):
+    """arg si c'est le nom d'une instance connue, sinon None (toutes)."""
+    if not arg:
+        return None
+    if arg in instances():
+        return [arg]
+    return None
+
+
+async def handle_sessions_list(chat_id: int, arg: str):
+    """/sessions [v1|v2|suite] : liste multi-instances paginée (10 par page).
+
+    - arg = nom d'une instance connue -> liste seulement celle-ci ; sinon toutes.
+    - instance injoignable -> ligne « ⚠️ <nom> injoignable » sans bloquer.
+    - la page affichée est mémorisée dans state[cid]["page_rows"] : /select
+      pioche dedans, sans recalcul.
+    - ◀️ marque la session courante.
+    """
     cid = str(chat_id)
-    try:
-        all_sessions = await list_sessions()
-    except Exception as e:
-        log.error("Erreur liste sessions: %s", e)
-        await send_message(chat_id, f"❌ Erreur récupération sessions : {e}")
-        return
+    results = await cli_list_sessions(instances())
 
-    if not all_sessions:
-        await send_message(chat_id, "Aucune session. Envoie `/newsession` pour en créer une.")
-        return
+    wanted = _resolve_instances(arg)
 
-    sorted_sessions = sorted(all_sessions, key=lambda s: s.get("time", {}).get("created", 0), reverse=True)
-    current_sid = state.get(cid, {}).get("current")
+    rows = []
+    for name, res in results.items():
+        if wanted is not None and name not in wanted:
+            continue
+        if res.get("unreachable"):
+            rows.append({"warning": f"⚠️ {name} injoignable"})
+            continue
+        for s in res.get("sessions", []):
+            rows.append(
+                {
+                    "instance": name,
+                    "sid": s["sid"],
+                    "title": s["title"],
+                    "agent": s["agent"],
+                }
+            )
 
-    show_all = len(sorted_sessions) <= 30
-    limit = None if show_all else 20
-    displayed = sorted_sessions[:limit]
+    current = _cur(chat_id)
+
+    if arg == "suite":
+        page = state.get(cid, {}).get("page", 0) + 1
+    else:
+        page = 0
+
+    state.setdefault(cid, {})
+    page_rows = rows[page * 10 : (page + 1) * 10]
+    state[cid]["page"] = page
+    state[cid]["page_rows"] = page_rows
+    _save_state(state)
 
     lines = []
-    for i, s in enumerate(displayed, 1):
-        sid = s["id"]
-        title = s.get("title", sid[:12])
-        marker = " ◀️" if sid == current_sid else ""
-        model = s.get("model", {}).get("id", "?")
-        agent = s.get("agent", "?")
-        agent_icon = "📋" if agent == "plan" else "🔧"
-        lines.append(f"{i}. `{title}`{marker}  {agent_icon}`{agent}`  _{model}_")
+    for row in page_rows:
+        if "warning" in row:
+            lines.append(row["warning"])
+            continue
+        marker = ""
+        if (
+            current
+            and current.get("instance") == row["instance"]
+            and current.get("sid") == row["sid"]
+        ):
+            marker = " ◀️"
+        agent_icon = "📋" if row["agent"] == "plan" else "🔧"
+        lines.append(f"{row['instance']}: {row['title']}{marker}  {agent_icon}`{row['agent']}`")
 
-    total = len(sorted_sessions)
-    if limit and total > limit:
-        lines.append(f"\n... et {total - limit} autres sessions")
+    total = len(rows)
+    pages = (total + 9) // 10 if total else 1
+    if arg == "suite":
+        lines.append("")
+        lines.append("Utilise `/sessions` pour revenir à la première page.")
+    else:
+        lines.append(f"\nPage {page + 1} sur {pages}")
+        lines.append("Utilise `/sessions suite` pour la page suivante.")
     lines.append("")
-    lines.append("Utilise `/select <n>` pour changer de session active.")
+    lines.append("Utilise `/select <n>` pour choisir une session active.")
 
     await send_message(chat_id, "\n".join(lines))
 
 
 async def handle_select(chat_id: int, arg: str):
+    """/select <n> : borné à la page affichée (state[cid]["page_rows"]).
+
+    - n hors page -> message clair, sans devinette.
+    - sélection via _set_cur (instance + sid), puis confirmation.
+    """
     cid = str(chat_id)
 
     if not arg:
@@ -578,42 +626,27 @@ async def handle_select(chat_id: int, arg: str):
         await send_message(chat_id, "Le numéro doit être un entier.")
         return
 
-    try:
-        all_sessions = await list_sessions()
-    except Exception as e:
-        await send_message(chat_id, f"❌ Erreur : {e}")
+    page_rows = state.get(cid, {}).get("page_rows")
+    if not page_rows:
+        await send_message(chat_id, "Aucune liste de sessions en mémoire. Envoie `/sessions` d'abord.")
         return
 
-    if not all_sessions:
-        await send_message(chat_id, "Aucune session disponible.")
+    idx = n - 1
+    if idx < 0 or idx >= len(page_rows):
+        await send_message(chat_id, f"Numéro hors page. Choisis entre 1 et {len(page_rows)}.")
         return
 
-    sorted_sessions = sorted(all_sessions, key=lambda s: s.get("time", {}).get("created", 0), reverse=True)
-
-    if n < 1 or n > len(sorted_sessions):
-        await send_message(chat_id, f"Numéro invalide. Choisis entre 1 et {len(sorted_sessions)}.")
+    row = page_rows[idx]
+    if "warning" in row:
+        await send_message(chat_id, row["warning"])
         return
 
-    selected = sorted_sessions[n - 1]
-    sid = selected["id"]
-    title = selected.get("title", sid[:12])
+    _set_cur(chat_id, row["instance"], row["sid"])
 
-    if cid not in state:
-        state[cid] = {}
-    state[cid]["current"] = sid
-    _save_state(state)
-
-    try:
-        ctx = await get_session_context_tokens(sid)
-        suffix = f"  (contexte {_fmt_tokens(ctx)} tokens)" if ctx else ""
-    except Exception:
-        suffix = ""
-
-    agent = selected.get("agent", state.get(cid, {}).get("agent", "build"))
+    title = row.get("title", row["sid"][:12])
+    agent = row.get("agent", "build")
     agent_icon = "📋" if agent == "plan" else "🔧"
-    state.setdefault(cid, {})["agent"] = agent
-    _save_state(state)
-    await send_message(chat_id, f"✅ Session active : `{title}`  {agent_icon}`{agent}`{suffix}")
+    await send_message(chat_id, f"✅ Session active : `{title}`  {agent_icon}`{agent}`  [{row['instance']}]")
 
 
 async def handle_newsession(chat_id: int):
@@ -895,7 +928,10 @@ async def main():
                             await handle_newsession(chat_id)
 
                         elif cmd == "/sessions":
-                            await handle_sessions_list(chat_id)
+                            await handle_sessions_list(
+                                chat_id,
+                                text.lower().split()[1] if len(text.split()) > 1 else "",
+                            )
 
                         elif cmd == "/select":
                             await handle_select(chat_id, text.lower().split()[1] if len(text.split()) > 1 else "")
