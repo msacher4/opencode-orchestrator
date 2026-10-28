@@ -1302,6 +1302,46 @@ const POOL = {
     }
     return false
   },
+  // Nouveau : libère le slot le plus récent pour un parent donné, sans dépendre d'args.
+  // - Parmi les slots dont parent === parent, prend le plus récent (since max).
+  // - Si ce slot a bg === true, ne rien faire (background encore vivant).
+  // - Sinon le retire, POOL.save, et trace "slot libéré : <step> (<raison>)".
+  releaseLatestFor(parent, reason = "fin spawn") {
+    const live = POOL.load()
+    const p = String(parent || "")
+    if (!p) return false
+    let idx = -1
+    let latestSince = -1
+    for (let i = 0; i < live.length; i++) {
+      const s = live[i]
+      if (String(s.parent || "") === p) {
+        const since = Number(s.since || 0)
+        if (since > latestSince) {
+          latestSince = since
+          idx = i
+        }
+      }
+    }
+    if (idx >= 0) {
+      const slot = live[idx]
+      if (slot.bg === true) {
+        // Background encore vivant : on ne libère pas
+        return false
+      }
+      const removed = live.splice(idx, 1)[0]
+      POOL.save(live)
+      audit({
+        kind: "slot-release",
+        reason,
+        step: String(removed.step || ""),
+        agent: String(removed.agent || ""),
+        model: String(removed.model || ""),
+        parent: p,
+      })
+      return true
+    }
+    return false
+  },
   // Purge les slots dont l'étape est terminée dans son manifest. Sûreté :
   // manifest absent/illisible → ne purge pas (le TTL reste le filet) ; étape
   // introuvable → ne purge pas ; slot sans step → purgé par le TTL seulement.
@@ -1854,6 +1894,10 @@ export default {
     })
     // tool.execute.after sur subagent : si le runtime refuse/interrompt le spawn,
     // on libère le slot qu'il occupait (sinon bloqué 45 min par le TTL).
+    // NOUVEAU : on ne dépend plus de input.args (absent) — on libère le slot le plus
+    // récent pour ce parent. Que le spawn ait réussi ou échoué, le tool est rendu ⇒
+    // le foreground est fini. input.error / output.status === "error" servent
+    // UNIQUEMENT à choisir la raison ("échec spawn" sinon "fin spawn").
     await ctx.tool.hook("execute.after", async (input) => {
       // Ce hook ne doit JAMAIS lever : une exception ici casserait l'agent.
       try {
@@ -1861,7 +1905,7 @@ export default {
         if (!SPAWN_TOOL.test(tool)) return
         const output = (input && input.output) || {}
         const outText = String(output.title || output.output || output.metadata || "")
-        // Détection d'échec STRICTE (Point 4) :
+        // Détection d'échec STRICTE :
         // - input.error truthy (runtime throw)
         // - output.error
         // - output.status === "error"
@@ -1871,30 +1915,11 @@ export default {
           (output && output.status === "error") ||
           /invalid model|model not found|no such model|rate limit/i.test(outText)
         const sid = sessionId(input)
-        const args = (input && input.args) || {}
-        const manifest = manifestFor(sid)
-        const txt = manifest ? readText(manifest) : ""
-        const sub = String(args.agent || args.subagent || args.name || "").toLowerCase()
-        const model = cleanModelId(String(args.model || ""))
-        // Trouver le slot pour connaître son mode bg (foreground/background)
-        const live = POOL.load()
-        const slot = live.find((s) =>
-          String(s.parent || "") === sid &&
-          String(s.agent || "") === sub &&
-          String(s.manifest || "") === manifest &&
-          String(s.model || "").toLowerCase() === model.toLowerCase()
-        )
-        const isBackground = Boolean(slot && slot.bg === true)
-        // Libération SEULEMENT pour les spawns foreground (bg !== true).
-        // Un spawn background garde son slot (il tourne encore) : libéré par close d'étape ou TTL.
-        const shouldRelease = !isBackground
-        if (failed && shouldRelease && sid && manifest && model) {
-          POOL.releaseSpawn({ parent: sid, agent: sub, manifest, model, reason: "échec spawn" })
-        } else if (!failed && shouldRelease && sid && manifest && model) {
-          // Succès d'un spawn foreground : libérer aussi (l'étape est terminée)
-          POOL.releaseSpawn({ parent: sid, agent: sub, manifest, model, reason: "fin spawn" })
-        }
-        // Spawn background (isBackground === true) : on ne touche pas au slot ici.
+        if (!sid) return
+        const reason = failed ? "échec spawn" : "fin spawn"
+        // releaseLatestFor gère le bg check en interne : si le slot le plus récent
+        // a bg === true, il ne le libère pas (background encore vivant).
+        POOL.releaseLatestFor(sid, reason)
       } catch {
         // jamais casser l'agent : la libération du slot est best-effort (TTL en filet)
       }
