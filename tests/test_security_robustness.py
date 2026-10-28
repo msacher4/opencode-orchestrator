@@ -308,7 +308,8 @@ class RecursionBoundTests(unittest.TestCase):
 
 class ErrorHandlingTests(unittest.TestCase):
     """Erreurs 4xx/5xx : message lisible pour l'utilisateur, journalisé côté
-    serveur, sans exposer de secret."""
+    serveur, sans exposer de secret. Le corps de la réponse (tronqué ~300 chars)
+    est inclus dans le message utilisateur."""
 
     def setUp(self):
         self._saved_transport = _bridge.TRANSPORT
@@ -323,20 +324,23 @@ class ErrorHandlingTests(unittest.TestCase):
         _bridge._KIND_CACHE.clear()
 
     def test_4xx_error_message(self):
-        """Erreur 4xx -> message lisible, pas de détail technique."""
-        # Test de la logique de gestion d'erreur dans handle_message
+        """Erreur 4xx -> message inclut le corps de la réponse (tronqué)."""
         import inspect
         source = inspect.getsource(_bridge.handle_message)
         self.assertIn("400 <= status < 500", source)
-        self.assertIn("requête invalide", source)
+        self.assertIn("body_snippet", source)
         self.assertIn("log.error", source)
+        # Le message utilisateur inclut le corps tronqué
+        self.assertIn("{body_snippet}", source)
 
     def test_5xx_error_message(self):
-        """Erreur 5xx -> message lisible, pas de détail technique."""
+        """Erreur 5xx -> message inclut le corps de la réponse (tronqué)."""
         import inspect
         source = inspect.getsource(_bridge.handle_message)
         self.assertIn("500 <= status < 600", source)
-        self.assertIn("service indisponible", source)
+        self.assertIn("body_snippet", source)
+        # Le message utilisateur inclut le corps tronqué
+        self.assertIn("{body_snippet}", source)
 
     def test_no_secret_in_error_logs(self):
         """Vérifier qu'aucun secret n'est loggé dans les erreurs."""

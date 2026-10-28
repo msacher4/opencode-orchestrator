@@ -624,11 +624,11 @@ async def ensure_session_titled(cid: str, sid: str, first_text: str):
 
 
 def _resolve_instances(arg: str):
-    """arg si c'est le nom d'une instance connue, sinon None (toutes)."""
+    """Retourne le nom d'instance (str) si arg est connu, None si vide/inconnu."""
     if not arg:
         return None
     if arg in instances():
-        return [arg]
+        return arg
     return None
 
 
@@ -682,7 +682,7 @@ async def handle_sessions_list(chat_id: int, arg: str):
     warning_lines = []
     rows = []
     for name, res in results.items():
-        if wanted is not None and name not in wanted:
+        if wanted is not None and name != wanted:
             continue
         if res.get("unreachable"):
             warning_lines.append(f"⚠️ {name} injoignable")
@@ -783,9 +783,16 @@ async def handle_select(chat_id: int, arg: str):
 
 async def handle_newsession(chat_id: int, arg: str = ""):
     """/**newsession* [v1|v2] : nouvelle session sur une instance donnée.
-    Sans argument -> instance de la session courante, sinon la première configurée."""
+    Sans argument -> instance de la session courante, sinon la première configurée.
+    Instance inconnue -> message clair avec la liste des disponibles."""
     cid = str(chat_id)
-    inst_name = _resolve_instances(arg) or default_instance()
+    inst_name = _resolve_instances(arg)
+    if arg and inst_name is None:
+        available = ", ".join(instances().keys())
+        await send_message(chat_id, f"❌ Instance inconnue : {arg} — disponibles : {available}")
+        return
+    if inst_name is None:
+        inst_name = default_instance()
     inst = instances()[inst_name]
     try:
         s = await create_session_on_instance(inst, {})
@@ -1015,7 +1022,16 @@ async def handle_message(chat_id: int, text: str):
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             # Erreurs 4xx/5xx : message lisible pour l'utilisateur, journalisé
-            # côté serveur, sans exposer de secret.
+            # côté serveur, sans exposer de secret. On inclut le corps tronqué.
+            def _err_body(resp):
+                try:
+                    body = resp.json()
+                    text = json.dumps(body, ensure_ascii=False)
+                except Exception:
+                    text = resp.text or ""
+                return text[:300]
+
+            body_snippet = _err_body(e.response)
             if status == 404 and not recreated:
                 log.warning("Session %s introuvable (404), création d'une nouvelle (tentative unique)", sid)
                 recreated = True
@@ -1035,16 +1051,16 @@ async def handle_message(chat_id: int, text: str):
                     await tg_edit(chat_id, ack_msg_id, f"❌ Erreur création session : {e2}")
                     break
             elif 400 <= status < 500:
-                log.error("Erreur client HTTP %s: %s", status, e)
-                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur client ({status}) : requête invalide")
+                log.error("Erreur client HTTP %s: %s | body=%s", status, e, body_snippet)
+                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur client ({status}) : {body_snippet}")
                 break
             elif 500 <= status < 600:
-                log.error("Erreur serveur HTTP %s: %s", status, e)
-                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur serveur ({status}) : service indisponible")
+                log.error("Erreur serveur HTTP %s: %s | body=%s", status, e, body_snippet)
+                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur serveur ({status}) : {body_snippet}")
                 break
             else:
-                log.error("Erreur HTTP inattendue %s: %s", status, e)
-                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur HTTP ({status})")
+                log.error("Erreur HTTP inattendue %s: %s | body=%s", status, e, body_snippet)
+                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur HTTP ({status}) : {body_snippet}")
                 break
         except httpx.TimeoutException:
             log.error("Timeout lors de l'appel OpenCode")

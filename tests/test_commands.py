@@ -279,3 +279,129 @@ class SessionsPaginationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NewSessionTests(unittest.TestCase):
+    """Tests pour /newsession : résolution d'instance et message d'erreur clair."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
+        self._saved_state = _bridge.state
+        self._cid = "333"
+        # Mock Telegram
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            if "editMessageText" in str(request.url):
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True})
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+
+    def _fake_create_session(self, inst_name="v1"):
+        """Mock create_session_on_instance pour retourner une session valide."""
+        async def fake(inst, body=None):
+            return {"id": "ses_new", "title": "New session", "agent": "build"}
+        _bridge.create_session_on_instance = fake
+
+    def test_newsession_resolves_instance_v2(self):
+        """/newsession v2 résout correctement l'instance v2."""
+        self._fake_create_session("v2")
+        _bridge.state = {}
+        asyncio.run(_bridge.handle_newsession(int(self._cid), "v2"))
+        # Vérifier que la session a été créée sur v2
+        self.assertEqual(_bridge.state[self._cid]["current"]["instance"], "v2")
+        self.assertEqual(_bridge.state[self._cid]["current"]["sid"], "ses_new")
+
+    def test_newsession_unknown_instance_clear_error(self):
+        """/newsession v3 (inconnue) -> message clair avec liste dispo."""
+        _bridge.state = {}
+        # Capturer le message envoyé
+        sent_messages = []
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                import json as _json
+                payload = _json.loads(request.content)
+                sent_messages.append(payload["text"])
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            return httpx.Response(200, json={"ok": True})
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+        asyncio.run(_bridge.handle_newsession(int(self._cid), "v3"))
+        # Vérifier le message d'erreur
+        self.assertTrue(len(sent_messages) > 0)
+        self.assertIn("Instance inconnue : v3", sent_messages[0])
+        self.assertIn("disponibles : v1, v2", sent_messages[0])
+        # L'état ne doit pas être modifié
+        self.assertNotIn(self._cid, _bridge.state)
+
+
+class ErrorBodyTests(unittest.TestCase):
+    """Tests pour l'inclusion du corps de réponse dans les erreurs 4xx/5xx."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
+        self._saved_state = _bridge.state
+        self._cid = "444"
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+
+    def test_4xx_error_includes_response_body(self):
+        """Erreur 400 sur cli_prompt -> message utilisateur contient le corps tronqué."""
+        _bridge.state = {self._cid: {"current": {"instance": "v2", "sid": "ses_abc"}, "agent": "build"}}
+
+        # Mock pour simuler un 400 avec corps JSON
+        def make_transport():
+            def handler(request):
+                path = request.url.path
+                if path == "/api/session":
+                    return httpx.Response(200, json={"data": [{"id": "ses_abc", "title": "Test", "agent": "build"}]})
+                if "/api/session/ses_abc/prompt" in path:
+                    # Retourne 400 avec corps détaillé
+                    return httpx.Response(
+                        400,
+                        json={"_tag": "InvalidRequestError", "message": "Invalid payload: missing required field 'agents'", "kind": "Payload", "details": {"field": "agents"}}
+                    )
+                if "/api/session/ses_abc/message" in path:
+                    return httpx.Response(200, json={"data": []})
+                return httpx.Response(404)
+            return httpx.MockTransport(handler)
+
+        _bridge.TRANSPORT = make_transport()
+
+        # Mock Telegram pour capturer le message d'erreur
+        sent_messages = []
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                import json as _json
+                payload = _json.loads(request.content)
+                sent_messages.append(payload["text"])
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            if "editMessageText" in str(request.url):
+                import json as _json
+                payload = _json.loads(request.content)
+                sent_messages.append(payload["text"])
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True})
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+
+        asyncio.run(_bridge.handle_message(int(self._cid), "test prompt"))
+
+        # Vérifier que le message d'erreur contient le corps de la réponse
+        self.assertTrue(len(sent_messages) > 0)
+        error_msg = sent_messages[-1]  # Dernier message (editMessageText)
+        self.assertIn("400", error_msg)
+        self.assertIn("Invalid payload", error_msg)
+        self.assertIn("missing required field", error_msg)
+        # Le corps doit être tronqué à ~300 chars
+        self.assertLessEqual(len(error_msg), 500)  # Marge raisonnable
