@@ -92,6 +92,16 @@ function paidDeclared(txt, step, model) {
   return ids.map(norm).filter(Boolean).includes(model)
 }
 
+// Nettoie un id de modèle : trim + retire backticks UNIQUEMENT. Ne supprime AUCUN préfixe.
+// Ex: `nvidia/nvidia/nemotron-3-ultra-550b-a55b` → nvidia/nvidia/nemotron-3-ultra-550b-a55b
+function cleanModelId(id) {
+  return String(id || "").trim().replace(/^`|`$/g, "")
+}
+
+// TODO (Point 2) : validation catalogue avant POOL.add
+// Lire Opencodev2/plugin-sdk/node_modules/@opencode/plugin/dist/promise/model.d.ts
+// Si l'API ne permet pas de lister les ids sans ambiguïté, NE PAS IMPLÉMENTER.
+
 const SHELL_TOOL = /^(shell|bash|pty)$/i
 const SPAWN_TOOL = /^(subagent|task)$/i
 const WRITE_TOOL =
@@ -937,19 +947,32 @@ function normalizeManifest(txt) {
 export function parseSteps(txt) {
   const steps = []
   const seen = {}
-  for (const block of normalizeManifest(String(txt)).split(/^#{2,3} /m).slice(1)) {
+  for (const block of normalizeManifest(String(txt)).split(/^#{2,4} /m).slice(1)) {
     const get = (re) => {
       const m = block.match(re)
       return m ? m[1].trim() : ""
     }
+    const rawTitle = block.split("\n")[0].trim()
+    const explicitId = get(/^-\s*id\s*:\s*(.+)$/im)
+    let id = explicitId
+    if (!id) {
+      const beforeDash = rawTitle.split("—")[0].trim()
+      if (beforeDash) {
+        id = beforeDash
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, "-")
+          .replace(/[^a-z0-9-]/g, "")
+      }
+    }
     const step = {
-      title: block.split("\n")[0].trim(),
-      id: get(/^-\s*id\s*:\s*(.+)$/im),
+      title: rawTitle,
+      id: id || "",
+      explicitId: !!explicitId,
       qui: get(/^-\s*Qui\s*:\s*(.+)$/im).toLowerCase(),
       scope: get(/^-\s*P[ée]rim[èe]tre\s*:\s*(.+)$/im),
       paid: get(/^-\s*Modèle payant\s*:\s*(.+)$/im),
-      // Modèle épinglé manuellement par Marc via /orchestrator (`- Modèle:`) — distinct
-      // de `- Modèle payant:` (la regex exige « Modèle » immédiatement suivi de « : »).
       model: get(/^-\s*Modèle\s*:\s*(.+)$/im),
       statut: get(/^-\s*Statut\s*:\s*(.+)$/im).toLowerCase(),
     }
@@ -957,7 +980,11 @@ export function parseSteps(txt) {
       if (seen[step.id]) {
         step.duplicate = true
         seen[step.id].duplicate = true
-        step.auditNote = "doublon d'id d'étape dans le manifest (« " + step.id + " ») : note d'audit, ni autorisation ni refus nouveau"
+        seen[step.id].superseded = true
+        seen[step.id] = step
+        const auditNote = "doublon d'id d'étape dans le manifest (« " + step.id + " ») : note d'audit, ni autorisation ni refus nouveau"
+        step.auditNote = auditNote
+        seen[step.id].auditNote = auditNote
       } else {
         seen[step.id] = step
       }
@@ -982,17 +1009,35 @@ function inScope(path, scopes) {
   })
 }
 
-const OPEN_STATUS = new Set(["annoncée", "annoncee", "lancée", "lancee", "rendue"])
+const OPEN_STATUS = new Set(["annoncée", "annoncee", "lancée", "lancee", "rendue", "en cours", "en-cours", "in progress", "running", "open", "active", "wip"])
+
+function normalizeStatut(statut) {
+  return String(statut || "")
+    .toLowerCase()
+    .replace(/\*\*/g, "")
+    .replace(/[🔘⏳✅❌🟡🟢🔴⚪🟣🟠🔵⏸▶⏹⏺]/g, "")
+    .replace(/[.,;:!?]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
 
 // Une seule étape active pour cet agent => périmètre applicable. Sinon (parallélisme),
 // on ne devine pas : le contrôle de périmètre est sauté et tracé.
 function activeStep(txt, agent) {
-  const active = parseSteps(txt).filter((s) => s.qui === agent && OPEN_STATUS.has(s.statut))
+  const active = parseSteps(txt).filter((s) => s.qui === agent && OPEN_STATUS.has(normalizeStatut(s.statut)) && !s.superseded)
   return active.length === 1 ? active[0] : null
 }
 
 function openStepFor(txt, agent) {
-  return parseSteps(txt).find((s) => s.qui === agent && OPEN_STATUS.has(s.statut)) || null
+  return parseSteps(txt).find((s) => s.qui === agent && OPEN_STATUS.has(normalizeStatut(s.statut)) && !s.superseded) || null
+}
+
+function stepDiag(txt, agent) {
+  const steps = parseSteps(txt).filter((s) => s.qui === agent && !s.superseded)
+  if (steps.length === 0) return { type: "none" }
+  const openSteps = steps.filter((s) => OPEN_STATUS.has(normalizeStatut(s.statut)))
+  if (openSteps.length > 0) return { type: "open", step: openSteps[openSteps.length - 1] }
+  return { type: "closed", step: steps[steps.length - 1] }
 }
 
 // ---------- binding subagent → manifest ----------
@@ -1096,11 +1141,24 @@ const POOL = {
     }
     const now = Date.now()
     const live = []
+    let ttlPurged = false
     for (const s of slots) {
       if (!s || typeof s !== "object") continue
       const since = Number(s.since)
       if (!Number.isFinite(since)) continue
-      if (!(now - since < SLOT_TTL)) continue
+      if (!(now - since < SLOT_TTL)) {
+        // TTL expired - audit trace
+        audit({
+          kind: "slot-release",
+          reason: "TTL",
+          step: String(s.step || ""),
+          agent: String(s.agent || ""),
+          model: String(s.model || ""),
+          parent: String(s.parent || ""),
+        })
+        ttlPurged = true
+        continue
+      }
       live.push({
         sessionID: String(s.sessionID || ""),
         parent: String(s.parent || ""),
@@ -1110,9 +1168,10 @@ const POOL = {
         step: String(s.step || ""),
         manifest: String(s.manifest || ""),
         since,
+        bg: Boolean(s.bg),
       })
     }
-    if (live.length !== slots.length) POOL.save(live)
+    if (live.length !== slots.length || ttlPurged) POOL.save(live)
     return live
   },
   save(slots) {
@@ -1160,13 +1219,16 @@ const POOL = {
     const live = POOL.load()
     const step = String((ctx && ctx.step) || "")
     const manifest = String((ctx && ctx.manifest) || "")
+    const agent = String((ctx && ctx.agent) || "")
+    const bg = Boolean((ctx && ctx.background) === true)
     if (step) {
       const occupied = live.find((s) =>
         String(s.manifest || "") === manifest &&
         String(s.step || "") === step
       )
       if (occupied) {
-        return "étape déjà occupée : " + step + " (worker " + m + " en cours) — attends la libération"
+        const ageMin = Math.round((Date.now() - Number(occupied.since || Date.now())) / 60000)
+        return "étape déjà occupée : " + step + " (" + (agent || occupied.agent || "worker") + " " + m + " depuis " + ageMin + " min) — attends la libération"
       }
     }
     live.push({
@@ -1178,6 +1240,7 @@ const POOL = {
       step: step,
       manifest: manifest,
       since: Date.now(),
+      bg,
     })
     POOL.save(live)
   },
@@ -1196,6 +1259,49 @@ const POOL = {
     )
     if (filtered.length !== live.length) POOL.save(filtered)
   },
+  // Retire le slot le plus récent correspondant à (parent, manifest, agent).
+  // Utilisé à la fin d'un spawn foreground (success ou échec) pour libérer immédiatement.
+  // reason: "fin spawn" (success) | "échec spawn" (failure) | "étape close" | "TTL"
+  releaseSpawn({ parent, agent, manifest, model, reason = "fin spawn" }) {
+    const live = POOL.load()
+    const p = String(parent || "")
+    const a = String(agent || "")
+    const man = String(manifest || "")
+    const m = String(model || "").toLowerCase()
+    if (!p || !a || !man) return false
+    // Trouver le slot le plus récent (plus grand since) qui match
+    let idx = -1
+    let latestSince = -1
+    for (let i = 0; i < live.length; i++) {
+      const s = live[i]
+      if (String(s.parent || "") === p &&
+          String(s.agent || "") === a &&
+          String(s.manifest || "") === man &&
+          String(s.model || "").toLowerCase() === m) {
+        const since = Number(s.since || 0)
+        if (since > latestSince) {
+          latestSince = since
+          idx = i
+        }
+      }
+    }
+    if (idx >= 0) {
+      const removed = live[idx]
+      live.splice(idx, 1)
+      POOL.save(live)
+      // Audit trace
+      audit({
+        kind: "slot-release",
+        reason,
+        step: String(removed.step || ""),
+        agent: a,
+        model: m,
+        parent: p,
+      })
+      return true
+    }
+    return false
+  },
   // Purge les slots dont l'étape est terminée dans son manifest. Sûreté :
   // manifest absent/illisible → ne purge pas (le TTL reste le filet) ; étape
   // introuvable → ne purge pas ; slot sans step → purgé par le TTL seulement.
@@ -1205,16 +1311,14 @@ const POOL = {
     let changed = false
     for (const s of live) {
       let purge = false
+      let reason = ""
       if (s.step && s.manifest) {
         const txt = readText(s.manifest)
         if (txt) {
           const step = parseSteps(txt).find((st) => st.id === s.step)
           if (step) {
-            purge = !OPEN_STATUS.has(step.statut)
-            // Filet pour un spawn interrompu sans erreur exploitable : étape encore ouverte
-            // mais slot plus vieux que 1/3 du TTL (15 min) → libéré. Le TTL de 45 min reste
-            // le filet final. Aucune observabilité disque/API n'est disponible ici.
-            if (!purge && Date.now() - s.since > SLOT_TTL / 3) purge = true
+            purge = !OPEN_STATUS.has(normalizeStatut(step.statut))
+            reason = "étape close"
           }
           // étape introuvable → on ne purge pas
         }
@@ -1223,6 +1327,14 @@ const POOL = {
       // slot sans step → pas de purge ici (TTL uniquement)
       if (purge) {
         changed = true
+        audit({
+          kind: "slot-release",
+          reason: reason || "étape close",
+          step: String(s.step || ""),
+          agent: String(s.agent || ""),
+          model: String(s.model || ""),
+          parent: String(s.parent || ""),
+        })
       } else {
         toKeep.push(s)
       }
@@ -1360,12 +1472,45 @@ export function check(input) {
       // Parallélisme autorisé : c'est le pool de slots (caps modèle + fournisseur) qui borne.
 
       const sub = String(args.agent || args.subagent || args.name || "").toLowerCase()
+      let step = null
+      let stepRefusalPushed = false
       if (!SPAWNABLE.has(sub)) {
         blocked.push("subagent non autorisé : " + (sub || "(vide)") + " — attendu worker, reviewer ou merger")
       } else {
         const txt = manifestPath ? readText(manifestPath) : ""
-        const step = manifestPath ? openStepFor(txt, sub) : null
-        const model = String(args.model || "")
+
+        // ---- RÉSOLUTION DE L'ÉTAPE PAR LE PROMPT (Point 3) ----
+        // Forme acceptée UNIQUEMENT : /(?:^|\s)étape\s+([a-zA-Z0-9_.-]+)/i sur args.prompt (sinon args.message)
+        const promptForStep = String(args.prompt || args.message || "")
+        const stepIdMatch = promptForStep.match(/(?:^|\s)étape\s+([a-zA-Z0-9_.-]+)/i)
+
+        if (stepIdMatch) {
+          const stepId = stepIdMatch[1]
+          const steps = parseSteps(txt).filter((s) => !s.superseded)
+          const foundStep = steps.find((s) => s.id === stepId)
+
+          if (foundStep) {
+            if (foundStep.qui !== sub) {
+              blocked.push("l'étape " + stepId + " est pour « " + foundStep.qui + " », pas « " + sub + " »")
+              stepRefusalPushed = true
+            } else if (!OPEN_STATUS.has(normalizeStatut(foundStep.statut))) {
+              blocked.push("l'étape " + stepId + " est fermée (Statut: " + foundStep.statut + ")")
+              stepRefusalPushed = true
+            } else {
+              step = foundStep
+            }
+          } else {
+            // id trouvé + inexistant → PAS de refus : repli sur openStepFor + note d'audit
+            step = openStepFor(txt, sub)
+            notes.push("id d'étape inconnu dans le prompt : " + stepId + " — repli sur " + (step ? step.id : "(aucune)"))
+          }
+        } else {
+          // aucun id dans le prompt → premier ouvert + note d'audit
+          step = openStepFor(txt, sub)
+          notes.push("spawn sans id d'étape dans le prompt")
+        }
+
+        const model = cleanModelId(String(args.model || ""))
 
         // SOUS VERROU ACTIF : modèle explicite OBLIGATOIRE
         if (nightActive && !model) {
@@ -1426,9 +1571,17 @@ export function check(input) {
         if (!pool.ok) blocked.push(pool.why)
         if (!manifestPath) {
           // déjà bloqué plus haut (pas de manifest à cette session) : on n'ajoute pas de bruit
-        } else if (!step) {
-          blocked.push("aucune étape en attente pour « " + sub + " » dans " + manifestPath + " — ajoute une étape (Qui: " + sub + ", Statut: annoncée)")
-        } else {
+        } else if (!step && !stepRefusalPushed) {
+          const diag = stepDiag(readText(manifestPath), sub)
+          if (diag.type === "none") {
+            blocked.push("aucun bloc « Qui: " + sub + " » dans " + manifestPath + " — champs requis : - id:, - Qui:, - Périmètre:, - Statut:")
+          } else if (diag.type === "closed") {
+            const rawStatut = diag.step.statut
+            blocked.push("étape de « " + sub + " » trouvée mais Statut: " + rawStatut + " — rouvre-la (Statut: annoncée) : " + diag.step.id)
+          } else {
+            blocked.push("aucune étape en attente pour « " + sub + " » dans " + manifestPath + " — ajoute une étape (Qui: " + sub + ", Statut: annoncée)")
+          }
+        } else if (step) {
           const scope = scopeList(step)
           if (!scope.length) notes.push("étape " + step.id + " sans périmètre : le worker ne sera pas borné")
           else notes.push("spawn " + sub + (model ? " [" + model + "]" : "") + " → étape " + step.id)
@@ -1454,17 +1607,18 @@ export function check(input) {
         }
       }
       if (!blocked.length) {
-        const m = String(args.model || "")
+        const m = cleanModelId(String(args.model || ""))
         if (m) {
-          const st = manifestPath ? openStepFor(readText(manifestPath), sub) : null
-            const refused = POOL.add(m, {
-              sessionID: String(args.sessionID || args.session_id || sid),
-              parent: sid,
-              agent: sub,
-              step: st ? st.id : "",
-              manifest: manifestPath,
-            })
-            if (refused) blocked.push(refused)
+          const st = step // utilise l'étape résolue (Point 4)
+          const refused = POOL.add(m, {
+            sessionID: String(args.sessionID || args.session_id || sid),
+            parent: sid,
+            agent: sub,
+            step: st ? st.id : "",
+            manifest: manifestPath,
+            background: Boolean(args.background === true),
+          })
+          if (refused) blocked.push(refused)
         }
         rememberSpawn(sub, manifestPath)
       }
@@ -1525,34 +1679,41 @@ export function check(input) {
     if (isShell) {
       if (!cmd) blocked.push("shell sans commande lisible par le guard")
       for (const seg of segments(cmd)) {
+        const why = mutating(seg)
+        if (why) {
+          blocked.push("commande mutatrice interdite au merger (" + why + ")")
+          break
+        }
         const w = firstWord(seg)
-        if (w !== "git") {
-          blocked.push("le merger n'exécute que git (" + (w || "?") + ")")
+        if (w !== "git" && w !== "cd" && w !== "ls" && w !== "echo" && w !== "cat") {
+          blocked.push("le merger n'exécute que git, cd, ls, echo, cat (" + (w || "?") + ")")
           break
         }
-        if (/\bgit\s+(pull|fetch|clone|remote\s+add)\b/.test(seg)) {
-          blocked.push("le merger ne fait pas de réseau git pull/fetch/clone/remote (" + seg + ")")
-          break
-        }
-        if (/\bgit\s+push\b/.test(seg)) {
-          if (/(--force\b|--force-with-lease|\s-f(?!\w)|--delete\b|\s-d(?!\w)|--mirror\b|--all\b|--tags\b)/.test(seg)) {
-            blocked.push("le merger ne force pas le push (" + seg + ")")
+        if (w === "git") {
+          if (/\bgit\s+(pull|fetch|clone|remote\s+add)\b/.test(seg)) {
+            blocked.push("le merger ne fait pas de réseau git pull/fetch/clone/remote (" + seg + ")")
             break
           }
-          // cible du push : refspec = 2e argument positionnel, destination après « : », refs/heads/ optionnel
-          const pushArgs = seg.replace(/^\s*git\s+push\b/, "").trim().split(/\s+/).filter(Boolean)
-          const positional = []
-          for (const a of pushArgs) {
-            const clean = a.replace(/^["']|["']$/g, "")
-            if (clean.startsWith("-")) continue
-            positional.push(clean)
-          }
-          const refspec = positional.length >= 2 ? positional[1] : ""
-          const dest = (refspec.includes(":") ? refspec.split(":").pop() : refspec) || ""
-          const branch = dest.replace(/^refs\/heads\//, "")
-          if (branch === "main" || branch === "master") {
-            blocked.push("le merger ne pousse pas main/master — branche dédiée obligatoire (orch/*) (" + seg + ")")
-            break
+          if (/\bgit\s+push\b/.test(seg)) {
+            if (/(--force\b|--force-with-lease|\s-f(?!\w)|--delete\b|\s-d(?!\w)|--mirror\b|--all\b|--tags\b)/.test(seg)) {
+              blocked.push("le merger ne force pas le push (" + seg + ")")
+              break
+            }
+            // cible du push : refspec = 2e argument positionnel, destination après « : », refs/heads/ optionnel
+            const pushArgs = seg.replace(/^\s*git\s+push\b/, "").trim().split(/\s+/).filter(Boolean)
+            const positional = []
+            for (const a of pushArgs) {
+              const clean = a.replace(/^["']|["']$/g, "")
+              if (clean.startsWith("-")) continue
+              positional.push(clean)
+            }
+            const refspec = positional.length >= 2 ? positional[1] : ""
+            const dest = (refspec.includes(":") ? refspec.split(":").pop() : refspec) || ""
+            const branch = dest.replace(/^refs\/heads\//, "")
+            if (branch === "main" || branch === "master") {
+              blocked.push("le merger ne pousse pas main/master — branche dédiée obligatoire (orch/*) (" + seg + ")")
+              break
+            }
           }
         }
       }
@@ -1660,7 +1821,7 @@ if (agent === "worker") {
   return { blocked: [...new Set(blocked)], notes, tool, text: String(cmd || firstPath(args)).slice(0, 800) }
 }
 
-export { jevSecondOpinion, jevHash, jevValidateApiAnswer, jevCacheKey, jevCacheGet, jevCacheSet, jevCachePurge, jevReadApiKey, jevCallApi, jevIsUnknownWordRefusal, jevIsArbitraryExecutionWrapper, jevLikelySecret }
+export { jevSecondOpinion, jevHash, jevValidateApiAnswer, jevCacheKey, jevCacheGet, jevCacheSet, jevCachePurge, jevReadApiKey, jevCallApi, jevIsUnknownWordRefusal, jevIsArbitraryExecutionWrapper, jevLikelySecret, POOL }
 
 export default {
   id: "orch-guard",
@@ -1700,22 +1861,40 @@ export default {
         if (!SPAWN_TOOL.test(tool)) return
         const output = (input && input.output) || {}
         const outText = String(output.title || output.output || output.metadata || "")
-        // Détection défensive : le runtime peut throw (output vide) ou signaler l'échec
-        // dans error/status ; sinon motif élargi (modèle invalide, indisponible, introuvable).
+        // Détection d'échec STRICTE (Point 4) :
+        // - input.error truthy (runtime throw)
+        // - output.error
+        // - output.status === "error"
+        // - motifs courts et explicites seulement
         const failed =
           Boolean((input && input.error) || output.error) ||
           (output && output.status === "error") ||
-          /error|fail|interrupt|refus|bloqu|exception|invalid model|model format|not found|unavailable|no such|introuvable/i.test(outText)
-        if (!failed) return
+          /invalid model|model not found|no such model|rate limit/i.test(outText)
         const sid = sessionId(input)
         const args = (input && input.args) || {}
         const manifest = manifestFor(sid)
         const txt = manifest ? readText(manifest) : ""
         const sub = String(args.agent || args.subagent || args.name || "").toLowerCase()
-        const step = txt ? openStepFor(txt, sub) : null
-        if (sid && step && manifest) {
-          POOL.removeSlot(sid, step.id, manifest)
+        const model = cleanModelId(String(args.model || ""))
+        // Trouver le slot pour connaître son mode bg (foreground/background)
+        const live = POOL.load()
+        const slot = live.find((s) =>
+          String(s.parent || "") === sid &&
+          String(s.agent || "") === sub &&
+          String(s.manifest || "") === manifest &&
+          String(s.model || "").toLowerCase() === model.toLowerCase()
+        )
+        const isBackground = Boolean(slot && slot.bg === true)
+        // Libération SEULEMENT pour les spawns foreground (bg !== true).
+        // Un spawn background garde son slot (il tourne encore) : libéré par close d'étape ou TTL.
+        const shouldRelease = !isBackground
+        if (failed && shouldRelease && sid && manifest && model) {
+          POOL.releaseSpawn({ parent: sid, agent: sub, manifest, model, reason: "échec spawn" })
+        } else if (!failed && shouldRelease && sid && manifest && model) {
+          // Succès d'un spawn foreground : libérer aussi (l'étape est terminée)
+          POOL.releaseSpawn({ parent: sid, agent: sub, manifest, model, reason: "fin spawn" })
         }
+        // Spawn background (isBackground === true) : on ne touche pas au slot ici.
       } catch {
         // jamais casser l'agent : la libération du slot est best-effort (TTL en filet)
       }
