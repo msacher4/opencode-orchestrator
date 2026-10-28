@@ -632,7 +632,7 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       current: prefillAgent,
     })
     if (!agentChoice) return
-    if (agentChoice !== "build" && agentChoice !== "orchestrator-auto") {
+    if (agentChoice !== "build") {
       goalAgent = agentChoice
     }
 
@@ -877,10 +877,14 @@ async function openList(ctx: Ctx) {
       if (result.error) {
         await ctx.ui.dialog.alert({ title: "Lancement impossible", message: result.error })
       } else {
+        const msg = result.warning
+          ? result.warning
+          : result.sessionTitle ?? result.sessionID ?? "session créée"
+        const variant = result.warning ? "success" : "success"
         ctx.ui.toast.show({
-          title: "Goal lancé",
-          message: result.sessionTitle ?? result.sessionID ?? "session créée",
-          variant: "success",
+          title: result.warning ? "Goal lancé (timeout commande)" : "Goal lancé",
+          message: msg,
+          variant,
           duration: 5000,
         })
       }
