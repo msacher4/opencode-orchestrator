@@ -33,7 +33,7 @@ STATE_FILE = os.getenv(
     "/media/marcs/Linux_Apps/Projets_AI/.opencode/tg-sessions.json",
 )
 
-if not TELEGRAM_TOKEN and "--api-probe" not in sys.argv:
+if not TELEGRAM_TOKEN and not any(x in sys.argv for x in ("--api-probe", "--selftest", "--notify-test")):
     log.error("TELEGRAM_TOKEN not set")
     sys.exit(1)
 
@@ -1156,8 +1156,63 @@ async def main():
                 poll_attempt += 1
 
 
+async def selftest(instances):
+    """--selftest : crée une session v2, envoie "Réponds exactement : PONG",
+    vérifie PONG reçu, sortie 0/1."""
+    # Trouver l'instance v2
+    inst = instances.get("v2")
+    if not inst:
+        print("ERREUR: instance v2 non trouvée dans OPENCODE_INSTANCES")
+        return False
+    try:
+        # Créer une session
+        session = await cli_create_session(inst)
+        if not session or "id" not in session:
+            print("ERREUR: création session v2 échouée")
+            return False
+        sid = session["id"]
+        print(f"Session créée: {sid}")
+        # Envoyer le prompt
+        response = await cli_prompt(inst, sid, "Réponds exactement : PONG")
+        print(f"Réponse: {response!r}")
+        # Vérifier PONG
+        if "PONG" in response.upper():
+            print("OK: PONG reçu")
+            return True
+        else:
+            print("ERREUR: PONG non trouvé dans la réponse")
+            return False
+    except Exception as e:
+        print(f"ERREUR selftest: {e}")
+        return False
+
+
+async def notify_test(instances):
+    """--notify-test : envoie un message au chat autorisé et exige ok:true."""
+    chat_id = 1155339708
+    test_text = "🧪 Test de notification depuis bridge.py --notify-test"
+    try:
+        # Utiliser tg_send directement (bypass handle_message)
+        msg_id = await tg_send(chat_id, test_text, markdown=False)
+        if msg_id:
+            print(f"OK: message envoyé (message_id={msg_id})")
+            return True
+        else:
+            print("ERREUR: aucun message_id retourné")
+            return False
+    except Exception as e:
+        print(f"ERREUR notify_test: {e}")
+        return False
+
+
 if __name__ == "__main__":
     if "--api-probe" in sys.argv:
         asyncio.run(api_probe(parse_instances()))
+    elif "--selftest" in sys.argv:
+        ok = asyncio.run(selftest(parse_instances()))
+        sys.exit(0 if ok else 1)
+    elif "--notify-test" in sys.argv:
+        ok = asyncio.run(notify_test(parse_instances()))
+        sys.exit(0 if ok else 1)
     else:
         asyncio.run(main())

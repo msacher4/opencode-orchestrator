@@ -1,17 +1,16 @@
 [Unit]
 Description=Telegram → OpenCode Bridge
 Documentation=https://opencode.ai/docs/server
-After=network.target opencode-serve.service
-Wants=opencode-serve.service
+After=network-online.target opencode-serve-v2.service
+Wants=network-online.target opencode-serve-v2.service
 
 [Service]
 Type=simple
 User=marcs
 Group=marcs
-Environment=TELEGRAM_TOKEN=8626402489:AAGrpX6JheNqmopUlmf9OaR_P70krod97Gs
-Environment=OPENCODE_URL=http://127.0.0.1:4096
+EnvironmentFile=/home/marcs/.telegram-bridge-venv/bridge.env
 ExecStart=/home/marcs/.telegram-bridge-venv/bin/python3 /home/marcs/.telegram-bridge-venv/bridge.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

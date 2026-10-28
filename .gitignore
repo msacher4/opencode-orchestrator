@@ -7,3 +7,5 @@ __pycache__/
 *.bak-*
 .env
 bridge.env
+v2.env
+.test_output.txt

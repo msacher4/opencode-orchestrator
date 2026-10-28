@@ -1,5 +1,0 @@
-1) accès/robustesse: B2 (allowlist AUTHORIZED_CHAT_IDS env + fallback état, refus explicite sans appel OpenCode), B6 (backoff exponentiel 5s→60s avec jitter, testable sans sleep), B8 (accusé ⏳ puis édition message au lieu de nouvel envoi), B13 (boucle while + drapeau recreated pour une seule re-création sur 404, pas de récursion), erreurs 4xx/5xx messages lisibles sans secrets
-2) tests: 31 OK (20 existants + 11 nouveaux: AuthTests 4, BackoffTests 2, AckEditTests 1, RecursionBoundTests 1, ErrorHandlingTests 3)
-3) unittest: OK
-4) diff: 3 files changed, 223 insertions(+), 52 deletions(-) (bridge.py, test_commands.py, test_transport.py) + nouveau test_security_robustness.py non tracké
-5) ouvert: rien

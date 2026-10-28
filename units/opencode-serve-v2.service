@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenCode v2 Headless Server
+Documentation=https://opencode.ai/docs/server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=marcs
+Group=marcs
+WorkingDirectory=/media/marcs/Linux_Apps/Projets_AI
+Environment=OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS=true
+Environment=OPENCODE_DISABLE_AUTOUPDATE=true
+EnvironmentFile=/home/marcs/.telegram-bridge-venv/v2.env
+Environment=XDG_CONFIG_HOME=/media/marcs/Linux_Apps/Projets_AI/Opencodev2/config
+Environment=XDG_DATA_HOME=/media/marcs/Linux_Apps/Projets_AI/Opencodev2/data
+Environment=XDG_STATE_HOME=/media/marcs/Linux_Apps/Projets_AI/Opencodev2/state
+Environment=XDG_CACHE_HOME=/media/marcs/Linux_Apps/Projets_AI/Opencodev2/cache
+Environment=OPENCODE_DB=/media/marcs/Linux_Apps/Projets_AI/Opencodev2/data/opencode/opencode.db
+Environment=OPENCODE_DISABLE_PROJECT_CONFIG=1
+ExecStart=/media/marcs/Linux_Apps/Projets_AI/Opencodev2/opencode serve --port 4097 --hostname 127.0.0.1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
