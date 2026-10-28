@@ -229,5 +229,147 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(results["bad"]["sessions"], [])
 
 
+class GetSessionContextTokensTests(unittest.TestCase):
+    """B9 — get_session_context_tokens lit l'objet session (pas les messages),
+    gère v1 et v2, repli tolérant à 0 sans lever."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_kind_cache = dict(_bridge._KIND_CACHE)
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind_cache)
+
+    def _legacy_transport_with_tokens(self, input_tokens=150, output_tokens=75):
+        """Transport legacy (v1) avec session contenant tokens."""
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/session":
+                return httpx.Response(200, json=[_v1_session()])
+            if request.method == "GET" and path == "/session/ses_v1":
+                return httpx.Response(200, json={
+                    "id": "ses_v1",
+                    "title": "Test Session",
+                    "agent": "build",
+                    "model": {"id": "base"},
+                    "tokens": {"input": input_tokens, "output": output_tokens, "reasoning": 0, "cache": {"read": 10, "write": 5}},
+                    "time": {"created": 1793189228639},
+                })
+            if request.method == "POST" and path == "/session/ses_v1/message":
+                return httpx.Response(200, json={"parts": [{"type": "text", "text": "réponse v1"}]})
+            if request.method == "PATCH" and path == "/session/ses_v1":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def _api_transport_with_tokens(self, input_tokens=300, output_tokens=150):
+        """Transport api (v2) avec session contenant tokens dans l'enveloppe data."""
+        _API_AUTH_STATE["msg_calls"] = 0
+        _API_AUTH_STATE["last_auth"] = None
+
+        def handler(request):
+            auth = request.headers.get("Authorization")
+            _API_AUTH_STATE["last_auth"] = auth
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(
+                    200,
+                    json={"data": [_v2_session()], "cursor": {"previous": None, "next": None}},
+                )
+            if path == "/api/session/ses_v2":
+                return httpx.Response(
+                    200,
+                    json={"data": {
+                        "id": "ses_v2",
+                        "title": "Test Session v2",
+                        "agent": "build",
+                        "model": "base",
+                        "tokens": {"input": input_tokens, "output": output_tokens, "reasoning": 0, "cache": {"read": 20, "write": 10}},
+                        "time": {"created": 1793189274187},
+                    }},
+                )
+            if path == "/api/session/ses_v2/prompt":
+                return httpx.Response(
+                    200,
+                    json={"data": {"id": "msg_1", "type": "user", "payload": {"text": "salut"}}},
+                )
+            if path == "/api/session/ses_v2/message":
+                _API_AUTH_STATE["msg_calls"] += 1
+                if _API_AUTH_STATE["msg_calls"] == 1:
+                    return httpx.Response(
+                        200, json={"data": [], "cursor": {"previous": None, "next": None}}
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "type": "assistant",
+                                "agent": "build",
+                                "content": [{"type": "text", "text": "réponse v2"}],
+                                "finish": "stop",
+                            }
+                        ],
+                        "cursor": {"previous": None, "next": None},
+                    },
+                )
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def test_legacy_tokens_from_session_object(self):
+        """v1 (legacy) : tokens = session.tokens.input + session.tokens.output."""
+        self._legacy_transport_with_tokens(input_tokens=150, output_tokens=75)
+        inst = {"name": "v1", "url": "http://127.0.0.1:4096", "auth": "", "kind": "legacy"}
+        n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_v1"))
+        self.assertEqual(n, 225)  # 150 + 75
+
+    def test_api_tokens_from_session_object(self):
+        """v2 (api) : tokens = session.data.tokens.input + session.data.tokens.output."""
+        self._api_transport_with_tokens(input_tokens=300, output_tokens=150)
+        inst = {"name": "v2", "url": "http://127.0.0.1:4097", "auth": "opencode:pass", "kind": "api"}
+        n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_v2"))
+        self.assertEqual(n, 450)  # 300 + 150
+
+    def test_missing_tokens_field_returns_zero(self):
+        """Session sans champ tokens -> 0, pas d'exception."""
+        def handler(request):
+            if request.method == "GET" and request.url.path == "/session":
+                return httpx.Response(200, json=[{"id": "ses_no_tokens", "title": "Test", "agent": "build"}])
+            if request.method == "GET" and request.url.path == "/session/ses_no_tokens":
+                return httpx.Response(200, json={"id": "ses_no_tokens", "title": "Test", "agent": "build", "model": "base"})
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        inst = {"name": "v1", "url": "http://127.0.0.1:4096", "auth": "", "kind": "legacy"}
+        n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_no_tokens"))
+        self.assertEqual(n, 0)
+
+    def test_unreachable_instance_returns_zero_no_exception(self):
+        """Instance injoignable -> 0, pas d'exception (repli tolérant)."""
+        def handler(request):
+            return httpx.Response(500)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        inst = {"name": "v1", "url": "http://127.0.0.1:4096", "auth": "", "kind": None}
+        n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_xxx"))
+        self.assertEqual(n, 0)
+
+    def test_session_not_found_returns_zero_no_exception(self):
+        """Session 404 -> 0, pas d'exception (repli tolérant)."""
+        def handler(request):
+            if request.method == "GET" and request.url.path == "/session/ses_missing":
+                return httpx.Response(404)
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        inst = {"name": "v1", "url": "http://127.0.0.1:4096", "auth": "", "kind": "legacy"}
+        n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_missing"))
+        self.assertEqual(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -331,13 +331,26 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-async def get_session_context_tokens(sid: str) -> int:
+async def get_session_context_tokens(inst: dict, sid: str) -> int:
+    """Lit les tokens de contexte depuis l'objet session (pas depuis les messages).
+    v1 (legacy) : session.tokens.input + session.tokens.output
+    v2 (api)    : session.data.tokens.input + session.data.tokens.output
+    Repli tolérant à 0 si absent ou si l'appel échoue, sans lever, en journalisant.
+    """
     try:
-        msgs = await api_get(f"/session/{sid}/message?limit=2")
-        if isinstance(msgs, list) and len(msgs) >= 2:
-            return msgs[0].get("info", {}).get("tokens", {}).get("total", 0)
+        session = await cli_get_session(inst, sid)
+        if not session:
+            return 0
+        kind = await detect_kind(inst)
+        if kind == "api":
+            # v2 : session est déjà l'objet data (cli_get_session dépaquette l'enveloppe)
+            t = session.get("tokens") or {}
+        else:
+            # v1 : session est l'objet brut
+            t = session.get("tokens") or {}
+        return (t.get("input", 0) or 0) + (t.get("output", 0) or 0)
     except Exception:
-        log.exception("Contexte tokens indisponible pour %s", sid)
+        log.exception("Contexte tokens indisponible pour %s sur instance %s", sid, inst.get("name"))
     return 0
 
 
@@ -618,7 +631,7 @@ async def handle_status(chat_id: int):
     tokens = "?"
     try:
         if sid:
-            n = await get_session_context_tokens(sid)
+            n = await get_session_context_tokens(inst, sid)
             tokens = _fmt_tokens(n) if n > 0 else "0"
     except Exception:
         pass
@@ -915,13 +928,14 @@ async def _status_header(chat_id: int) -> str:
     cid = str(chat_id)
     cur = _cur(chat_id)
     inst_name = cur.get("instance", default_instance())
+    inst = instances()[inst_name]
     sid = cur.get("sid", "")
     agent = cur.get("agent", "build")
 
     tokens = "?"
     try:
         if sid:
-            n = await get_session_context_tokens(sid)
+            n = await get_session_context_tokens(inst, sid)
             tokens = _fmt_tokens(n) if n > 0 else "0"
     except Exception:
         pass
