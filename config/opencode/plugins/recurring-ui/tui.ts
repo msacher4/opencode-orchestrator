@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { execFileSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 
 const PROJECT = "/media/marcs/Linux_Apps/Projets_AI"
 const PYTHON = `${PROJECT}/mcp/opencode-recurring/venv/bin/python`
@@ -244,13 +244,11 @@ function checkYearly(raw: string): Check {
 function checkModel(raw: string): Check {
   const value = raw.trim()
   if (!value) return { value: undefined }
-  const re = /^([a-z0-9][a-z0-9._-]*)\/([a-z0-9][a-z0-9._-]*)(\/([a-z0-9._-]+))?$/i
+  const re = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)+(#[a-z0-9._-]+)?$/i
   if (!re.test(value)) {
-    return { error: "Format attendu : provider/model ou provider/model#variant (ex : nvidia/nemotron-3-ultra ou nvidia/nemotron-3-ultra#main)" }
+    return { error: "Format attendu : provider/model, provider/model/sous-modele ou provider/model#variant (ex : opencode/deepseek-v4.1-flash-free ou nvidia/nvidia/nemotron-3-ultra-550b-a55b)" }
   }
-  // Convert /variant to #variant for engine compatibility
-  const canonical = value.replace(/\/([a-z0-9._-]+)$/, '#$1')
-  return { value: canonical }
+  return { value }
 }
 
 /* ───────── model catalogue (copied from orch-ui/tui.ts) ───────── */
@@ -634,7 +632,7 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       current: prefillAgent,
     })
     if (!agentChoice) return
-    if (agentChoice !== "build" && agentChoice !== "orchestrator-auto") {
+    if (agentChoice !== "build") {
       goalAgent = agentChoice
     }
 
@@ -743,12 +741,21 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
   const effectsLabel = effects === "both" ? "carte Kanban + Telegram" : effects === "kanban" ? "carte Kanban" : "Telegram"
 
   const recap = [
+    isEdit ? `ID : ${opts?.id}` : "ID : (nouvelle règle)",
     `« ${title} »`,
     `Fréquence : ${scheduleLabel(kind, payload, payload.time)}`,
     `Départ : ${frDate(payload.start)}`,
     `Effets : ${effectsLabel}`,
     execLine,
   ].join("\n")
+
+  try {
+    writeFileSync(
+      "/tmp/recurring-ui-last-payload.json",
+      JSON.stringify({ at: new Date().toISOString(), isEdit, id: opts?.id ?? null, payload }, null, 2),
+      "utf8",
+    )
+  } catch {}
 
   const confirmed = await ctx.ui.dialog.confirm({
     title: isEdit ? "Modifier la tâche récurrente ?" : "Créer la tâche récurrente ?",
@@ -759,6 +766,9 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
 
   if (isEdit && opts.id) {
     const result = call(["--update", opts.id, "--patch-json", JSON.stringify(payload)])
+    try {
+      writeFileSync("/tmp/recurring-ui-last-result.json", JSON.stringify({ at: new Date().toISOString(), id: opts.id, result }, null, 2), "utf8")
+    } catch {}
     if (result.error) {
       await ctx.ui.dialog.alert({ title: "Mise à jour impossible", message: result.error })
       return
@@ -867,10 +877,14 @@ async function openList(ctx: Ctx) {
       if (result.error) {
         await ctx.ui.dialog.alert({ title: "Lancement impossible", message: result.error })
       } else {
+        const msg = result.warning
+          ? result.warning
+          : result.sessionTitle ?? result.sessionID ?? "session créée"
+        const variant = result.warning ? "success" : "success"
         ctx.ui.toast.show({
-          title: "Goal lancé",
-          message: result.sessionTitle ?? result.sessionID ?? "session créée",
-          variant: "success",
+          title: result.warning ? "Goal lancé (timeout commande)" : "Goal lancé",
+          message: msg,
+          variant,
           duration: 5000,
         })
       }
