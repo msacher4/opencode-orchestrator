@@ -371,5 +371,106 @@ class GetSessionContextTokensTests(unittest.TestCase):
         self.assertEqual(n, 0)
 
 
+class CliPromptPayloadTests(unittest.TestCase):
+    """Tests pour le payload cli_prompt v2 : format agents[name] et erreur 400 explicite."""
+
+    def setUp(self):
+        self._saved = _bridge.TRANSPORT
+        self._saved_kind_cache = dict(_bridge._KIND_CACHE)
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind_cache)
+
+    def _api_transport_with_prompt_capture(self):
+        """Capture le payload envoyé à /prompt pour vérifier le format."""
+        self.captured_payload = None
+
+        def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(
+                    200,
+                    json={"data": [_v2_session()], "cursor": {"previous": None, "next": None}},
+                )
+            if path == "/api/session/ses_v2/prompt":
+                import json as _json
+                self.captured_payload = _json.loads(request.content.decode())
+                return httpx.Response(
+                    200,
+                    json={"data": {"id": "msg_1", "type": "user", "payload": self.captured_payload, "delivery": "steer"}},
+                )
+            if path == "/api/session/ses_v2/message":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "type": "assistant",
+                                "agent": "build",
+                                "content": [{"type": "text", "text": "réponse v2"}],
+                                "finish": "stop",
+                            }
+                        ],
+                        "cursor": {"previous": None, "next": None},
+                    },
+                )
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def test_api_prompt_payload_uses_name_not_id(self):
+        """Le payload envoyé à /prompt doit utiliser agents[].name (pas .id)."""
+        self._api_transport_with_prompt_capture()
+        inst = {"name": "v2", "url": "http://127.0.0.1:4097", "auth": "opencode:pass", "kind": "api"}
+        asyncio.run(_bridge.cli_prompt(inst, "ses_v2", "salut", agent="build"))
+        # Vérifier le payload capturé
+        self.assertIsNotNone(self.captured_payload)
+        self.assertIn("agents", self.captured_payload)
+        agents = self.captured_payload["agents"]
+        self.assertIsInstance(agents, list)
+        self.assertEqual(len(agents), 1)
+        self.assertIn("name", agents[0])
+        self.assertEqual(agents[0]["name"], "build")
+        self.assertNotIn("id", agents[0])
+
+    def _api_transport_always_400(self):
+        """Simule un 400 systématique sur /prompt pour tester la gestion d'erreur."""
+        def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(
+                    200,
+                    json={"data": [_v2_session()], "cursor": {"previous": None, "next": None}},
+                )
+            if path == "/api/session/ses_v2/prompt":
+                return httpx.Response(
+                    400,
+                    json={"_tag": "InvalidRequestError", "message": "Invalid payload: missing required field", "kind": "Payload"},
+                )
+            if path == "/api/session/ses_v2/message":
+                return httpx.Response(
+                    200,
+                    json={"data": [], "cursor": {"previous": None, "next": None}},
+                )
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def test_api_prompt_400_raises_explicit_error(self):
+        """Un 400 sur /prompt lève une HTTPStatusError avec un message lisible."""
+        self._api_transport_always_400()
+        inst = {"name": "v2", "url": "http://127.0.0.1:4097", "auth": "opencode:pass", "kind": "api"}
+        import json
+        try:
+            asyncio.run(_bridge.cli_prompt(inst, "ses_v2", "salut", agent="build"))
+            self.fail("Expected HTTPStatusError for 400")
+        except httpx.HTTPStatusError as e:
+            self.assertIn("400", str(e))
+            self.assertIn("Invalid payload", str(e))
+            self.assertIn("prompt", str(e))
+
+
 if __name__ == "__main__":
     unittest.main()

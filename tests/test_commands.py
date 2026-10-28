@@ -183,10 +183,10 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(method, "POST")
         # Assertion clé : l'URL doit être /api/session/ses_abc/prompt (et non /session/ses_abc/message)
         self.assertIn("/api/session/ses_abc/prompt", url)
-        # L'agent doit figurer dans le corps de la requête (payload api met agents: [{"id": agent}])
+        # L'agent doit figurer dans le corps de la requête (payload api met agents: [{"name": agent}])
         content = body.decode() if isinstance(body, bytes) else body
         self.assertIn("agents", content)
-        self.assertIn('{"id":"build"}', content)
+        self.assertIn('{"name":"build"}', content)
         # Le message doit bien être dans le corps
         self.assertIn("Bonjour le monde", content)
 

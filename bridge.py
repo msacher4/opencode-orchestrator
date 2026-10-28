@@ -412,7 +412,12 @@ async def _http_post(inst, path, body=None, timeout=10.0):
         r = await cl.post(path, json=body or {}, headers=headers)
         log.debug("POST %s -> %s", path, r.status_code)
         if r.status_code != 200:
-            return None, r.status_code
+            # Capturer le corps pour les erreurs (utile pour messages lisibles)
+            try:
+                error_data = r.json()
+            except Exception:
+                error_data = {"raw": r.text}
+            return error_data, r.status_code
         if not r.content:
             return None, r.status_code
         return r.json(), r.status_code
@@ -530,8 +535,17 @@ async def cli_prompt(inst, sid, text, agent=None):
     if kind == "api":
         payload = {"text": text}
         if agent:
-            payload["agents"] = [{"id": agent}]
-        await _http_post(inst, f"/api/session/{sid}/prompt", payload, timeout=180.0)
+            # L'API v2 attend "name" (AgentAttachment), pas "id" (cf. SDK @opencode/protocol)
+            payload["agents"] = [{"name": agent}]
+        data, code = await _http_post(inst, f"/api/session/{sid}/prompt", payload, timeout=180.0)
+        if code != 200:
+            # Erreur lisible avec le corps de la réponse (sans exposer de secret)
+            body = json.dumps(data, ensure_ascii=False) if data else "(corps vide)"
+            raise httpx.HTTPStatusError(
+                f"POST /api/session/{sid}/prompt → {code}: {body}",
+                request=None,
+                response=httpx.Response(code, json=data),
+            )
         return await _poll_api(inst, sid)
     result, _ = await _http_post(inst, f"/session/{sid}/message", {"parts": [{"type": "text", "text": text}]}, timeout=180.0)
     parts = (result or {}).get("parts", []) if isinstance(result, dict) else []
