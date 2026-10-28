@@ -13,8 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_DIR="/etc/systemd/system"
 
 echo "=== Copie des units systemd ==="
-cp -v "$SCRIPT_DIR/telegram-bridge.service" "$UNIT_DIR/"
-cp -v "$SCRIPT_DIR/opencode-serve-v2.service" "$UNIT_DIR/"
+if [[ ! -f "$SCRIPT_DIR/units/telegram-bridge.service" || ! -f "$SCRIPT_DIR/units/opencode-serve-v2.service" ]]; then
+    echo "ERREUR : un ou plusieurs fichiers unit sources manquent dans $SCRIPT_DIR/units/" >&2
+    exit 1
+fi
+cp -v "$SCRIPT_DIR/units/telegram-bridge.service" "$UNIT_DIR/"
+cp -v "$SCRIPT_DIR/units/opencode-serve-v2.service" "$UNIT_DIR/"
 
 # S'assurer que bridge.env a les bons droits (600)
 chmod 600 "$SCRIPT_DIR/bridge.env"
