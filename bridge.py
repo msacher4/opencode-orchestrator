@@ -6,6 +6,7 @@ Le stockage local ne contient que la session active par chat.
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -35,6 +36,11 @@ if not TELEGRAM_TOKEN:
 
 API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# Point d'injection de transport : TOUS les httpx.AsyncClient() passent
+# transport=TRANSPORT. Par défaut None = client standard. Permet aux tests de
+# tourner hors réseau via httpx.MockTransport.
+TRANSPORT = None
+
 # Employé autonome : les messages « #emp … » ne vont JAMAIS dans une session.
 EMPLOYEE_SUPERVISOR = os.getenv(
     "EMPLOYEE_SUPERVISOR",
@@ -55,17 +61,111 @@ PUSHER = os.path.join(PUSH_DIR, "pusher.py")
 PUSH_ACKS = os.path.join(PUSH_DIR, "acks.jsonl")
 
 
+class TelegramError(Exception):
+    """Lever une erreur explicite quand Telegram refuse l'envoi d'un bloc."""
+
+
+def chunk_text(text: str, limit: int = 3500) -> list[str]:
+    """Découpe text en blocs <= limit caractères en respectant les frontières :
+    d'abord "\\n\\n", puis "\\n", puis un espace, puis coupe brute. Jamais de bloc
+    vide ; un texte court (<= limit) revient en liste à un élément ; "" -> []."""
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        window = text[start : start + limit]
+        idx = window.rfind("\n\n")
+        if idx > 0:
+            end = start + idx
+        else:
+            idx = window.rfind("\n")
+            if idx > 0:
+                end = start + idx
+            else:
+                idx = window.rfind(" ")
+                if idx > 0:
+                    end = start + idx
+                else:
+                    end = start + limit
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+async def tg_send(chat_id: int, text: str, markdown: bool = True) -> None:
+    """Envoi fiable : découpe en blocs <= 3500, tente parse_mode Markdown, replie
+    en texte brut si l'API renvoie 400 (en journalisant description), lève
+    TelegramError sinon. Toute exception réseau est loggée puis propagée."""
+    try:
+        async with httpx.AsyncClient(transport=TRANSPORT) as cl:
+            for chunk in chunk_text(text):
+                payload = {"chat_id": chat_id, "text": chunk}
+                if markdown:
+                    payload["parse_mode"] = "Markdown"
+                resp = await cl.post(f"{API_BASE}/sendMessage", json=payload)
+                log.debug("POST sendMessage -> %s", resp.status_code)
+                data = resp.json()
+                code = resp.status_code
+                description = data.get("description", "")
+                if not data.get("ok") and markdown and code == 400:
+                    log.warning(
+                        "Bloc refusé en Markdown (%s), réessai sans parse_mode",
+                        description,
+                    )
+                    resp = await cl.post(
+                        f"{API_BASE}/sendMessage",
+                        json={"chat_id": chat_id, "text": chunk},
+                    )
+                    data = resp.json()
+                    code = resp.status_code
+                    description = data.get("description", "")
+                if not data.get("ok"):
+                    raise TelegramError(f"sendMessage {code}: {description}")
+    except httpx.HTTPError as e:
+        log.exception("Erreur réseau Telegram: %s", e)
+        raise
+
+
+def send_message(chat_id: int, text: str) -> None:
+    """Enveloppe de tg_send en markdown (1er essai Markdown, repli texte brut)."""
+    return asyncio.to_thread(tg_send, chat_id, text, markdown=True)
+
+
+def _send_plain(chat_id: int, text: str) -> None:
+    """Enveloppe de tg_send sans parse_mode (sortie pusher avec _ et *)."""
+    return asyncio.to_thread(tg_send, chat_id, text, markdown=False)
+
+
 def _load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        log.error("État corrompu (%s), relance à vide", e)
         return {}
 
 
 def _save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    """Écriture atomique : tmp puis os.replace, protégée par un verrou fcntl
+    sur <STATE_FILE>.lock ; crée le dossier si absent."""
+    directory = os.path.dirname(STATE_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    lock_file = os.path.join(directory, os.path.basename(STATE_FILE) + ".lock")
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            tmp = f"{STATE_FILE}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, STATE_FILE)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 state = _load_state()
@@ -75,6 +175,7 @@ log.info("Chats suivis: %d", len(state))
 async def api_get(path):
     async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=httpx.Timeout(10.0)) as cl:
         r = await cl.get(path)
+        log.debug("GET %s -> %s", path, r.status_code)
         r.raise_for_status()
         return r.json()
 
@@ -82,6 +183,7 @@ async def api_get(path):
 async def api_post(path, body=None):
     async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=httpx.Timeout(180.0)) as cl:
         r = await cl.post(path, json=body or {})
+        log.debug("POST %s -> %s", path, r.status_code)
         r.raise_for_status()
         if not r.content:
             return None
@@ -91,6 +193,7 @@ async def api_post(path, body=None):
 async def api_patch(path, body):
     async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=httpx.Timeout(10.0)) as cl:
         r = await cl.patch(path, json=body)
+        log.debug("PATCH %s -> %s", path, r.status_code)
         r.raise_for_status()
         return r.json()
 
@@ -127,7 +230,7 @@ async def get_session_context_tokens(sid: str) -> int:
         if isinstance(msgs, list) and len(msgs) >= 2:
             return msgs[0].get("info", {}).get("tokens", {}).get("total", 0)
     except Exception:
-        pass
+        log.exception("Contexte tokens indisponible pour %s", sid)
     return 0
 
 
