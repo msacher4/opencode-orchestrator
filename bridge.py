@@ -6,12 +6,14 @@ Le stockage local ne contient que la session active par chat.
 """
 
 import asyncio
+import base64
 import fcntl
 import json
 import logging
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 import httpx
@@ -30,7 +32,7 @@ STATE_FILE = os.getenv(
     "/media/marcs/Linux_Apps/Projets_AI/.opencode/tg-sessions.json",
 )
 
-if not TELEGRAM_TOKEN:
+if not TELEGRAM_TOKEN and "--api-probe" not in sys.argv:
     log.error("TELEGRAM_TOKEN not set")
     sys.exit(1)
 
@@ -236,6 +238,229 @@ async def get_session_context_tokens(sid: str) -> int:
 
 async def get_session_info(sid: str) -> dict:
     return await api_get(f"/session/{sid}")
+
+
+# ---------------------------------------------------------------------------
+# Couche client multi-instances (t3a) — adaptateurs legacy (v1) et api (v2)
+# derrière une interface unique. Ne touche pas aux commandes Telegram. Tous les
+# appels HTTP passent par TRANSPORT (point d'injection des tests MockTransport).
+# ---------------------------------------------------------------------------
+
+
+def parse_instances(raw=None):
+    """lit OPENCODE_INSTANCES="nom=url,nom=url" (défaut v1/v2) et
+    OPENCODE_V2_AUTH="user:pass" (Basic pour les instances à API sous /api)."""
+    if raw is None:
+        raw = os.getenv("OPENCODE_INSTANCES")
+    if not raw:
+        raw = "v1=http://127.0.0.1:4096,v2=http://127.0.0.1:4097"
+    auth = os.getenv("OPENCODE_V2_AUTH", "")
+    instances = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        name, _, url = pair.partition("=")
+        name = name.strip()
+        url = url.strip()
+        if not name or not url:
+            continue
+        instances[name] = {"name": name, "url": url, "auth": auth, "kind": None}
+    return instances
+
+
+def _auth_headers(inst):
+    auth = inst.get("auth") or ""
+    if not auth:
+        return {}
+    user, _, passw = auth.partition(":")
+    token = base64.b64encode(f"{user}:{passw}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+async def _http_get(inst, path, timeout=10.0):
+    headers = _auth_headers(inst)
+    async with httpx.AsyncClient(base_url=inst["url"], transport=TRANSPORT, timeout=httpx.Timeout(timeout)) as cl:
+        r = await cl.get(path, headers=headers)
+        log.debug("GET %s -> %s", path, r.status_code)
+        if r.status_code != 200:
+            return None, r.status_code
+        return r.json(), r.status_code
+
+
+async def _http_post(inst, path, body=None, timeout=10.0):
+    headers = _auth_headers(inst)
+    async with httpx.AsyncClient(base_url=inst["url"], transport=TRANSPORT, timeout=httpx.Timeout(timeout)) as cl:
+        r = await cl.post(path, json=body or {}, headers=headers)
+        log.debug("POST %s -> %s", path, r.status_code)
+        if r.status_code != 200:
+            return None, r.status_code
+        if not r.content:
+            return None, r.status_code
+        return r.json(), r.status_code
+
+
+async def _http_patch(inst, path, body, timeout=10.0):
+    headers = _auth_headers(inst)
+    async with httpx.AsyncClient(base_url=inst["url"], transport=TRANSPORT, timeout=httpx.Timeout(timeout)) as cl:
+        r = await cl.patch(path, json=body, headers=headers)
+        log.debug("PATCH %s -> %s", path, r.status_code)
+        if r.status_code != 200:
+            return None, r.status_code
+        if not r.content:
+            return None, r.status_code
+        return r.json(), r.status_code
+
+
+_KIND_CACHE = {}
+
+
+async def detect_kind(inst):
+    """Détection du kind si absent : GET /api/session 200 => api, sinon
+    GET /session JSON => legacy. Résultat mémorisé (seulement api/legacy)."""
+    name = inst["name"]
+    if name in _KIND_CACHE:
+        return _KIND_CACHE[name]
+    kind = "unreachable"
+    data, code = await _http_get(inst, "/api/session", timeout=10.0)
+    if code == 200 and isinstance(data, dict):
+        kind = "api"
+    else:
+        data, code = await _http_get(inst, "/session", timeout=10.0)
+        if code == 200 and isinstance(data, (list, dict)) and data:
+            kind = "legacy"
+    if kind in ("api", "legacy"):
+        _KIND_CACHE[name] = kind
+    return kind
+
+
+async def cli_list_sessions(instances):
+    """Liste toutes les instances. Une instance injoignable ne bloque pas :
+    marquée indisponible, le reste continue. Retourne {name: {kind, unreachable,
+    sessions, code}}."""
+    results = {}
+    for name, inst in instances.items():
+        try:
+            kind = await detect_kind(inst)
+            if kind == "unreachable":
+                results[name] = {"kind": kind, "unreachable": True, "sessions": [], "code": -1}
+                continue
+            if kind == "api":
+                data, code = await _http_get(inst, "/api/session", timeout=10.0)
+                raw = (data or {}).get("data", []) if isinstance(data, dict) else []
+            else:
+                data, code = await _http_get(inst, "/session", timeout=10.0)
+                raw = data if isinstance(data, list) else []
+            sessions = [cli_normalize_session(s, name, kind) for s in raw if isinstance(s, dict)]
+            results[name] = {"kind": kind, "unreachable": False, "sessions": sessions, "code": code}
+        except Exception as e:
+            log.exception("Listing instance %s échoué: %s", name, e)
+            results[name] = {"kind": None, "unreachable": True, "sessions": [], "code": -1, "error": str(e)}
+    return results
+
+
+async def cli_create_session(inst):
+    kind = await detect_kind(inst)
+    if kind == "api":
+        data, _ = await _http_post(inst, "/api/session", {}, timeout=180.0)
+        return (data or {}).get("data") if isinstance(data, dict) else None
+    data, _ = await _http_post(inst, "/session", {}, timeout=180.0)
+    return data
+
+
+async def cli_get_session(inst, sid):
+    kind = await detect_kind(inst)
+    if kind == "api":
+        data, _ = await _http_get(inst, f"/api/session/{sid}", timeout=10.0)
+        return (data or {}).get("data") if isinstance(data, dict) else None
+    data, _ = await _http_get(inst, f"/session/{sid}", timeout=10.0)
+    return data
+
+
+async def cli_set_title(inst, sid, title):
+    kind = await detect_kind(inst)
+    if kind == "api":
+        return await _http_patch(inst, f"/api/session/{sid}", {"title": title}, timeout=10.0)
+    return await _http_patch(inst, f"/session/{sid}", {"title": title}, timeout=10.0)
+
+
+def cli_normalize_session(raw, instance, kind):
+    """normalize_session(raw, instance, kind) -> {instance, sid, title, agent,
+    model, tokens} quel que soit le serveur."""
+    t = raw.get("tokens") or {}
+    cache = t.get("cache") if isinstance(t, dict) else {}
+    tokens = t.get("input", 0) + t.get("output", 0)
+    model = raw.get("model")
+    if isinstance(model, dict):
+        model = model.get("id")
+    title = raw.get("title") or (raw.get("id") or "")[:12]
+    return {
+        "instance": instance,
+        "sid": raw.get("id"),
+        "title": title,
+        "agent": raw.get("agent") or "build",
+        "model": model,
+        "tokens": tokens,
+    }
+
+
+async def cli_prompt(inst, sid, text, agent=None):
+    """prompt(inst, sid, text, agent). legacy : réponse directe dans parts[].text ;
+    api : POST /prompt puis polling GET /message jusqu'à un message assistant
+    (timeout 180 s, intervalle 1 s)."""
+    kind = await detect_kind(inst)
+    if kind == "api":
+        payload = {"text": text}
+        if agent:
+            payload["agents"] = [{"id": agent}]
+        await _http_post(inst, f"/api/session/{sid}/prompt", payload, timeout=180.0)
+        return await _poll_api(inst, sid)
+    result, _ = await _http_post(inst, f"/session/{sid}/message", {"parts": [{"type": "text", "text": text}]}, timeout=180.0)
+    parts = (result or {}).get("parts", []) if isinstance(result, dict) else []
+    out = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
+    return out or "(pas de réponse textuelle)"
+
+
+async def _poll_api(inst, sid, timeout=180.0, interval=1.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+        items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "assistant":
+                contents = item.get("content", [])
+                if isinstance(contents, list):
+                    for c in contents:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            return c.get("text", "").strip()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timeout polling v2 après {timeout}s : aucune réponse assistant pour {sid}")
+        await asyncio.sleep(interval)
+
+
+async def api_probe(instances):
+    """--api-probe : pour chaque instance, kind, nb sessions, 1re session (sid +
+    titre), code observé. Retourne True si toutes répondent."""
+    results = await cli_list_sessions(instances)
+    all_ok = True
+    lines = []
+    for name, res in results.items():
+        if res.get("unreachable"):
+            all_ok = False
+            lines.append(f"[{name}] kind=? indisponible (code {res.get('code')})")
+            continue
+        sessions = res.get("sessions", [])
+        lines.append(f"[{name}] kind={res.get('kind')} sessions={len(sessions)} code={res.get('code')}")
+        if sessions:
+            first = sessions[0]
+            lines.append(f"    1re: sid={first['sid']} titre={first['title']!r}")
+        else:
+            lines.append("    1re: (aucune)")
+    print("\n".join(lines))
+    return all_ok
+
+
+# ...
 
 
 async def ensure_session_titled(cid: str, sid: str, first_text: str):
@@ -666,4 +891,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--api-probe" in sys.argv:
+        asyncio.run(api_probe(parse_instances()))
+    else:
+        asyncio.run(main())
