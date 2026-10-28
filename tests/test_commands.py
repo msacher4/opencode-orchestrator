@@ -47,11 +47,13 @@ class StatusHeaderTests(unittest.TestCase):
 
     def setUp(self):
         self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
         self._saved_state = _bridge.state
         self._cid = "999"
 
     def tearDown(self):
         _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
         _bridge.state = self._saved_state
 
     def test_status_header_has_instance_prefix(self):
@@ -67,11 +69,13 @@ class PlanTests(unittest.TestCase):
 
     def setUp(self):
         self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
         self._saved_state = _bridge.state
         self._cid = "888"
 
     def tearDown(self):
         _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
         _bridge.state = self._saved_state
 
     def test_plan_no_network_calls(self):
@@ -88,11 +92,13 @@ class HandleMessageTests(unittest.TestCase):
 
     def setUp(self):
         self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
         self._saved_state = _bridge.state
         self._cid = "777"
 
     def tearDown(self):
         _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
         _bridge.state = self._saved_state
         _bridge._KIND_CACHE.clear()
 
@@ -103,6 +109,14 @@ class HandleMessageTests(unittest.TestCase):
             if not hasattr(self, "requests"):
                 self.requests = []
             self.requests.append((request.method, url_str, request.content))
+
+            # --- Telegram API ---
+            if "api.telegram.org" in url_str:
+                if "sendMessage" in url_str:
+                    return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+                if "editMessageText" in url_str:
+                    return httpx.Response(200, json={"ok": True})
+                return httpx.Response(200, json={"ok": True})
 
             # --- Kind detection : GET /api/session (racine exacte seulement) => kind "api" ---
             # On doit être precis : l'URL doit terminer par "/api/session", pas /api/session/sid/message
@@ -130,6 +144,17 @@ class HandleMessageTests(unittest.TestCase):
                     # Le payload cli_prompt y ajoute agents: [{"id": agent}]
                     return httpx.Response(200, json={"status": "ok"})
 
+            # --- Legacy OpenCode (v1) ---
+            if "/session" in url_str:
+                if request.method == "GET" and url_str.endswith("/session"):
+                    return httpx.Response(200, json=[{"id": "ses_abc", "title": "New session", "agent": "build", "model": "base", "tokens": {"input": 10, "output": 5}}])
+                if request.method == "POST" and "/message" in url_str:
+                    return httpx.Response(200, json={"parts": [{"type": "text", "text": "OK"}]})
+                if request.method == "GET" and "/session/" in url_str:
+                    return httpx.Response(200, json={"id": "ses_abc", "title": "New session", "agent": "build", "model": "base", "tokens": {"input": 10, "output": 5}})
+                if request.method == "PATCH":
+                    return httpx.Response(200, json={})
+
             # --- Tout le reste ---
             return httpx.Response(200, json={})
 
@@ -137,6 +162,14 @@ class HandleMessageTests(unittest.TestCase):
     def test_handle_message_uses_expected_path(self):
         _bridge.state = {self._cid: {"current": {"instance": "v2", "sid": "ses_abc"}, "agent": "build"}}
         _bridge.TRANSPORT = httpx.MockTransport(self._make_request_handler())
+        # Aussi mocker TELEGRAM_TRANSPORT pour l'accusé ⏳
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            if "editMessageText" in str(request.url):
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True})
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
         asyncio.run(_bridge.handle_message(int(self._cid), "Bonjour le monde"))
         # S'assurer que des requêtes ont été enregistrées
         self.assertTrue(hasattr(self, "requests"), "Requests should be recorded by the handler")
@@ -184,11 +217,21 @@ class SessionsPaginationTests(unittest.TestCase):
     #    sélectionné (lu dans page_rows, sans recalcul).
     def setUp(self):
         self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
         self._saved_state = _bridge.state
         self._cid = "999"
+        # Mock Telegram pour éviter les vrais appels
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            if "editMessageText" in str(request.url):
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True})
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
 
     def tearDown(self):
         _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
         _bridge.state = self._saved_state
 
     def _fake_results(self, count: int = 15, instance: str = "v1"):

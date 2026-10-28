@@ -38,7 +38,7 @@ class _RecordingTransport:
 
 class TransportTests(unittest.TestCase):
     def _set_transport(self, handler):
-        _bridge.TRANSPORT = _RecordingTransport(handler)
+        _bridge.TELEGRAM_TRANSPORT = _RecordingTransport(handler)
 
     # 1) Repli en texte brut après 400
     def test_fallback_plain_apres_400(self):
@@ -53,8 +53,8 @@ class TransportTests(unittest.TestCase):
         self._set_transport(handler)
         # tg_send : pas d'erreur
         asyncio.run(_bridge.tg_send(1, "mot _non_apparie_"))
-        self.assertEqual(len(_bridge.TRANSPORT.requests), 2)
-        second = _bridge.TRANSPORT.requests[1]
+        self.assertEqual(len(_bridge.TELEGRAM_TRANSPORT.requests), 2)
+        second = _bridge.TELEGRAM_TRANSPORT.requests[1]
         self.assertEqual(second[0], "POST")
         self.assertNotIn("parse_mode", json.loads(second[2]))
 

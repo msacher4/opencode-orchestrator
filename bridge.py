@@ -11,6 +11,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 import time
@@ -36,12 +37,43 @@ if not TELEGRAM_TOKEN and "--api-probe" not in sys.argv:
     log.error("TELEGRAM_TOKEN not set")
     sys.exit(1)
 
+# AUTHORIZED_CHAT_IDS : variable d'environnement (identifiants séparés par des
+# virgules), repli sur les clés déjà présentes dans l'état si la variable est
+# absente. Un chat non autorisé reçoit un refus explicite, l'événement est
+# journalisé, et AUCUN appel ne part vers l'API OpenCode.
+def _authorized_chat_ids() -> set[int]:
+    raw = os.getenv("AUTHORIZED_CHAT_IDS", "").strip()
+    if raw:
+        return {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
+    # Repli : tous les chat_id présents dans l'état local
+    return {int(cid) for cid in state.keys() if cid.isdigit()}
+
+
+def _is_authorized(chat_id: int) -> bool:
+    return chat_id in _authorized_chat_ids()
+
+
 API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Point d'injection de transport : TOUS les httpx.AsyncClient() passent
-# transport=TRANSPORT. Par défaut None = client standard. Permet aux tests de
-# tourner hors réseau via httpx.MockTransport.
+# Backoff borné 5 s → 60 s sur erreur réseau (exponentiel + jitter), calculable
+# sans dormir réellement pour être testable.
+def _backoff_schedule(attempt: int, base: float = 5.0, max_delay: float = 60.0) -> float:
+    """Retourne le délai en secondes pour la tentative `attempt` (0-indexé).
+    Formule : min(base * 2^attempt, max_delay) + jitter(±25%).
+    Ne fait PAS sleep — pour tests et usage réel on appellera asyncio.sleep soi-même.
+    """
+    delay = min(base * (2 ** attempt), max_delay)
+    jitter = delay * 0.25 * (random.random() * 2 - 1)  # ±25%
+    return delay + jitter
+
+
+# Point d'injection de transport pour l'API OpenCode : tous les clients
+# httpx vers OpenCode passent transport=TRANSPORT. Par défaut None = client
+# standard. Permet aux tests de tourner hors réseau via httpx.MockTransport.
+# L'API Telegram utilise TELEGRAM_TRANSPORT (défaut None) pour l'injection
+# de tests ; en production, None = client standard.
 TRANSPORT = None
+TELEGRAM_TRANSPORT = None
 
 # Employé autonome : les messages « #emp … » ne vont JAMAIS dans une session.
 EMPLOYEE_SUPERVISOR = os.getenv(
@@ -97,12 +129,14 @@ def chunk_text(text: str, limit: int = 3500) -> list[str]:
     return chunks
 
 
-async def tg_send(chat_id: int, text: str, markdown: bool = True) -> None:
+async def tg_send(chat_id: int, text: str, markdown: bool = True) -> int:
     """Envoi fiable : découpe en blocs <= 3500, tente parse_mode Markdown, replie
     en texte brut si l'API renvoie 400 (en journalisant description), lève
-    TelegramError sinon. Toute exception réseau est loggée puis propagée."""
+    TelegramError sinon. Toute exception réseau est loggée puis propagée.
+    Retourne le message_id du dernier bloc envoyé (pour édition)."""
+    last_msg_id = None
     try:
-        async with httpx.AsyncClient(transport=TRANSPORT) as cl:
+        async with httpx.AsyncClient(transport=TELEGRAM_TRANSPORT) as cl:
             for chunk in chunk_text(text):
                 payload = {"chat_id": chat_id, "text": chunk}
                 if markdown:
@@ -126,19 +160,54 @@ async def tg_send(chat_id: int, text: str, markdown: bool = True) -> None:
                     description = data.get("description", "")
                 if not data.get("ok"):
                     raise TelegramError(f"sendMessage {code}: {description}")
+                if data.get("result"):
+                    last_msg_id = data["result"].get("message_id")
     except httpx.HTTPError as e:
         log.exception("Erreur réseau Telegram: %s", e)
         raise
+    return last_msg_id
 
 
-def send_message(chat_id: int, text: str) -> None:
+async def tg_edit(chat_id: int, message_id: int, text: str, markdown: bool = True) -> None:
+    """Édite un message Telegram existant. Découpe si > 3500, repli texte brut sur 400."""
+    try:
+        async with httpx.AsyncClient(transport=TELEGRAM_TRANSPORT) as cl:
+            for chunk in chunk_text(text):
+                payload = {"chat_id": chat_id, "message_id": message_id, "text": chunk}
+                if markdown:
+                    payload["parse_mode"] = "Markdown"
+                resp = await cl.post(f"{API_BASE}/editMessageText", json=payload)
+                log.debug("POST editMessageText -> %s", resp.status_code)
+                data = resp.json()
+                code = resp.status_code
+                description = data.get("description", "")
+                if not data.get("ok") and markdown and code == 400:
+                    log.warning(
+                        "Bloc refusé en Markdown (%s), réessai sans parse_mode",
+                        description,
+                    )
+                    resp = await cl.post(
+                        f"{API_BASE}/editMessageText",
+                        json={"chat_id": chat_id, "message_id": message_id, "text": chunk},
+                    )
+                    data = resp.json()
+                    code = resp.status_code
+                    description = data.get("description", "")
+                if not data.get("ok"):
+                    raise TelegramError(f"editMessageText {code}: {description}")
+    except httpx.HTTPError as e:
+        log.exception("Erreur réseau Telegram (edit): %s", e)
+        raise
+
+
+async def send_message(chat_id: int, text: str) -> None:
     """Enveloppe de tg_send en markdown (1er essai Markdown, repli texte brut)."""
-    return asyncio.to_thread(tg_send, chat_id, text, markdown=True)
+    await tg_send(chat_id, text, markdown=True)
 
 
-def _send_plain(chat_id: int, text: str) -> None:
+async def _send_plain(chat_id: int, text: str) -> None:
     """Enveloppe de tg_send sans parse_mode (sortie pusher avec _ et *)."""
-    return asyncio.to_thread(tg_send, chat_id, text, markdown=False)
+    await tg_send(chat_id, text, markdown=False)
 
 
 def _load_state() -> dict:
@@ -527,14 +596,6 @@ async def ensure_session_titled(cid: str, sid: str, first_text: str):
         log.warning("Impossible de titrer session %s: %s", sid, e)
 
 
-async def send_message(chat_id: int, text: str):
-    async with httpx.AsyncClient() as cl:
-        await cl.post(
-            f"{API_BASE}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "Markdown"},
-        )
-
-
 def _resolve_instances(arg: str):
     """arg si c'est le nom d'une instance connue, sinon None (toutes)."""
     if not arg:
@@ -746,15 +807,6 @@ def _run_pusher(*args: str) -> str:
         return f"❌ Erreur pusher : {e}"
 
 
-async def _send_plain(chat_id: int, text: str):
-    """Envoi sans parse_mode : la sortie du pusher contient des _ et des *."""
-    async with httpx.AsyncClient() as cl:
-        await cl.post(
-            f"{API_BASE}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000]},
-        )
-
-
 async def handle_push(chat_id: int, body: str):
     """Canal #push : les ordres du jour. Jamais transmis à une session OpenCode."""
     body = body.strip()
@@ -887,6 +939,15 @@ async def _status_header(chat_id: int) -> str:
 
 async def handle_message(chat_id: int, text: str):
     cid = str(chat_id)
+
+    # B2 — contrôle d'accès : AUTHORIZED_CHAT_IDS lu dans l'environnement,
+    # repli sur les clés de l'état. Chat non autorisé = refus explicite, loggé,
+    # AUCUN appel vers l'API OpenCode.
+    if not _is_authorized(chat_id):
+        log.warning("Chat non autorisé: %s", chat_id)
+        await send_message(chat_id, "⛔ Chat non autorisé.")
+        return
+
     cur = _cur(cid)  # {"instance": inst_name, "sid": sid}
     inst_name = cur["instance"]
     sid = cur["sid"]
@@ -906,30 +967,78 @@ async def handle_message(chat_id: int, text: str):
             await send_message(chat_id, f"❌ Erreur création session : {e}")
             return
 
-    try:
-        response = await cli_prompt(inst, sid, text, agent)
-        # Titrer la session après le 1er message si pas déjà fait
-        await ensure_session_titled(cid, sid, text)
-        header = await _status_header(chat_id)
-        await send_message(chat_id, f"{header}\n{response}")
-        log.info("Réponse envoyée (%d chars)", len(response))
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            log.warning("Session %s introuvable, création d'une nouvelle", sid)
-            del state[cid]["current"]
-            _save_state(state)
-            await handle_message(chat_id, text)
-        else:
-            log.error("Erreur HTTP: %s", e)
-            await send_message(chat_id, f"❌ Erreur : {e}")
-    except Exception as e:
-        log.error("Erreur: %s", e)
-        await send_message(chat_id, f"❌ Erreur : {e}")
+    # B8 — accusé de réception : envoyer « ⏳ » avant un prompt long,
+    # puis ÉDITER ce message avec la réponse.
+    ack_msg_id = await tg_send(chat_id, "⏳", markdown=False)
+
+    # B13 — borner la récursion sur 404 : une seule re-création, jamais de
+    # rappel récursif sans limite. On utilise un drapeau local.
+    recreated = False
+
+    while True:
+        try:
+            response = await cli_prompt(inst, sid, text, agent)
+            # Titrer la session après le 1er message si pas déjà fait
+            await ensure_session_titled(cid, sid, text)
+            header = await _status_header(chat_id)
+            await tg_edit(chat_id, ack_msg_id, f"{header}\n{response}")
+            log.info("Réponse envoyée (%d chars)", len(response))
+            break
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            # Erreurs 4xx/5xx : message lisible pour l'utilisateur, journalisé
+            # côté serveur, sans exposer de secret.
+            if status == 404 and not recreated:
+                log.warning("Session %s introuvable (404), création d'une nouvelle (tentative unique)", sid)
+                recreated = True
+                del state[cid]["current"]
+                _save_state(state)
+                # Nouvelle session, on réessaie une seule fois
+                try:
+                    s = await create_session()
+                    sid = s["id"]
+                    cur["sid"] = sid
+                    state[cid]["current"] = {"instance": inst_name, "sid": sid}
+                    _save_state(state)
+                    log.info("Nouvelle session %s pour chat %s après 404", sid, cid)
+                    continue  # réessaie la boucle while
+                except Exception as e2:
+                    log.error("Erreur création session après 404: %s", e2)
+                    await tg_edit(chat_id, ack_msg_id, f"❌ Erreur création session : {e2}")
+                    break
+            elif 400 <= status < 500:
+                log.error("Erreur client HTTP %s: %s", status, e)
+                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur client ({status}) : requête invalide")
+                break
+            elif 500 <= status < 600:
+                log.error("Erreur serveur HTTP %s: %s", status, e)
+                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur serveur ({status}) : service indisponible")
+                break
+            else:
+                log.error("Erreur HTTP inattendue %s: %s", status, e)
+                await tg_edit(chat_id, ack_msg_id, f"❌ Erreur HTTP ({status})")
+                break
+        except httpx.TimeoutException:
+            log.error("Timeout lors de l'appel OpenCode")
+            await tg_edit(chat_id, ack_msg_id, "❌ Timeout : OpenCode ne répond pas")
+            break
+        except httpx.NetworkError as e:
+            log.error("Erreur réseau OpenCode: %s", e)
+            await tg_edit(chat_id, ack_msg_id, "❌ Erreur réseau : impossible de joindre OpenCode")
+            break
+        except Exception as e:
+            log.exception("Erreur inattendue dans handle_message: %s", e)
+            await tg_edit(chat_id, ack_msg_id, f"❌ Erreur interne")
+            break
 
 
 async def main():
     offset = 0
     log.info("Pont Telegram → OpenCode démarré (polling direct)")
+
+    # B6 — backoff borné 5 s → 60 s sur erreur réseau (pas de boucle serrée,
+    # pas d'attente infinie), calculable sans dormir réellement pour être testable.
+    poll_attempt = 0
 
     async with httpx.AsyncClient() as cl:
         while True:
@@ -942,8 +1051,14 @@ async def main():
 
                 if not data.get("ok"):
                     log.warning("API error: %s", data)
-                    await asyncio.sleep(5)
+                    delay = _backoff_schedule(poll_attempt)
+                    log.info("Backoff polling: %.1fs (tentative %d)", delay, poll_attempt)
+                    await asyncio.sleep(delay)
+                    poll_attempt += 1
                     continue
+
+                # Succès : on remet le compteur de backoff à zéro
+                poll_attempt = 0
 
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
@@ -1022,10 +1137,23 @@ async def main():
                         await send_message(chat_id, f"❌ Erreur : {e}")
 
             except httpx.TimeoutException:
-                pass
+                # Timeout sur getUpdates : backoff
+                delay = _backoff_schedule(poll_attempt)
+                log.info("Timeout getUpdates, backoff: %.1fs (tentative %d)", delay, poll_attempt)
+                await asyncio.sleep(delay)
+                poll_attempt += 1
+            except httpx.NetworkError as e:
+                # Erreur réseau : backoff
+                delay = _backoff_schedule(poll_attempt)
+                log.error("Erreur réseau polling: %s, backoff: %.1fs (tentative %d)", e, delay, poll_attempt)
+                await asyncio.sleep(delay)
+                poll_attempt += 1
             except Exception as e:
                 log.error("Erreur polling: %s", e)
-                await asyncio.sleep(5)
+                delay = _backoff_schedule(poll_attempt)
+                log.info("Backoff polling: %.1fs (tentative %d)", delay, poll_attempt)
+                await asyncio.sleep(delay)
+                poll_attempt += 1
 
 
 if __name__ == "__main__":
