@@ -40,8 +40,8 @@ const NIGHT_MANIFESTS_DIR = PROJECT + "/.opencode/night/manifests/"
 const NIGHT_QUEUE = PROJECT + "/.opencode/night/queue.jsonl"
 const NIGHT_STOP = PROJECT + "/.opencode/night/STOP"
 
-const AGENTS = new Set(["orchestrator", "worker", "reviewer", "merger"])
-const SPAWNABLE = new Set(["worker", "reviewer", "merger"])
+const AGENTS = new Set(["orchestrator", "worker", "reviewer", "merger", "webnav"])
+const SPAWNABLE = new Set(["worker", "reviewer", "merger", "webnav"])
 
 // Le frontière ne s'exécute jamais. Ces règles encodent la séparation :
 //   - un worker/merger tourne sur un modèle d'exécution free ou local (rien d'autre),
@@ -1001,7 +1001,7 @@ function bindWorker(sid, writingPath) {
   const known = readJson(KNOWN, {})
   if (known[sid]) return { ...known[sid], ambiguous: false }
   const pending = readJson(PENDING, []).filter((e) => Date.now() - (e.at || 0) < PENDING_TTL)
-  const candidates = pending.filter((e) => e.agent === "worker")
+  const candidates = pending.filter((e) => e.agent === "worker" || e.agent === "webnav")
   if (candidates.length === 0) return null
 
   // If writingPath is provided, deterministically match by scope
@@ -1011,7 +1011,8 @@ function bindWorker(sid, writingPath) {
     for (const c of candidates) {
       const txt = readText(c.manifest)
       if (!txt) continue
-      const step = activeStep(txt, "worker")
+      const agent = c.agent
+      const step = activeStep(txt, agent)
       if (!step) continue
       const scope = scopeList(step)
       if (scope.length && inScope(normPath, scope)) {
@@ -1020,17 +1021,17 @@ function bindWorker(sid, writingPath) {
     }
     if (matching.length === 1) {
       const entry = matching[0]
-      writeJson(KNOWN, { ...known, [sid]: { agent: "worker", manifest: entry.manifest, at: Date.now() } })
+      writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, at: Date.now() } })
       writeJson(PENDING, pending.filter((e) => e !== entry))
-      return { agent: "worker", manifest: entry.manifest, ambiguous: false }
+      return { agent: entry.agent, manifest: entry.manifest, ambiguous: false }
     }
     if (matching.length === 0 && candidates.length === 1) {
       // Single pending manifest but no scope match (e.g. multiple open steps, or path outside scope)
       // Bind to it but mark ambiguous so scope check is skipped with "liaison ambiguë" note
       const entry = candidates[0]
-      writeJson(KNOWN, { ...known, [sid]: { agent: "worker", manifest: entry.manifest, at: Date.now() } })
+      writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, at: Date.now() } })
       writeJson(PENDING, pending.filter((e) => e !== entry))
-      return { agent: "worker", manifest: entry.manifest, ambiguous: true }
+      return { agent: entry.agent, manifest: entry.manifest, ambiguous: true }
     }
     if (matching.length > 1) {
       // Multiple manifests match the path: do NOT guess, do NOT bind
@@ -1043,9 +1044,9 @@ function bindWorker(sid, writingPath) {
   // No writingPath provided: fall back to single pending entry
   if (candidates.length === 1) {
     const entry = candidates[0]
-    writeJson(KNOWN, { ...known, [sid]: { agent: "worker", manifest: entry.manifest, at: Date.now() } })
+    writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, at: Date.now() } })
     writeJson(PENDING, pending.filter((e) => e !== entry))
-    return { agent: "worker", manifest: entry.manifest, ambiguous: false }
+    return { agent: entry.agent, manifest: entry.manifest, ambiguous: false }
   }
   return null
 }
@@ -1648,6 +1649,12 @@ if (agent === "worker") {
         }
       }
     }
+  }
+
+  if (agent === "webnav") {
+    if (SPAWN_TOOL.test(tool)) blocked.push("webnav ne lance pas de sous-agent")
+    if (isWrite) blocked.push("webnav n'édite pas de fichier (edit/write interdits)")
+    if (isShell) blocked.push("webnav n'exécute pas de shell (bash interdit)")
   }
 
   return { blocked: [...new Set(blocked)], notes, tool, text: String(cmd || firstPath(args)).slice(0, 800) }
