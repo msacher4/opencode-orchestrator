@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { execFileSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 
 const PROJECT = "/media/marcs/Linux_Apps/Projets_AI"
 const PYTHON = `${PROJECT}/mcp/opencode-recurring/venv/bin/python`
@@ -741,12 +741,21 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
   const effectsLabel = effects === "both" ? "carte Kanban + Telegram" : effects === "kanban" ? "carte Kanban" : "Telegram"
 
   const recap = [
+    isEdit ? `ID : ${opts?.id}` : "ID : (nouvelle règle)",
     `« ${title} »`,
     `Fréquence : ${scheduleLabel(kind, payload, payload.time)}`,
     `Départ : ${frDate(payload.start)}`,
     `Effets : ${effectsLabel}`,
     execLine,
   ].join("\n")
+
+  try {
+    writeFileSync(
+      "/tmp/recurring-ui-last-payload.json",
+      JSON.stringify({ at: new Date().toISOString(), isEdit, id: opts?.id ?? null, payload }, null, 2),
+      "utf8",
+    )
+  } catch {}
 
   const confirmed = await ctx.ui.dialog.confirm({
     title: isEdit ? "Modifier la tâche récurrente ?" : "Créer la tâche récurrente ?",
@@ -757,6 +766,9 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
 
   if (isEdit && opts.id) {
     const result = call(["--update", opts.id, "--patch-json", JSON.stringify(payload)])
+    try {
+      writeFileSync("/tmp/recurring-ui-last-result.json", JSON.stringify({ at: new Date().toISOString(), id: opts.id, result }, null, 2), "utf8")
+    } catch {}
     if (result.error) {
       await ctx.ui.dialog.alert({ title: "Mise à jour impossible", message: result.error })
       return
