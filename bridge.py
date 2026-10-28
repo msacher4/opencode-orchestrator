@@ -238,14 +238,20 @@ async def create_session() -> dict:
     return await api_post("/session", {})
 
 
+async def create_session_on_instance(inst, body=None):
+    """Créer une session sur une instance donnée (v1 ou v2)."""
+    kind = await detect_kind(inst)
+    if kind == "api":
+        data, _ = await _http_post(inst, "/api/session", body or {}, timeout=180.0)
+        return (data or {}).get("data") if isinstance(data, dict) else None
+    data, _ = await _http_post(inst, "/session", body or {}, timeout=180.0)
+    return data
+
+
 async def send_to_session(sid: str, text: str) -> str:
     result = await api_post(f"/session/{sid}/message", {"parts": [{"type": "text", "text": text}]})
     parts = result.get("parts", [])
     return "\n".join(p["text"] for p in parts if p.get("type") == "text").strip() or "(pas de réponse textuelle)"
-
-
-async def switch_agent(sid: str, agent_id: str):
-    return await api_post(f"/api/session/{sid}/agent", {"agent": agent_id})
 
 
 def _fmt_tokens(n: int) -> str:
@@ -497,6 +503,9 @@ async def ensure_session_titled(cid: str, sid: str, first_text: str):
     titled = state.get(cid, {}).get("titled", [])
     if sid in titled:
         return
+    cur = _cur(cid)
+    inst_name = cur.get("instance", default_instance())
+    inst = instances()[inst_name]
     try:
         info = await get_session_info(sid)
     except Exception:
@@ -510,7 +519,7 @@ async def ensure_session_titled(cid: str, sid: str, first_text: str):
     if not title:
         return
     try:
-        await api_patch(f"/session/{sid}", {"title": title})
+        await cli_set_title(inst, sid, title)
         state.setdefault(cid, {}).setdefault("titled", []).append(sid)
         _save_state(state)
         log.info("Session %s titrée: %s", sid, title)
@@ -535,11 +544,44 @@ def _resolve_instances(arg: str):
     return None
 
 
+async def handle_status(chat_id: int):
+    """/status : affiche instance, session, agent et le contexte en tokens."""
+    cid = str(chat_id)
+    cur = _cur(chat_id)
+    inst_name = cur.get("instance", default_instance())
+    inst = instances()[inst_name]
+    sid = cur.get("sid", "")
+    agent = cur.get("agent", "build")
+
+    # Tokens
+    tokens = "?"
+    try:
+        if sid:
+            n = await get_session_context_tokens(sid)
+            tokens = _fmt_tokens(n) if n > 0 else "0"
+    except Exception:
+        pass
+
+    title = ""
+    try:
+        info = await get_session_info(sid) if sid else {}
+        title = info.get("title", "") or sid[:12] if sid else ""
+    except Exception:
+        pass
+
+    lines = [
+        f"[{inst_name}] {title} · {agent} · ctx {tokens}",
+        f"Session : {sid or '(aucune)'}",
+    ]
+    await send_message(chat_id, "\n".join(lines))
+
+
 async def handle_sessions_list(chat_id: int, arg: str):
     """/sessions [v1|v2|suite] : liste multi-instances paginée (10 par page).
 
     - arg = nom d'une instance connue -> liste seulement celle-ci ; sinon toutes.
-    - instance injoignable -> ligne « ⚠️ <nom> injoignable » sans bloquer.
+    - instance injoignable -> ligne « ⚠️ <nom> injoignable » affichée en-tête,
+      jamais dans page_rows (évite sélection par /select).
     - la page affichée est mémorisée dans state[cid]["page_rows"] : /select
       pioche dedans, sans recalcul.
     - ◀️ marque la session courante.
@@ -549,12 +591,13 @@ async def handle_sessions_list(chat_id: int, arg: str):
 
     wanted = _resolve_instances(arg)
 
+    warning_lines = []
     rows = []
     for name, res in results.items():
         if wanted is not None and name not in wanted:
             continue
         if res.get("unreachable"):
-            rows.append({"warning": f"⚠️ {name} injoignable"})
+            warning_lines.append(f"⚠️ {name} injoignable")
             continue
         for s in res.get("sessions", []):
             rows.append(
@@ -573,17 +616,18 @@ async def handle_sessions_list(chat_id: int, arg: str):
     else:
         page = 0
 
-    state.setdefault(cid, {})
     page_rows = rows[page * 10 : (page + 1) * 10]
+    state.setdefault(cid, {})
     state[cid]["page"] = page
     state[cid]["page_rows"] = page_rows
     _save_state(state)
 
     lines = []
+    # Afficher les avertissements en-tête (hors page_rows)
+    for wl in warning_lines:
+        lines.append(wl)
+    # Lignes de sessions paginées
     for row in page_rows:
-        if "warning" in row:
-            lines.append(row["warning"])
-            continue
         marker = ""
         if (
             current
@@ -649,40 +693,24 @@ async def handle_select(chat_id: int, arg: str):
     await send_message(chat_id, f"✅ Session active : `{title}`  {agent_icon}`{agent}`  [{row['instance']}]")
 
 
-async def handle_newsession(chat_id: int):
+async def handle_newsession(chat_id: int, arg: str = ""):
+    """/**newsession* [v1|v2] : nouvelle session sur une instance donnée.
+    Sans argument -> instance de la session courante, sinon la première configurée."""
     cid = str(chat_id)
+    inst_name = _resolve_instances(arg) or default_instance()
+    inst = instances()[inst_name]
     try:
-        s = await create_session()
+        s = await create_session_on_instance(inst, {})
         sid = s["id"]
         title = s.get("title", sid[:12])
         if cid not in state:
             state[cid] = {}
-        state[cid]["current"] = sid
+        state[cid]["current"] = {"instance": inst_name, "sid": sid}
         _save_state(state)
-        log.info("Nouvelle session %s pour chat %s", sid, cid)
+        log.info("Nouvelle session %s pour chat %s sur instance %s", sid, cid, inst_name)
         await send_message(chat_id, f"✅ Nouvelle session créée : `{title}`  (contexte 0 tokens)")
     except Exception as e:
         log.error("Erreur création session: %s", e)
-        await send_message(chat_id, f"❌ Erreur : {e}")
-
-
-async def handle_switch_agent(chat_id: int, agent_id: str):
-    cid = str(chat_id)
-    current_sid = state.get(cid, {}).get("current")
-
-    if not current_sid:
-        await send_message(chat_id, "Aucune session active. Crée‑en une avec `/newsession` d'abord.")
-        return
-
-    try:
-        await switch_agent(current_sid, agent_id)
-        state.setdefault(cid, {})["agent"] = agent_id
-        _save_state(state)
-        emoji = "📋" if agent_id == "plan" else "🔧"
-        await send_message(chat_id, f"{emoji} Mode passé à `{agent_id}` pour la session active.")
-        log.info("Session %s → agent %s", current_sid, agent_id)
-    except Exception as e:
-        log.error("Erreur switch agent: %s", e)
         await send_message(chat_id, f"❌ Erreur : {e}")
 
 
@@ -830,34 +858,64 @@ async def handle_emp(chat_id: int, body: str):
             await send_message(chat_id, f"❌ Inbox employé indisponible : {e}")
 
 
+async def _status_header(chat_id: int) -> str:
+    """Génère la chaîne d'en-tête [instance] titre · agent · ctx N tokens."""
+    cid = str(chat_id)
+    cur = _cur(chat_id)
+    inst_name = cur.get("instance", default_instance())
+    sid = cur.get("sid", "")
+    agent = cur.get("agent", "build")
+
+    tokens = "?"
+    try:
+        if sid:
+            n = await get_session_context_tokens(sid)
+            tokens = _fmt_tokens(n) if n > 0 else "0"
+    except Exception:
+        pass
+
+    title = ""
+    try:
+        if sid:
+            info = await get_session_info(sid)
+            title = info.get("title", "") or sid[:12]
+    except Exception:
+        pass
+
+    return f"[{inst_name}] {title} · {agent} · ctx {tokens}"
+
+
 async def handle_message(chat_id: int, text: str):
     cid = str(chat_id)
-    current_sid = state.get(cid, {}).get("current")
+    cur = _cur(cid)  # {"instance": inst_name, "sid": sid}
+    inst_name = cur["instance"]
+    sid = cur["sid"]
+    agent = state[cid].get("agent", "build")
+    inst = instances()[inst_name]
 
-    if not current_sid:
+    if not sid:
         try:
             s = await create_session()
-            current_sid = s["id"]
-            title = s.get("title", current_sid[:12])
-            if cid not in state:
-                state[cid] = {}
-            state[cid]["current"] = current_sid
+            sid = s["id"]
+            cur["sid"] = sid
+            state[cid]["current"] = {"instance": inst_name, "sid": sid}
             _save_state(state)
-            log.info("Auto-session %s pour chat %s (%s)", current_sid, cid, title)
+            log.info("Auto-session %s pour chat %s", sid, cid)
         except Exception as e:
             log.error("Erreur création auto-session: %s", e)
             await send_message(chat_id, f"❌ Erreur création session : {e}")
             return
 
     try:
-        response = await send_to_session(current_sid, text)
+        response = await cli_prompt(inst, sid, text, agent)
         # Titrer la session après le 1er message si pas déjà fait
-        await ensure_session_titled(cid, current_sid, text)
-        await send_message(chat_id, response)
+        await ensure_session_titled(cid, sid, text)
+        header = await _status_header(chat_id)
+        await send_message(chat_id, f"{header}\n{response}")
         log.info("Réponse envoyée (%d chars)", len(response))
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
-            log.warning("Session %s introuvable, création d'une nouvelle", current_sid)
+            log.warning("Session %s introuvable, création d'une nouvelle", sid)
             del state[cid]["current"]
             _save_state(state)
             await handle_message(chat_id, text)
@@ -925,7 +983,13 @@ async def main():
                             )
 
                         elif cmd == "/newsession":
-                            await handle_newsession(chat_id)
+                            await handle_newsession(
+                                chat_id,
+                                text.lower().split()[1] if len(text.split()) > 1 else "",
+                            )
+
+                        elif cmd == "/status":
+                            await handle_status(chat_id)
 
                         elif cmd == "/sessions":
                             await handle_sessions_list(
@@ -937,10 +1001,18 @@ async def main():
                             await handle_select(chat_id, text.lower().split()[1] if len(text.split()) > 1 else "")
 
                         elif cmd == "/plan":
-                            await handle_switch_agent(chat_id, "plan")
+                            cid = str(chat_id)
+                            state.setdefault(cid, {})["agent"] = "plan"
+                            _save_state(state)
+                            emoji = "📋"
+                            await send_message(chat_id, f"{emoji} Mode passé à `plan` pour la session active.")
 
                         elif cmd == "/build":
-                            await handle_switch_agent(chat_id, "build")
+                            cid = str(chat_id)
+                            state.setdefault(cid, {})["agent"] = "build"
+                            _save_state(state)
+                            emoji = "🔧"
+                            await send_message(chat_id, f"{emoji} Mode passé à `build` pour la session active.")
 
                         else:
                             await handle_message(chat_id, text)

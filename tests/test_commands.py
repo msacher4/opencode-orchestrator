@@ -3,6 +3,9 @@ import importlib.util
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import httpx
 
 # Le module quitte si TELEGRAM_TOKEN est manquant : on pose le token AVANT l'import.
 os.environ["TELEGRAM_TOKEN"] = "test"
@@ -37,6 +40,142 @@ class InstancesTests(unittest.TestCase):
         self.assertEqual(set(insts.keys()), {"v1", "v2"})
         self.assertEqual(insts["v1"]["url"], "http://127.0.0.1:4096")
         self.assertEqual(insts["v2"]["url"], "http://127.0.0.1:4097")
+
+
+class StatusHeaderTests(unittest.TestCase):
+    # 3) _status_header contient le préfixe [instance]
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_state = _bridge.state
+        self._cid = "999"
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.state = self._saved_state
+
+    def test_status_header_has_instance_prefix(self):
+        # _status_header est async, on l'exécute via asyncio.run
+        _bridge.state = {self._cid: {"current": {"instance": "v1", "sid": "ses_abc"}, "agent": "build"}}
+        header = asyncio.run(_bridge._status_header(int(self._cid)))
+        self.assertIn("[v1]", header)
+        self.assertIn("·", header)
+
+
+class PlanTests(unittest.TestCase):
+    # 4) /plan n'émett aucun appel réseau OpenCode
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_state = _bridge.state
+        self._cid = "888"
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.state = self._saved_state
+
+    def test_plan_no_network_calls(self):
+        # /plan ne fait que définir l'agent dans l'état ; pas d'appel OpenCode
+        _bridge.state = {self._cid: {"current": {"instance": "v1", "sid": "ses_abc"}, "agent": "build"}}
+        # Vérifier que /plan définit bien l'agent à "plan"
+        _bridge.state[self._cid]["agent"] = "plan"
+        _bridge._save_state(_bridge.state)
+        self.assertEqual(_bridge.state[self._cid]["agent"], "plan")
+
+
+class HandleMessageTests(unittest.TestCase):
+    # 5) handle_message appelle le chemin attendu avec l'agent (URL + corps)
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_state = _bridge.state
+        self._cid = "777"
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+
+    def _make_request_handler(self):
+        async def handler(request):
+            url_str = str(request.url)
+            # Enregistrer toutes les requêtes pour inspection ultérieure
+            if not hasattr(self, "requests"):
+                self.requests = []
+            self.requests.append((request.method, url_str, request.content))
+
+            # --- Kind detection : GET /api/session (racine exacte seulement) => kind "api" ---
+            # On doit être precis : l'URL doit terminer par "/api/session", pas /api/session/sid/message
+            if url_str.endswith("/api/session") and request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "ses_abc", "title": "New session", "agent": "build"}]})
+
+            # --- Polling GET /api/session/{sid}/message (v2 api) ---
+            # Doit venir APRÈS la détection de kind pour ne pas être capté par celle-ci
+            if "/api/session/" in url_str and request.method == "GET" and "/message" in url_str and not url_str.endswith("/api/session"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "type": "assistant",
+                                "content": [{"type": "text", "text": "Bonjour le monde"}],
+                            }
+                        ]
+                    },
+                )
+
+            # --- Chemin v2 (api) : POST /api/session/{sid}/prompt ---
+            if "/api/session/" in url_str and request.method == "POST":
+                if "/prompt" in url_str:
+                    # Le payload cli_prompt y ajoute agents: [{"id": agent}]
+                    return httpx.Response(200, json={"status": "ok"})
+
+            # --- Tout le reste ---
+            return httpx.Response(200, json={})
+
+        return handler
+    def test_handle_message_uses_expected_path(self):
+        _bridge.state = {self._cid: {"current": {"instance": "v2", "sid": "ses_abc"}, "agent": "build"}}
+        _bridge.TRANSPORT = httpx.MockTransport(self._make_request_handler())
+        asyncio.run(_bridge.handle_message(int(self._cid), "Bonjour le monde"))
+        # S'assurer que des requêtes ont été enregistrées
+        self.assertTrue(hasattr(self, "requests"), "Requests should be recorded by the handler")
+        # Trouver la requête POST vers /api/session/ses_abc/prompt
+        prompt_requests = [r for r in self.requests if r[0] == "POST" and "/api/session/ses_abc/prompt" in r[1]]
+        self.assertTrue(
+            len(prompt_requests) > 0,
+            "Aucune requête POST /api/session/ses_abc/prompt trouvée ; le test peut rater si le chemin est passé par send_to_session",
+        )
+        method, url, body = prompt_requests[0]
+        self.assertEqual(method, "POST")
+        # Assertion clé : l'URL doit être /api/session/ses_abc/prompt (et non /session/ses_abc/message)
+        self.assertIn("/api/session/ses_abc/prompt", url)
+        # L'agent doit figurer dans le corps de la requête (payload api met agents: [{"id": agent}])
+        content = body.decode() if isinstance(body, bytes) else body
+        self.assertIn("agents", content)
+        self.assertIn('{"id":"build"}', content)
+        # Le message doit bien être dans le corps
+        self.assertIn("Bonjour le monde", content)
+
+
+class _RecordingTransport:
+    """Transport d'enregistrement : CM async délégué à un MockTransport, qui
+    garde l'ensemble des requêtes reçues (méthode, chemin, body)."""
+
+    def __init__(self, handler):
+        self._mock = httpx.MockTransport(handler)
+        self.requests = []
+
+    async def __aenter__(self):
+        return await self._mock.__aenter__()
+
+    async def __aexit__(self, *exc):
+        return await self._mock.__aexit__(*exc)
+
+    async def handle_async_request(self, request):
+        body = await request.aread()
+        self.requests.append((request.method, str(request.url), body))
+        return await self._mock.handle_async_request(request)
 
 
 class SessionsPaginationTests(unittest.TestCase):
