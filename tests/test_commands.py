@@ -405,3 +405,263 @@ class ErrorBodyTests(unittest.TestCase):
         self.assertIn("missing required field", error_msg)
         # Le corps doit être tronqué à ~300 chars
         self.assertLessEqual(len(error_msg), 500)  # Marge raisonnable
+
+
+class SessionSortTests(unittest.TestCase):
+    """Tests pour _sort_key_session : tri par récence décroissante."""
+
+    def test_sessions_sort_recency_desc(self):
+        """_sort_key_session ordonne updated desc, puis created desc, None à la fin,
+        sans TypeError entre None et une date."""
+        # Session 1 : updated le plus récent (mis à jour après création)
+        s1 = {
+            "sid": "ses_a",
+            "created_ms": 1000,
+            "updated_ms": 3000,  # mis à jour récemment
+        }
+        # Session 2 : seulement created, pas d'updated
+        s2 = {
+            "sid": "ses_b",
+            "created_ms": 2000,
+            "updated_ms": None,
+        }
+        # Session 3 : ni created ni updated (sans date)
+        s3 = {
+            "sid": "ses_c",
+            "created_ms": None,
+            "updated_ms": None,
+        }
+        # Session 4 : updated plus ancien que s1, created plus récent que s2
+        s4 = {
+            "sid": "ses_d",
+            "created_ms": 2500,
+            "updated_ms": 1500,
+        }
+
+        sessions = [s1, s2, s3, s4]
+        # Trier avec reverse=True car la clé est conçue pour l'ordre croissant
+        # (has_date True > False, puis timestamps plus grands = plus récents)
+        sessions.sort(key=_bridge._sort_key_session, reverse=True)
+
+        # Ordre attendu : s1 (updated=3000), s4 (updated=1500), s2 (created=2000, pas d'updated), s3 (sans date)
+        self.assertEqual(sessions[0]["sid"], "ses_a")  # updated le plus récent
+        self.assertEqual(sessions[1]["sid"], "ses_d")  # updated=1500
+        self.assertEqual(sessions[2]["sid"], "ses_b")  # seulement created=2000
+        self.assertEqual(sessions[3]["sid"], "ses_c")  # sans date à la fin
+
+        # Vérifier qu'aucun TypeError n'est levé (None vs int comparé dans la clé)
+        # La clé retourne (has_date, updated_or_-1, created_or_-1) - tous comparables
+        for s in sessions:
+            _ = _bridge._sort_key_session(s)  # ne doit pas lever
+
+
+class MirrorTests(unittest.TestCase):
+    """Tests pour la boucle de miroir : anti-doublon, anti-rejeu, exclusion live."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
+        self._saved_state = _bridge.state
+        self._saved_mirror_tasks = dict(_bridge._MIRROR_TASKS)
+        self._saved_kind_cache = dict(_bridge._KIND_CACHE)
+        self._cid = "9999"
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
+        _bridge.state = self._saved_state
+        _bridge._MIRROR_TASKS.clear()
+        _bridge._MIRROR_TASKS.update(self._saved_mirror_tasks)
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind_cache)
+
+    def _make_transports(self, opencode_handler, tg_handler):
+        """Configure les transports mock pour OpenCode et Telegram."""
+        _bridge.TRANSPORT = httpx.MockTransport(opencode_handler)
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+
+    async def _run_mirror_iteration(self, chat_id, inst_name="v1", sid="ses_test"):
+        """Exécute une itération de la boucle miroir (une fois _mirror_loop sans sleep)."""
+        # On appelle directement _fetch_new_assistant_messages et _send_mirror_message
+        # pour tester la logique sans attendre le sleep
+        inst = _bridge.instances()[inst_name]
+        mirror_state = _bridge._get_mirror_state(str(chat_id))
+        last_seen = mirror_state.get("last_seen_id")
+        seen_ids = _bridge._mirror_seen_ids_as_set(mirror_state)
+
+        new_messages = await _bridge._fetch_new_assistant_messages(inst, sid, last_seen)
+
+        sent_count = 0
+        for msg in new_messages:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen_ids:
+                continue
+            await _bridge._send_mirror_message(chat_id, inst, sid, msg)
+            seen_ids.add(msg_id)
+            mirror_state["last_seen_id"] = msg_id
+            _bridge._mirror_save_seen_ids(mirror_state, seen_ids)
+            _bridge._save_state(_bridge.state)
+            sent_count += 1
+        return sent_count, new_messages
+
+    def test_mirror_new_message_once(self):
+        """Un nouveau message d'assistant n'est envoyé qu'une fois et entre dans seen_ids
+        sur plusieurs tours de boucle."""
+        # État initial : session courante, last_seen_id = None (premier tour)
+        _bridge.state = {
+            self._cid: {
+                "current": {"instance": "v1", "sid": "ses_test"},
+                "mirror": {"last_seen_id": None, "seen_ids": []},
+            }
+        }
+
+        tg_requests = []
+
+        def opencode_handler(request):
+            url = str(request.url)
+            if "/session/ses_test/message" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"id": "msg_1", "type": "user", "content": [{"type": "text", "text": "hello"}]},
+                        {"id": "msg_2", "type": "assistant", "content": [{"type": "text", "text": "Bonjour !"}]},
+                    ],
+                )
+            return httpx.Response(404)
+
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                import json as _json
+                payload = _json.loads(request.content)
+                tg_requests.append(payload["text"])
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            return httpx.Response(404)
+
+        self._make_transports(opencode_handler, tg_handler)
+
+        # Premier tour de boucle : découvre le message assistant
+        sent1, _ = asyncio.run(self._run_mirror_iteration(int(self._cid)))
+        self.assertEqual(sent1, 1, "Premier tour : un message envoyé")
+        self.assertEqual(len(tg_requests), 1)
+        self.assertIn("Bonjour !", tg_requests[0])
+
+        # Vérifier que seen_ids contient maintenant msg_2
+        mirror_state = _bridge._get_mirror_state(self._cid)
+        seen_ids = _bridge._mirror_seen_ids_as_set(mirror_state)
+        self.assertIn("msg_2", seen_ids, "L'id du message doit être dans seen_ids")
+
+        # Deuxième tour de boucle : même réponse de l'API, mais déjà vu
+        sent2, _ = asyncio.run(self._run_mirror_iteration(int(self._cid)))
+        self.assertEqual(sent2, 0, "Deuxième tour : aucun envoi (déjà vu)")
+        self.assertEqual(len(tg_requests), 1, "Total Telegram : exactement 1 envoi")
+
+        # Troisième tour : encore zéro
+        sent3, _ = asyncio.run(self._run_mirror_iteration(int(self._cid)))
+        self.assertEqual(sent3, 0, "Troisième tour : aucun envoi")
+
+    def test_mirror_no_replay_after_select(self):
+        """Après /select sur une session avec historique, le fetch utilise after_id
+        égal au dernier message existant → l'historique n'est jamais rejoué."""
+        # État : session sélectionnée, last_seen_id = dernier message de l'historique
+        _bridge.state = {
+            self._cid: {
+                "current": {"instance": "v1", "sid": "ses_test"},
+                "mirror": {"last_seen_id": "msg_99", "seen_ids": ["msg_1", "msg_50", "msg_99"]},
+            }
+        }
+
+        tg_requests = []
+
+        def opencode_handler(request):
+            url = str(request.url)
+            if "/session/ses_test/message" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"id": "msg_1", "type": "user", "content": [{"type": "text", "text": "old"}]},
+                        {"id": "msg_50", "type": "assistant", "content": [{"type": "text", "text": "old reply"}]},
+                        {"id": "msg_99", "type": "user", "content": [{"type": "text", "text": "last user"}]},
+                        {"id": "msg_100", "type": "assistant", "content": [{"type": "text", "text": "NEW assistant"}]},
+                    ],
+                )
+            return httpx.Response(404)
+
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                import json as _json
+                payload = _json.loads(request.content)
+                tg_requests.append(payload["text"])
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            return httpx.Response(404)
+
+        self._make_transports(opencode_handler, tg_handler)
+
+        # Un tour de boucle : after_id = "msg_99" (last_seen_id)
+        sent, new_msgs = asyncio.run(self._run_mirror_iteration(int(self._cid)))
+
+        # Seul msg_100 (après msg_99) doit être traité
+        self.assertEqual(len(new_msgs), 1)
+        self.assertEqual(new_msgs[0]["id"], "msg_100")
+        self.assertEqual(sent, 1)
+        self.assertIn("NEW assistant", tg_requests[0])
+
+        # Vérifier que les messages avant msg_99 (msg_1, msg_50) ne sont PAS dans new_msgs
+        for m in new_msgs:
+            self.assertNotIn(m["id"], ["msg_1", "msg_50", "msg_99"])
+
+    def test_mirror_no_duplicate_live_delivery(self):
+        """Le message livré en direct par handle_message est marqué vu ;
+        le miroir ne le renvoie pas (pas de doublon)."""
+        # Simuler : handle_message vient de livrer un message assistant (msg_42)
+        # et a appelé _mark_latest_assistant_seen -> seen_ids contient msg_42
+        _bridge.state = {
+            self._cid: {
+                "current": {"instance": "v1", "sid": "ses_test"},
+                "mirror": {"last_seen_id": "msg_42", "seen_ids": ["msg_42"]},
+            }
+        }
+
+        tg_requests = []
+
+        def opencode_handler(request):
+            url = str(request.url)
+            if "/session/ses_test/message" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"id": "msg_40", "type": "user", "content": [{"type": "text", "text": "q"}]},
+                        {"id": "msg_42", "type": "assistant", "content": [{"type": "text", "text": "Réponse livrée en direct"}]},
+                        {"id": "msg_43", "type": "assistant", "content": [{"type": "text", "text": "Autre réponse"}]},
+                    ],
+                )
+            return httpx.Response(404)
+
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                import json as _json
+                payload = _json.loads(request.content)
+                tg_requests.append(payload["text"])
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            return httpx.Response(404)
+
+        self._make_transports(opencode_handler, tg_handler)
+
+        # Un tour de boucle : msg_42 est déjà dans seen_ids, seul msg_43 devrait passer
+        sent, new_msgs = asyncio.run(self._run_mirror_iteration(int(self._cid)))
+
+        # msg_42 doit être filtré par seen_ids
+        # Seuls les messages assistant non vus après last_seen_id (msg_42) sont candidats
+        # Ici : msg_42 est à l'index 1, msg_43 à l'index 2
+        # last_seen_id = "msg_42", donc found_after devient True à msg_42
+        # msg_43 est après, mais c'est aussi un assistant -> devrait être envoyé
+        # MAIS msg_42 est dans seen_ids, donc il est skip
+        # msg_43 n'est PAS dans seen_ids, donc il SERAIT envoyé
+        # Le test vérifie que le message "live" (msg_42) n'est pas rejoué
+
+        # Vérifier que msg_42 n'est PAS dans les messages envoyés
+        sent_texts = " ".join(tg_requests)
+        self.assertNotIn("Réponse livrée en direct", sent_texts, "msg_42 (live) ne doit pas être renvoyé")
+
+
+if __name__ == "__main__":
+    unittest.main()

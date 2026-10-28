@@ -241,6 +241,12 @@ def _save_state(state: dict):
 
 state = _load_state()
 
+# MIRROR: intervalle de polling pour la boucle de miroir (défaut 3s, surchargeable par MIRROR_INTERVAL)
+MIRROR_INTERVAL = float(os.getenv("MIRROR_INTERVAL", "3.0"))
+
+# Tâches de miroir actives par chat_id -> asyncio.Task
+_MIRROR_TASKS: dict[int, asyncio.Task] = {}
+
 _INSTANCES = None
 
 
@@ -266,19 +272,230 @@ def _cur(chat_id):
     return c
 
 
-def _set_cur(chat_id, instance, sid):
+async def _set_cur(chat_id, instance, sid):
     cid = str(chat_id)
     state.setdefault(cid, {})["current"] = {"instance": instance, "sid": sid}
     _save_state(state)
-log.info("Chats suivis: %d", len(state))
+    # Redémarrer la tâche de miroir pour ce chat avec la nouvelle session
+    await _restart_mirror_task(chat_id)
 
 
-async def api_get(path):
-    async with httpx.AsyncClient(base_url=OPENCODE_URL, timeout=httpx.Timeout(10.0)) as cl:
-        r = await cl.get(path)
-        log.debug("GET %s -> %s", path, r.status_code)
-        r.raise_for_status()
-        return r.json()
+def _get_mirror_state(cid: str) -> dict:
+    """Récupère l'état de miroir pour un chat (last_seen_id, seen_ids set en mémoire)."""
+    chat_state = state.setdefault(cid, {})
+    mirror = chat_state.setdefault("mirror", {})
+    # seen_ids est stocké comme liste dans l'état (JSON), mais utilisé comme set en mémoire
+    if "seen_ids" not in mirror:
+        mirror["seen_ids"] = []
+    return mirror
+
+
+def _mirror_seen_ids_as_set(mirror: dict) -> set:
+    """Convertit mirror['seen_ids'] (liste) en set pour usage en mémoire."""
+    return set(mirror.get("seen_ids", []))
+
+
+def _mirror_save_seen_ids(mirror: dict, seen_ids: set):
+    """Sauvegarde le set seen_ids comme liste dans l'état."""
+    mirror["seen_ids"] = list(seen_ids)
+
+
+async def _fetch_last_message_id(inst: dict, sid: str) -> str | None:
+    """Récupère l'ID du dernier message de la session (pour initialiser le miroir sans rejouer l'historique)."""
+    kind = await detect_kind(inst)
+    try:
+        if kind == "api":
+            data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+            items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        else:
+            data, _ = await _http_get(inst, f"/session/{sid}/message", timeout=10.0)
+            items = data if isinstance(data, list) else []
+        if items:
+            last = items[-1]
+            if isinstance(last, dict):
+                return last.get("id")
+    except Exception as e:
+        log.debug("Impossible de récupérer le dernier message pour miroir %s/%s: %s", inst.get("name"), sid, e)
+    return None
+
+
+async def _fetch_new_assistant_messages(inst: dict, sid: str, after_id: str | None) -> list[dict]:
+    """Récupère les messages d'assistant nouveaux depuis after_id (exclusif).
+    Retourne une liste de dicts {id, text} pour les messages assistant non vides."""
+    kind = await detect_kind(inst)
+    new_messages = []
+    try:
+        if kind == "api":
+            data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+            items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        else:
+            data, _ = await _http_get(inst, f"/session/{sid}/message", timeout=10.0)
+            items = data if isinstance(data, list) else []
+
+        found_after = after_id is None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            msg_id = item.get("id")
+            if not found_after:
+                if msg_id == after_id:
+                    found_after = True
+                continue
+            # Ne traiter que les messages assistant
+            if item.get("type") != "assistant":
+                continue
+            # Extraire le texte depuis content[].text
+            contents = item.get("content", [])
+            if not isinstance(contents, list):
+                continue
+            text_parts = []
+            for c in contents:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = c.get("text", "").strip()
+                    if text:
+                        text_parts.append(text)
+            if text_parts:
+                new_messages.append({"id": msg_id, "text": "\n".join(text_parts)})
+    except Exception as e:
+        log.debug("Erreur récupération messages miroir %s/%s: %s", inst.get("name"), sid, e)
+    return new_messages
+
+
+async def _send_mirror_message(chat_id: int, inst: dict, sid: str, msg: dict):
+    """Envoie un message miroir sur Telegram avec l'en-tête standard."""
+    try:
+        header = await _status_header(chat_id)
+        text = f"{header}\n{msg['text']}"
+        await tg_send(chat_id, text, markdown=True)
+        log.info("Miroir: message %s envoyé au chat %s", msg.get("id"), chat_id)
+    except Exception as e:
+        log.error("Erreur envoi miroir chat %s: %s", chat_id, e)
+
+
+async def _fetch_latest_assistant_message_id(inst: dict, sid: str) -> str | None:
+    """Récupère l'ID du dernier message assistant de la session."""
+    kind = await detect_kind(inst)
+    try:
+        if kind == "api":
+            data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+            items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        else:
+            data, _ = await _http_get(inst, f"/session/{sid}/message", timeout=10.0)
+            items = data if isinstance(data, list) else []
+        # Parcourir en sens inverse pour trouver le dernier assistant
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "assistant":
+                return item.get("id")
+    except Exception as e:
+        log.debug("Impossible de récupérer le dernier message assistant %s/%s: %s", inst.get("name"), sid, e)
+    return None
+
+
+async def _mark_latest_assistant_seen(chat_id: int, inst: dict, sid: str):
+    """Marque le dernier message assistant comme vu dans l'état miroir."""
+    msg_id = await _fetch_latest_assistant_message_id(inst, sid)
+    if not msg_id:
+        return
+    cid = str(chat_id)
+    mirror_state = _get_mirror_state(cid)
+    seen_ids = _mirror_seen_ids_as_set(mirror_state)
+    if msg_id not in seen_ids:
+        seen_ids.add(msg_id)
+        mirror_state["last_seen_id"] = msg_id
+        _mirror_save_seen_ids(mirror_state, seen_ids)
+        _save_state(state)
+        log.debug("Miroir: message %s marqué comme vu (livré en direct) pour chat %s", msg_id, cid)
+
+
+async def _mirror_loop(chat_id: int):
+    """Boucle de miroir pour un chat : poll périodique des nouveaux messages assistant."""
+    cid = str(chat_id)
+    log.info("Miroir démarré pour chat %s (intervalle %.1fs)", cid, MIRROR_INTERVAL)
+
+    while True:
+        try:
+            await asyncio.sleep(MIRROR_INTERVAL)
+
+            # Vérifier que le chat a encore une session courante
+            cur = _cur(chat_id)
+            if not cur or not cur.get("sid"):
+                log.debug("Miroir: pas de session courante pour chat %s, attente...", cid)
+                continue
+
+            inst_name = cur["instance"]
+            sid = cur["sid"]
+            inst = instances().get(inst_name)
+            if not inst:
+                log.warning("Miroir: instance %s introuvable pour chat %s", inst_name, cid)
+                continue
+
+            mirror_state = _get_mirror_state(cid)
+            last_seen = mirror_state.get("last_seen_id")
+            seen_ids = _mirror_seen_ids_as_set(mirror_state)
+
+            # Récupérer les nouveaux messages assistant
+            new_messages = await _fetch_new_assistant_messages(inst, sid, last_seen)
+
+            for msg in new_messages:
+                msg_id = msg.get("id")
+                if not msg_id or msg_id in seen_ids:
+                    continue
+                # Envoyer le message
+                await _send_mirror_message(chat_id, inst, sid, msg)
+                # Marquer comme vu
+                seen_ids.add(msg_id)
+                mirror_state["last_seen_id"] = msg_id
+                _mirror_save_seen_ids(mirror_state, seen_ids)
+                _save_state(state)
+
+        except asyncio.CancelledError:
+            log.info("Miroir arrêté pour chat %s", cid)
+            break
+        except Exception as e:
+            log.exception("Erreur dans la boucle miroir chat %s: %s", cid, e)
+            # On continue la boucle malgré l'erreur
+
+
+async def _restart_mirror_task(chat_id: int):
+    """Arrête l'ancienne tâche de miroir (si existante) et en démarre une nouvelle."""
+    # Annuler l'ancienne tâche
+    old_task = _MIRROR_TASKS.pop(chat_id, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    # Vérifier qu'il y a une session courante
+    cur = _cur(chat_id)
+    if not cur or not cur.get("sid"):
+        return
+
+    # Initialiser l'état de miroir : last_seen_id = dernier message existant
+    cid = str(chat_id)
+    inst_name = cur["instance"]
+    sid = cur["sid"]
+    inst = instances().get(inst_name)
+    if not inst:
+        return
+
+    mirror_state = _get_mirror_state(cid)
+    last_id = await _fetch_last_message_id(inst, sid)
+    mirror_state["last_seen_id"] = last_id
+    _mirror_save_seen_ids(mirror_state, set())
+    _save_state(state)
+
+    # Démarrer la nouvelle tâche
+    task = asyncio.create_task(_mirror_loop(chat_id))
+    _MIRROR_TASKS[chat_id] = task
+    log.info("Miroir: tâche redémarrée pour chat %s (session %s, last_seen=%s)", cid, sid, last_id)
+
+
+def _stop_mirror_task(chat_id: int):
+    """Arrête la tâche de miroir pour un chat (ex: lors du changement de session)."""
+    task = _MIRROR_TASKS.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+        log.info("Miroir: tâche arrêtée pour chat %s", chat_id)
 
 
 async def api_post(path, body=None):
@@ -507,9 +724,22 @@ async def cli_set_title(inst, sid, title):
     return await _http_patch(inst, f"/session/{sid}", {"title": title}, timeout=10.0)
 
 
+def _extract_time_fields(raw):
+    """Extrait created/updated depuis raw.time (v1) ou raw.data.time (v2).
+    Retourne (created_ms, updated_ms) en int ou None si absent.
+    Les timestamps sont en millisecondes epoch (OpenCode)."""
+    time_obj = raw.get("time")
+    if isinstance(time_obj, dict):
+        created = time_obj.get("created")
+        updated = time_obj.get("updated")
+        return (created if isinstance(created, (int, float)) else None,
+                updated if isinstance(updated, (int, float)) else None)
+    return (None, None)
+
+
 def cli_normalize_session(raw, instance, kind):
     """normalize_session(raw, instance, kind) -> {instance, sid, title, agent,
-    model, tokens} quel que soit le serveur."""
+    model, tokens, created_ms, updated_ms} quel que soit le serveur."""
     t = raw.get("tokens") or {}
     cache = t.get("cache") if isinstance(t, dict) else {}
     tokens = t.get("input", 0) + t.get("output", 0)
@@ -517,6 +747,7 @@ def cli_normalize_session(raw, instance, kind):
     if isinstance(model, dict):
         model = model.get("id")
     title = raw.get("title") or (raw.get("id") or "")[:12]
+    created_ms, updated_ms = _extract_time_fields(raw)
     return {
         "instance": instance,
         "sid": raw.get("id"),
@@ -524,6 +755,8 @@ def cli_normalize_session(raw, instance, kind):
         "agent": raw.get("agent") or "build",
         "model": model,
         "tokens": tokens,
+        "created_ms": created_ms,
+        "updated_ms": updated_ms,
     }
 
 
@@ -664,6 +897,30 @@ async def handle_status(chat_id: int):
     await send_message(chat_id, "\n".join(lines))
 
 
+def _fmt_ts(ms):
+    """Formate un timestamp ms epoch en 'JJ/MM HH:MM' (ex: 28/10 23:58).
+    Retourne '' si ms est None."""
+    if ms is None:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(ms / 1000.0)
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:
+        return ""
+
+
+def _sort_key_session(s):
+    """Clé de tri pour sessions : updated desc, puis created desc, None à la fin.
+    Retourne un tuple comparable : (has_date, updated_ms, created_ms) où has_date
+    force les sessions sans date à la fin (False < True)."""
+    updated = s.get("updated_ms")
+    created = s.get("created_ms")
+    has_date = updated is not None or created is not None
+    # Pour tri décroissant : on inverse le signe des timestamps
+    # None -> -inf pour les mettre à la fin (mais has_date gère déjà)
+    return (has_date, updated if updated is not None else -1, created if created is not None else -1)
+
+
 async def handle_sessions_list(chat_id: int, arg: str):
     """/sessions [v1|v2|suite] : liste multi-instances paginée (10 par page).
 
@@ -673,6 +930,8 @@ async def handle_sessions_list(chat_id: int, arg: str):
     - la page affichée est mémorisée dans state[cid]["page_rows"] : /select
       pioche dedans, sans recalcul.
     - ◀️ marque la session courante.
+    - Sessions triées par récence décroissante (updated, sinon created).
+    - Horodatage court affiché (ex: 28/10 23:58).
     """
     cid = str(chat_id)
     results = await cli_list_sessions(instances())
@@ -694,8 +953,13 @@ async def handle_sessions_list(chat_id: int, arg: str):
                     "sid": s["sid"],
                     "title": s["title"],
                     "agent": s["agent"],
+                    "created_ms": s.get("created_ms"),
+                    "updated_ms": s.get("updated_ms"),
                 }
             )
+
+    # Trier par récence décroissante : updated desc, puis created desc, None à la fin
+    rows.sort(key=_sort_key_session, reverse=True)
 
     current = _cur(chat_id)
 
@@ -724,7 +988,9 @@ async def handle_sessions_list(chat_id: int, arg: str):
         ):
             marker = " ◀️"
         agent_icon = "📋" if row["agent"] == "plan" else "🔧"
-        lines.append(f"{row['instance']}: {row['title']}{marker}  {agent_icon}`{row['agent']}`")
+        ts = _fmt_ts(row.get("updated_ms") or row.get("created_ms"))
+        ts_part = f" [{ts}]" if ts else ""
+        lines.append(f"{row['instance']}: {row['title']}{ts_part}{marker}  {agent_icon}`{row['agent']}`")
 
     total = len(rows)
     pages = (total + 9) // 10 if total else 1
@@ -773,7 +1039,7 @@ async def handle_select(chat_id: int, arg: str):
         await send_message(chat_id, row["warning"])
         return
 
-    _set_cur(chat_id, row["instance"], row["sid"])
+    await _set_cur(chat_id, row["instance"], row["sid"])
 
     title = row.get("title", row["sid"][:12])
     agent = row.get("agent", "build")
@@ -798,10 +1064,7 @@ async def handle_newsession(chat_id: int, arg: str = ""):
         s = await create_session_on_instance(inst, {})
         sid = s["id"]
         title = s.get("title", sid[:12])
-        if cid not in state:
-            state[cid] = {}
-        state[cid]["current"] = {"instance": inst_name, "sid": sid}
-        _save_state(state)
+        await _set_cur(chat_id, inst_name, sid)
         log.info("Nouvelle session %s pour chat %s sur instance %s", sid, cid, inst_name)
         await send_message(chat_id, f"✅ Nouvelle session créée : `{title}`  (contexte 0 tokens)")
     except Exception as e:
@@ -993,9 +1256,7 @@ async def handle_message(chat_id: int, text: str):
         try:
             s = await create_session()
             sid = s["id"]
-            cur["sid"] = sid
-            state[cid]["current"] = {"instance": inst_name, "sid": sid}
-            _save_state(state)
+            await _set_cur(chat_id, inst_name, sid)
             log.info("Auto-session %s pour chat %s", sid, cid)
         except Exception as e:
             log.error("Erreur création auto-session: %s", e)
@@ -1018,6 +1279,8 @@ async def handle_message(chat_id: int, text: str):
             header = await _status_header(chat_id)
             await tg_edit(chat_id, ack_msg_id, f"{header}\n{response}")
             log.info("Réponse envoyée (%d chars)", len(response))
+            # Marquer le message assistant livré comme vu pour éviter le doublon miroir
+            await _mark_latest_assistant_seen(chat_id, inst, sid)
             break
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -1035,15 +1298,11 @@ async def handle_message(chat_id: int, text: str):
             if status == 404 and not recreated:
                 log.warning("Session %s introuvable (404), création d'une nouvelle (tentative unique)", sid)
                 recreated = True
-                del state[cid]["current"]
-                _save_state(state)
                 # Nouvelle session, on réessaie une seule fois
                 try:
                     s = await create_session()
                     sid = s["id"]
-                    cur["sid"] = sid
-                    state[cid]["current"] = {"instance": inst_name, "sid": sid}
-                    _save_state(state)
+                    await _set_cur(chat_id, inst_name, sid)
                     log.info("Nouvelle session %s pour chat %s après 404", sid, cid)
                     continue  # réessaie la boucle while
                 except Exception as e2:
