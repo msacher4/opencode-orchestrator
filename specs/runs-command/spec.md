@@ -114,8 +114,90 @@ Règles :
    **parents de contexte inclus** ; `running` = nombre de lignes avec `running === true`.
 8. Jamais d'exception sur une entrée malformée : champs manquants → `"?"`, tableaux vides → `[]`.
 
+## Détection multi-instance (correctif du 2026-10-29)
+
+`session.active()` ne renvoie que les sessions **possédées par le process OpenCode courant**
+(comme `interrupt` : *owned by this OpenCode process*). Les sessions qui tournent dans le daemon
+`opencode serve --service` (registre `Opencodev2/state/opencode/service.json`) ou dans un autre
+serveur local sont donc invisibles → la commande affiche « aucune session active » à tort.
+
+Source de vérité des instances locales :
+
+- **instance courante** : `ctx.client` (base = `ctx.client.baseURL ?? ctx.client.options?.baseURL`,
+  auth déjà portée par le client) ;
+- **daemon** : lire `Opencodev2/state/opencode/service.json` → `{ "url": "http://127.0.0.1:PORT", "password": "..." }`,
+  auth = `Basic base64("opencode:" + password)` (schéma confirmé le 2026-10-29 : 200 avec
+  `opencode:<password>`, 401 sinon).
+  **Le mot de passe ne doit jamais être affiché, loggé, ni écrit** — il ne sert qu'à construire l'en-tête.
+  Fichier absent / JSON invalide / pas de `password` → instance ignorée, jamais d'exception.
+
+Agrégation : pour chaque instance, `GET {base}/api/session/active` → `{data:{[sessionID]:{type:"running"}}}`.
+On fusionne en `sessionID → instanceID` (l'instance courante gagne en cas de doublon).
+Un kill cible **l'instance propriétaire** de la session (celle qui l'a déclarée `running`) ;
+si la session n'est déclarée nulle part, on retombe sur l'instance courante.
+
+### `instances.ts` — module pur, ZÉRO import
+
+```ts
+export type Instance = { id: string; base: string; auth: string | null }
+
+export function buildAuth(user: string, password: string): string        // "Basic " + base64(user + ":" + password)
+export function parseService(raw: string | null, fallbackBase?: string): Instance | null
+export function mergeActive(input: {
+  ownID: string
+  own: Record<string, any>
+  others: Array<{ id: string; active: Record<string, any> }>
+}): { owner: Record<string, string>; running: string[] }
+export function instanceFor(sessionID: string, owner: Record<string, string>, ownID: string): string
+```
+
+Règles :
+- base64 maison (aucune dépendance, pas de `Buffer`, pas de `btoa`) : alphabet standard, padding `=`.
+- `parseService` accepte `{url,password}` ; `url` trimé sans `/` final ; `id` = `"service"`.
+  `password` vide → `auth: null` (mais l'instance reste utilisable).
+- `mergeActive` : `ownID` prioritaire, puis les `others` dans l'ordre ; `running` trié par ordre
+  d'apparition, sans doublon.
+- `instanceFor` : `owner[sessionID]` sinon `ownID`.
+- aucune exception sur entrée malformée (`raw` null, JSON invalide, `others` non tableau).
+
+Vérification (déterministe, sans réseau) :
+
+```bash
+NODE=/media/marcs/Linux_Apps/.config/nvm/versions/node/v22.23.1/bin/node
+$NODE --experimental-strip-types -e '
+import("file:///media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plugins/runs-ui/instances.ts").then(m => {
+  if (m.buildAuth("opencode", "abc") !== "Basic b3BlbmNvZGU6YWJj") throw new Error("auth: " + m.buildAuth("opencode", "abc"));
+  const svc = m.parseService(JSON.stringify({ id: "x", url: "http://127.0.0.1:49374/", password: "pw" }));
+  if (!svc || svc.base !== "http://127.0.0.1:49374" || svc.auth !== "Basic b3BlbmNvZGU6cHc=" || svc.id !== "service") throw new Error("service: " + JSON.stringify(svc));
+  if (m.parseService("pas du json") !== null) throw new Error("json invalide accepté");
+  if (m.parseService(null) !== null) throw new Error("null accepté");
+  const merged = m.mergeActive({
+    ownID: "own",
+    own: { ses_a: { type: "running" } },
+    others: [{ id: "service", active: { ses_a: { type: "running" }, ses_b: { type: "running" } } }]
+  });
+  if (merged.owner.ses_a !== "own" || merged.owner.ses_b !== "service") throw new Error("merge: " + JSON.stringify(merged));
+  if (merged.running.length !== 2) throw new Error("running: " + JSON.stringify(merged.running));
+  if (m.instanceFor("ses_b", merged.owner, "own") !== "service") throw new Error("instanceFor");
+  if (m.instanceFor("ses_zzz", merged.owner, "own") !== "own") throw new Error("instanceFor fallback");
+  console.log("OK", JSON.stringify(merged.running));
+});
+'
+```
+
+Attendu : `OK ["ses_a","ses_b"]` (code 0).
+
 ## `tui.ts` — commande `/runs`
 
+- **Détection** : `active` = fusion de `await client.session.active()` (instance courante, forme
+  `{data:{...}}` ou objet direct — accepter les deux) et de `GET {service.base}/api/session/active`
+  (daemon, avec `Authorization: service.auth`). Utiliser `mergeActive` de `./instances.ts`.
+  Une session est `running` si elle figure dans la fusion.
+- **Kill** : router vers l'instance propriétaire (`instanceFor`). Si c'est l'instance courante →
+  `ctx.client.session.interrupt(...)` puis fallback REST local ; sinon → `POST {base}/api/session/{id}/interrupt`
+  avec l'en-tête d'auth de cette instance. En dernier recours seulement, réessayer sur l'instance courante.
+- **Description d'une ligne** : mentionner l'instance propriétaire (`service` ou `local`) quand ce
+  n'est pas l'instance courante, pour qu'on sache d'où vient le run.
 - **Une seule source de vérité** : `tui.ts` importe `buildRuns`, `formatAge`, `summarize` depuis
   `./runs-logic.ts` (`import { buildRuns, formatAge, summarize } from "./runs-logic.ts"`).
   **Aucune duplication** de cette logique dans `tui.ts` (pas de « copié depuis... »).

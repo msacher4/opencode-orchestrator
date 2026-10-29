@@ -3,6 +3,10 @@
 // Suit le modèle orch-ui (ctx.keymap.layer, ctx.ui.dialog, ctx.ui.slot).
 import { Plugin } from "@opencode/plugin/tui"
 import { buildRuns, formatAge, summarize, type RunRow, type RunGroup } from "./runs-logic.ts"
+import { buildAuth, parseService, mergeActive, instanceFor, type Instance } from "./instances.ts"
+import { readFileSync } from "node:fs"
+
+const SERVICE_JSON = "/media/marcs/Linux_Apps/Projets_AI/Opencodev2/state/opencode/service.json"
 
 type Ctx = any
 
@@ -24,12 +28,16 @@ function buildSessionLine(row: RunRow, isChild: boolean, parentTitle?: string): 
   return `${prefix}${dot} ${agent} · ${model} · il y a ${age} · ${title}`
 }
 
-function buildDescription(row: RunRow, parentTitle?: string): string {
+function buildDescription(row: RunRow, parentTitle?: string, instanceLabel?: string): string {
   const idShort = shortID(row.id)
+  let desc = idShort
   if (parentTitle) {
-    return `${idShort} — parent: ${shortID(row.parentID || "?")} "${parentTitle}"`
+    desc += ` — parent: ${shortID(row.parentID || "?")} "${parentTitle}"`
   }
-  return `${idShort}`
+  if (instanceLabel) {
+    desc += ` (via ${instanceLabel})`
+  }
+  return desc
 }
 
 /* ───────── API helpers ───────── */
@@ -44,66 +52,201 @@ function apiBase(ctx: Ctx): string {
   return "http://127.0.0.1:4096"
 }
 
-// Interrupt via SDK d'abord, puis fallback REST POST /api/session/{id}/interrupt
-async function interruptSession(ctx: Ctx, sessionID: string): Promise<{ ok: boolean; via: string; error?: string }> {
+// Découverte de l'instance daemon (service.json)
+async function discoverServiceInstance(): Promise<Instance | null> {
+  let raw: string | null = null
   try {
-    const ses: any = ctx?.client?.session
-    const interruptFn = ses?.interrupt
-    if (typeof interruptFn === "function") {
-      try {
-        const res: any = await interruptFn.call(ses, { sessionID })
-        if (res && typeof res === "object" && res.error) {
-          return { ok: false, via: "sdk", error: String(res.error) }
-        }
-        return { ok: true, via: "sdk" }
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err)
+    raw = readFileSync(SERVICE_JSON, "utf8")
+  } catch {
+    return null
+  }
+  return parseService(raw)
+}
+
+// Récupère /api/session/active depuis une instance distante
+async function fetchActiveFromInstance(inst: Instance): Promise<Record<string, any>> {
+  if (!inst.auth) return {}
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 1500)
+  try {
+    const res = await fetch(`${inst.base}/api/session/active`, {
+      method: "GET",
+      headers: { authorization: inst.auth },
+      signal: controller.signal,
+    })
+    if (!res.ok) return {}
+    const data = await res.json()
+    // La réponse peut être {data:{...}} ou l'objet direct
+    return data && typeof data === "object" && data.data ? data.data : data
+  } catch {
+    return {}
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+// Interrupt routé vers l'instance propriétaire
+async function interruptSession(
+  ctx: Ctx,
+  sessionID: string,
+  targetInstance: Instance,
+  ownInstance: Instance
+): Promise<{ ok: boolean; via: string; error?: string }> {
+  // 1. Instance cible = instance courante → SDK puis fallback REST local
+  if (targetInstance.id === ownInstance.id) {
+    try {
+      const ses: any = ctx?.client?.session
+      const interruptFn = ses?.interrupt
+      if (typeof interruptFn === "function") {
         try {
-          const base = apiBase(ctx)
-          const res = await fetch(`${base}/api/session/${encodeURIComponent(sessionID)}/interrupt`, { method: "POST" })
-          if (!res.ok) return { ok: false, via: "rest", error: `HTTP ${res.status} (après échec SDK : ${reason})` }
-          return { ok: true, via: "rest" }
-        } catch (err2) {
-          const reason2 = err2 instanceof Error ? err2.message : String(err2)
-          return { ok: false, via: "rest", error: `${reason} / ${reason2}` }
+          const res: any = await interruptFn.call(ses, { sessionID })
+          if (res && typeof res === "object" && res.error) {
+            return { ok: false, via: "sdk", error: String(res.error) }
+          }
+          return { ok: true, via: "sdk" }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err)
+          try {
+            const base = apiBase(ctx)
+            const res = await fetch(`${base}/api/session/${encodeURIComponent(sessionID)}/interrupt`, { method: "POST" })
+            if (!res.ok) return { ok: false, via: "rest-local", error: `HTTP ${res.status} (après échec SDK : ${reason})` }
+            return { ok: true, via: "rest-local" }
+          } catch (err2) {
+            const reason2 = err2 instanceof Error ? err2.message : String(err2)
+            return { ok: false, via: "rest-local", error: `${reason} / ${reason2}` }
+          }
         }
       }
+      // Pas de méthode SDK -> fallback REST local
+      const base = apiBase(ctx)
+      const res = await fetch(`${base}/api/session/${encodeURIComponent(sessionID)}/interrupt`, { method: "POST" })
+      if (!res.ok) return { ok: false, via: "rest-local", error: `HTTP ${res.status}` }
+      return { ok: true, via: "rest-local" }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err)
+      return { ok: false, via: "unknown", error: reason }
     }
-    // Pas de méthode SDK -> fallback REST
-    const base = apiBase(ctx)
-    const res = await fetch(`${base}/api/session/${encodeURIComponent(sessionID)}/interrupt`, { method: "POST" })
-    if (!res.ok) return { ok: false, via: "rest", error: `HTTP ${res.status}` }
-    return { ok: true, via: "rest" }
+  }
+
+  // 2. Instance cible = daemon/service → POST vers cette instance
+  try {
+    const res = await fetch(`${targetInstance.base}/api/session/${encodeURIComponent(sessionID)}/interrupt`, {
+      method: "POST",
+      headers: targetInstance.auth ? { authorization: targetInstance.auth } : {},
+    })
+    if (!res.ok) return { ok: false, via: `rest-${targetInstance.id}`, error: `HTTP ${res.status}` }
+    return { ok: true, via: `rest-${targetInstance.id}` }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
-    return { ok: false, via: "unknown", error: reason }
+    // Dernier recours : fallback SDK/REST local
+    try {
+      const ses: any = ctx?.client?.session
+      const interruptFn = ses?.interrupt
+      if (typeof interruptFn === "function") {
+        try {
+          const res: any = await interruptFn.call(ses, { sessionID })
+          if (res && typeof res === "object" && res.error) {
+            return { ok: false, via: "sdk-fallback", error: String(res.error) }
+          }
+          return { ok: true, via: "sdk-fallback" }
+        } catch { /* ignore, essayer REST local */ }
+      }
+      const base = apiBase(ctx)
+      const res2 = await fetch(`${base}/api/session/${encodeURIComponent(sessionID)}/interrupt`, { method: "POST" })
+      if (!res2.ok) return { ok: false, via: "rest-local-fallback", error: `HTTP ${res2.status} (fallback après erreur daemon: ${reason})` }
+      return { ok: true, via: "rest-local-fallback" }
+    } catch (err2) {
+      const reason2 = err2 instanceof Error ? err2.message : String(err2)
+      return { ok: false, via: "fallback-failed", error: `${reason} / ${reason2}` }
+    }
+  }
+}
+
+// Vérifie si une session est encore active sur une instance donnée
+async function checkStillActive(sessionID: string, inst: Instance): Promise<boolean> {
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 1500)
+    const res = await fetch(`${inst.base}/api/session/active`, {
+      method: "GET",
+      headers: inst.auth ? { authorization: inst.auth } : {},
+      signal: controller.signal,
+    })
+    clearTimeout(timeout)
+    if (!res.ok) return false
+    const data = await res.json()
+    const active = data && typeof data === "object" && data.data ? data.data : data
+    return Boolean(active && active[sessionID] && active[sessionID].type === "running")
+  } catch {
+    return false
   }
 }
 
 /* ───────── dialog helpers ───────── */
 
 async function openRunsDialog(ctx: Ctx, all: boolean) {
+  // Instance courante (client)
+  const ownInstance: Instance = {
+    id: "local",
+    base: apiBase(ctx),
+    auth: null, // Le client SDK porte déjà l'auth
+  }
+
   for (;;) {
     ctx.ui.dialog.set({ size: "large" })
 
-    // Charger sessions + active
+    // Charger sessions (global) + active (fusion multi-instance)
     let sessions: any[] = []
-    let active: Record<string, any> = {}
+    let mergedActive: Record<string, any> = {}
+    let owner: Record<string, string> = {}
+    let serviceInstance: Instance | null = null
+
     try {
+      // 1. Sessions globales (toujours depuis le client)
       const client: any = ctx?.client
       if (client?.session?.list) {
         const listRes = await client.session.list({ limit: 500 })
         sessions = Array.isArray(listRes?.data) ? listRes.data : (Array.isArray(listRes) ? listRes : [])
       }
+
+      // 2. Active local (instance courante)
+      let ownActive: Record<string, any> = {}
       if (client?.session?.active) {
         const activeRes = await client.session.active()
-        active = activeRes && typeof activeRes === "object" ? activeRes : {}
+        ownActive = activeRes && typeof activeRes === "object" ? activeRes : {}
+        // Accepter {data:{...}} ou objet direct
+        if (ownActive.data && typeof ownActive.data === "object") {
+          ownActive = ownActive.data
+        }
+      }
+
+      // 3. Découvrir et interroger le daemon
+      serviceInstance = await discoverServiceInstance()
+      let others: Array<{ id: string; active: Record<string, any> }> = []
+      if (serviceInstance) {
+        const svcActive = await fetchActiveFromInstance(serviceInstance)
+        if (Object.keys(svcActive).length > 0) {
+          others.push({ id: serviceInstance.id, active: svcActive })
+        }
+      }
+
+      // 4. Fusionner avec mergeActive
+      const merged = mergeActive({
+        ownID: ownInstance.id,
+        own: ownActive,
+        others,
+      })
+      owner = merged.owner
+      // Convertir owner → active pour buildRuns
+      mergedActive = {}
+      for (const sid of merged.running) {
+        mergedActive[sid] = { type: "running" }
       }
     } catch {
       // Ignorer erreurs de chargement, on affiche ce qu'on a
     }
 
-    const groups = buildRuns({ sessions, active, now: Date.now(), all })
+    const groups = buildRuns({ sessions, active: mergedActive, now: Date.now(), all })
     const summary = summarize(groups)
 
     // Construire options pour dialog.select
@@ -126,10 +269,11 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
 
       if (g.root) {
         // Racine
+        const rootInstanceLabel = owner[g.root.id] && owner[g.root.id] !== ownInstance.id ? owner[g.root.id] : undefined
         const opt: any = {
           title: buildSessionLine(g.root, false),
           value: { kind: "session", sessionID: g.root.id, groupParentID: g.parentID },
-          description: buildDescription(g.root),
+          description: buildDescription(g.root, undefined, rootInstanceLabel),
           category: shortKey(g.parentID),
         }
         options.push(opt)
@@ -138,10 +282,11 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
         // Enfants
         for (const child of g.children) {
           if (lineCount >= MAX_LINES) break
+          const childInstanceLabel = owner[child.id] && owner[child.id] !== ownInstance.id ? owner[child.id] : undefined
           const childOpt: any = {
             title: buildSessionLine(child, true, g.root.title),
             value: { kind: "session", sessionID: child.id, groupParentID: g.parentID },
-            description: buildDescription(child, g.root.title),
+            description: buildDescription(child, g.root.title, childInstanceLabel),
             category: shortKey(g.parentID),
           }
           options.push(childOpt)
@@ -150,11 +295,13 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
       } else {
         // Groupe orphelin : ligne "(orphelin) parent — titre"
         if (lineCount >= MAX_LINES) break
-        const orphanTitle = `(orphelin) ${g.parentTitle} — ${g.children[0]?.title || "?"}`
+        const firstChild = g.children[0]
+        const orphanInstanceLabel = owner[firstChild?.id] && owner[firstChild?.id] !== ownInstance.id ? owner[firstChild?.id] : undefined
+        const orphanTitle = `(orphelin) ${g.parentTitle} — ${firstChild?.title || "?"}`
         const opt: any = {
-          title: `${g.children[0]?.running ? "●" : "·"} ${orphanTitle.slice(0, 60)}`,
-          value: { kind: "session", sessionID: g.children[0]?.id, groupParentID: g.parentID },
-          description: buildDescription(g.children[0], g.parentTitle),
+          title: `${firstChild?.running ? "●" : "·"} ${orphanTitle.slice(0, 60)}`,
+          value: { kind: "session", sessionID: firstChild?.id, groupParentID: g.parentID },
+          description: buildDescription(firstChild, g.parentTitle, orphanInstanceLabel),
           category: shortKey(g.parentID),
         }
         options.push(opt)
@@ -164,10 +311,11 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
         for (let i = 1; i < g.children.length; i++) {
           if (lineCount >= MAX_LINES) break
           const child = g.children[i]
+          const childInstanceLabel = owner[child.id] && owner[child.id] !== ownInstance.id ? owner[child.id] : undefined
           const childOpt: any = {
             title: buildSessionLine(child, true, g.parentTitle),
             value: { kind: "session", sessionID: child.id, groupParentID: g.parentID },
-            description: buildDescription(child, g.parentTitle),
+            description: buildDescription(child, g.parentTitle, childInstanceLabel),
             category: shortKey(g.parentID),
           }
           options.push(childOpt)
@@ -215,18 +363,24 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
     }
 
     if (choice.kind === "kill-all") {
-      await handleKillAll(ctx, choice.sessionIDs)
+      await handleKillAll(ctx, choice.sessionIDs, owner, ownInstance, serviceInstance)
       continue
     }
 
     if (choice.kind === "session") {
-      await handleKillOne(ctx, choice.sessionID)
+      await handleKillOne(ctx, choice.sessionID, owner, ownInstance, serviceInstance)
       continue
     }
   }
 }
 
-async function handleKillOne(ctx: Ctx, sessionID: string) {
+async function handleKillOne(
+  ctx: Ctx,
+  sessionID: string,
+  owner: Record<string, string>,
+  ownInstance: Instance,
+  serviceInstance: Instance | null
+) {
   // Confirmation obligatoire
   const confirm = await ctx.ui.dialog.select<string>({
     title: `Confirmer l'arrêt de ${shortID(sessionID)} ?`,
@@ -237,17 +391,29 @@ async function handleKillOne(ctx: Ctx, sessionID: string) {
   })
   if (confirm !== "confirm") return
 
-  // Interrupt
-  const result = await interruptSession(ctx, sessionID)
+  // Déterminer l'instance cible
+  const targetInstanceID = instanceFor(sessionID, owner, ownInstance.id)
+  const targetInstance = targetInstanceID === ownInstance.id ? ownInstance : (serviceInstance?.id === targetInstanceID ? serviceInstance : ownInstance)
 
-  // Re-lire active() pour vérifier
+  // Interrupt
+  const result = await interruptSession(ctx, sessionID, targetInstance, ownInstance)
+
+  // Re-lire active() pour vérifier (sur l'instance cible + locale)
   let stillActive = false
   try {
-    const client: any = ctx?.client
-    if (client?.session?.active) {
-      const activeRes = await client.session.active()
-      const active = activeRes && typeof activeRes === "object" ? activeRes : {}
-      stillActive = Boolean(active[sessionID] && active[sessionID].type === "running")
+    // Vérifier sur l'instance cible
+    if (targetInstance.id !== ownInstance.id && targetInstance.auth) {
+      stillActive = await checkStillActive(sessionID, targetInstance)
+    }
+    // Vérifier aussi en local (double vérification)
+    if (!stillActive) {
+      const client: any = ctx?.client
+      if (client?.session?.active) {
+        const activeRes = await client.session.active()
+        const active = activeRes && typeof activeRes === "object" ? activeRes : {}
+        const localActive = active.data && typeof active.data === "object" ? active.data : active
+        stillActive = Boolean(localActive[sessionID] && localActive[sessionID].type === "running")
+      }
     }
   } catch { /* ignore */ }
 
@@ -269,7 +435,13 @@ async function handleKillOne(ctx: Ctx, sessionID: string) {
   }
 }
 
-async function handleKillAll(ctx: Ctx, sessionIDs: string[]) {
+async function handleKillAll(
+  ctx: Ctx,
+  sessionIDs: string[],
+  owner: Record<string, string>,
+  ownInstance: Instance,
+  serviceInstance: Instance | null
+) {
   // Confirmation obligatoire
   const confirm = await ctx.ui.dialog.select<string>({
     title: `Confirmer l'arrêt de ${sessionIDs.length} sessions ?`,
@@ -285,16 +457,25 @@ async function handleKillAll(ctx: Ctx, sessionIDs: string[]) {
   const failures: string[] = []
 
   for (const sessionID of sessionIDs) {
-    const result = await interruptSession(ctx, sessionID)
+    const targetInstanceID = instanceFor(sessionID, owner, ownInstance.id)
+    const targetInstance = targetInstanceID === ownInstance.id ? ownInstance : (serviceInstance?.id === targetInstanceID ? serviceInstance : ownInstance)
 
-    // Re-lire active() pour vérifier
+    const result = await interruptSession(ctx, sessionID, targetInstance, ownInstance)
+
+    // Re-lire active() pour vérifier (sur l'instance cible + locale)
     let stillActive = false
     try {
-      const client: any = ctx?.client
-      if (client?.session?.active) {
-        const activeRes = await client.session.active()
-        const active = activeRes && typeof activeRes === "object" ? activeRes : {}
-        stillActive = Boolean(active[sessionID] && active[sessionID].type === "running")
+      if (targetInstance.id !== ownInstance.id && targetInstance.auth) {
+        stillActive = await checkStillActive(sessionID, targetInstance)
+      }
+      if (!stillActive) {
+        const client: any = ctx?.client
+        if (client?.session?.active) {
+          const activeRes = await client.session.active()
+          const active = activeRes && typeof activeRes === "object" ? activeRes : {}
+          const localActive = active.data && typeof active.data === "object" ? active.data : active
+          stillActive = Boolean(localActive[sessionID] && localActive[sessionID].type === "running")
+        }
       }
     } catch { /* ignore */ }
 
