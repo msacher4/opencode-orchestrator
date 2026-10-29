@@ -739,7 +739,9 @@ def _extract_time_fields(raw):
 
 def cli_normalize_session(raw, instance, kind):
     """normalize_session(raw, instance, kind) -> {instance, sid, title, agent,
-    model, tokens, created_ms, updated_ms} quel que soit le serveur."""
+    model, tokens, created_ms, updated_ms, parent_id} quel que soit le serveur.
+    parent_id est présent (str) pour les sessions filles v2, absent/None pour les racines.
+    v1 n'a pas ce champ -> None."""
     t = raw.get("tokens") or {}
     cache = t.get("cache") if isinstance(t, dict) else {}
     tokens = t.get("input", 0) + t.get("output", 0)
@@ -748,6 +750,9 @@ def cli_normalize_session(raw, instance, kind):
         model = model.get("id")
     title = raw.get("title") or (raw.get("id") or "")[:12]
     created_ms, updated_ms = _extract_time_fields(raw)
+    # v2: parentID (camelCase) pour sessions filles ; racines n'ont pas le champ
+    # v1: pas de champ parent
+    parent_id = raw.get("parentID")
     return {
         "instance": instance,
         "sid": raw.get("id"),
@@ -757,6 +762,7 @@ def cli_normalize_session(raw, instance, kind):
         "tokens": tokens,
         "created_ms": created_ms,
         "updated_ms": updated_ms,
+        "parent_id": parent_id,
     }
 
 
@@ -922,9 +928,14 @@ def _sort_key_session(s):
 
 
 async def handle_sessions_list(chat_id: int, arg: str):
-    """/sessions [v1|v2|suite] : liste multi-instances paginée (10 par page).
+    """/sessions [v1|v2|all|suite] : liste multi-instances paginée (10 par page).
 
     - arg = nom d'une instance connue -> liste seulement celle-ci ; sinon toutes.
+    - arg = "all" -> affiche TOUTES les sessions (racines + filles).
+    - arg = "suite" -> page suivante de la liste filtrée en cours.
+    - Par défaut (sans arg ou instance) : n'affiche que les sessions RACINES
+      (celles sans parent_id). Les sessions filles (worker/reviewer/merger)
+      sont masquées.
     - instance injoignable -> ligne « ⚠️ <nom> injoignable » affichée en-tête,
       jamais dans page_rows (évite sélection par /select).
     - la page affichée est mémorisée dans state[cid]["page_rows"] : /select
@@ -932,14 +943,18 @@ async def handle_sessions_list(chat_id: int, arg: str):
     - ◀️ marque la session courante.
     - Sessions triées par récence décroissante (updated, sinon created).
     - Horodatage court affiché (ex: 28/10 23:58).
+    - Pied de page : nb sessions filles masquées si filtrage actif.
     """
     cid = str(chat_id)
     results = await cli_list_sessions(instances())
 
-    wanted = _resolve_instances(arg)
+    # Déterminer le mode d'affichage
+    show_all = arg == "all"
+    is_suite = arg == "suite"
+    wanted = _resolve_instances(arg) if not show_all and not is_suite else None
 
     warning_lines = []
-    rows = []
+    all_rows = []
     for name, res in results.items():
         if wanted is not None and name != wanted:
             continue
@@ -947,7 +962,7 @@ async def handle_sessions_list(chat_id: int, arg: str):
             warning_lines.append(f"⚠️ {name} injoignable")
             continue
         for s in res.get("sessions", []):
-            rows.append(
+            all_rows.append(
                 {
                     "instance": name,
                     "sid": s["sid"],
@@ -955,20 +970,29 @@ async def handle_sessions_list(chat_id: int, arg: str):
                     "agent": s["agent"],
                     "created_ms": s.get("created_ms"),
                     "updated_ms": s.get("updated_ms"),
+                    "parent_id": s.get("parent_id"),
                 }
             )
 
     # Trier par récence décroissante : updated desc, puis created desc, None à la fin
-    rows.sort(key=_sort_key_session, reverse=True)
+    all_rows.sort(key=_sort_key_session, reverse=True)
+
+    # Filtrer par défaut : seulement les racines (pas de parent_id)
+    if not show_all:
+        filtered_rows = [r for r in all_rows if not r.get("parent_id")]
+        hidden_count = len(all_rows) - len(filtered_rows)
+    else:
+        filtered_rows = all_rows
+        hidden_count = 0
 
     current = _cur(chat_id)
 
-    if arg == "suite":
+    if is_suite:
         page = state.get(cid, {}).get("page", 0) + 1
     else:
         page = 0
 
-    page_rows = rows[page * 10 : (page + 1) * 10]
+    page_rows = filtered_rows[page * 10 : (page + 1) * 10]
     state.setdefault(cid, {})
     state[cid]["page"] = page
     state[cid]["page_rows"] = page_rows
@@ -992,14 +1016,17 @@ async def handle_sessions_list(chat_id: int, arg: str):
         ts_part = f" [{ts}]" if ts else ""
         lines.append(f"{row['instance']}: {row['title']}{ts_part}{marker}  {agent_icon}`{row['agent']}`")
 
-    total = len(rows)
+    total = len(filtered_rows)
     pages = (total + 9) // 10 if total else 1
-    if arg == "suite":
+    if is_suite:
         lines.append("")
         lines.append("Utilise `/sessions` pour revenir à la première page.")
     else:
         lines.append(f"\nPage {page + 1} sur {pages}")
         lines.append("Utilise `/sessions suite` pour la page suivante.")
+    # Pied de page : sessions filles masquées
+    if hidden_count > 0 and not show_all:
+        lines.append(f"\n{hidden_count} sous-agent{'s' if hidden_count > 1 else ''} masqué{'s' if hidden_count > 1 else ''} — `/sessions all` pour tout voir")
     lines.append("")
     lines.append("Utilise `/select <n>` pour choisir une session active.")
 
@@ -1392,7 +1419,9 @@ async def main():
                                 "🤖 *Pont Telegram → OpenCode*\n\n"
                                 "Envoie un message → OpenCode répond.\n\n"
                                 "*/newsession* — nouvelle session\n"
-                                "*/sessions* — liste TOUTES les sessions\n"
+                                "*/sessions* — liste sessions racines (sans sous-agents)\n"
+                                "*/sessions all* — liste TOUTES les sessions\n"
+                                "*/sessions suite* — page suivante\n"
                                 "*/select <n>* — choisir une session active\n"
                                 "*/plan* — mode planification (lecture seule)\n"
                                 "*/build* — mode construction (actions)\n"

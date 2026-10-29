@@ -663,5 +663,110 @@ class MirrorTests(unittest.TestCase):
         self.assertNotIn("Réponse livrée en direct", sent_texts, "msg_42 (live) ne doit pas être renvoyé")
 
 
+class SessionFilterTests(unittest.TestCase):
+    """Tests pour le filtrage des sessions (racines vs filles)."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg_transport = _bridge.TELEGRAM_TRANSPORT
+        self._saved_state = _bridge.state
+        self._saved_kind_cache = dict(_bridge._KIND_CACHE)
+        self._cid = "555"
+        # Mock Telegram
+        def tg_handler(request):
+            if "sendMessage" in str(request.url):
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+            if "editMessageText" in str(request.url):
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True})
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg_transport
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind_cache)
+
+    def _fake_results_with_children(self):
+        """2 racines + 2 filles (avec parent_id)."""
+        sessions = [
+            {"instance": "v2", "sid": "ses_root1", "title": "Orchestrator principal", "agent": "orchestrator", "created_ms": 1000, "updated_ms": 5000, "parent_id": None},
+            {"instance": "v2", "sid": "ses_root2", "title": "Session utilisateur", "agent": "build", "created_ms": 2000, "updated_ms": 4000, "parent_id": None},
+            {"instance": "v2", "sid": "ses_child1", "title": "t1 — worker", "agent": "worker", "created_ms": 3000, "updated_ms": 3500, "parent_id": "ses_root1"},
+            {"instance": "v2", "sid": "ses_child2", "title": "m1 — merger", "agent": "merger", "created_ms": 4000, "updated_ms": 3000, "parent_id": "ses_root1"},
+        ]
+        return {
+            "v2": {"kind": "api", "unreachable": False, "sessions": sessions, "code": 200},
+        }
+
+    def _patch_list(self, results):
+        async def _fake(_insts):
+            return results
+        _bridge.cli_list_sessions = _fake
+
+    def _mock_transport_for_select(self):
+        """Mock transport pour /select : kind detection + session/message (pour miroir)."""
+        def handler(request):
+            path = request.url.path
+            # Kind detection : GET /api/session -> 200 avec data
+            if path == "/api/session" and request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "ses_root1", "title": "test", "agent": "build"}]})
+            # GET /api/session/{sid}/message pour _fetch_last_message_id
+            if "/api/session/" in path and "/message" in path and request.method == "GET":
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(404)
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    async def _run(self, text: str):
+        await _bridge.handle_sessions_list(self._cid, text)
+
+    def test_default_filters_children_only_roots(self):
+        """Par défaut /sessions n'affiche que les racines (pas de parent_id)."""
+        self._patch_list(self._fake_results_with_children())
+        _bridge.state = {}
+        asyncio.run(self._run(""))
+        page_rows = _bridge.state[self._cid]["page_rows"]
+        # Seules les 2 racines doivent être affichées
+        self.assertEqual(len(page_rows), 2)
+        sids = {r["sid"] for r in page_rows}
+        self.assertEqual(sids, {"ses_root1", "ses_root2"})
+
+    def test_sessions_all_shows_all_four(self):
+        """/sessions all affiche les 4 sessions (2 racines + 2 filles)."""
+        self._patch_list(self._fake_results_with_children())
+        _bridge.state = {}
+        asyncio.run(self._run("all"))
+        page_rows = _bridge.state[self._cid]["page_rows"]
+        self.assertEqual(len(page_rows), 4)
+        sids = {r["sid"] for r in page_rows}
+        self.assertEqual(sids, {"ses_root1", "ses_root2", "ses_child1", "ses_child2"})
+
+    def test_select_aligned_with_filtered_list(self):
+        """/select n pioche dans la liste filtrée (page_rows), pas dans la liste complète."""
+        self._patch_list(self._fake_results_with_children())
+        self._mock_transport_for_select()
+        _bridge.state = {}
+        asyncio.run(self._run(""))  # Liste filtrée : 2 racines
+        # La page_rows contient ses_root1 (plus récent updated=5000) puis ses_root2 (updated=4000)
+        page_rows = _bridge.state[self._cid]["page_rows"]
+        self.assertEqual(page_rows[0]["sid"], "ses_root1")
+        self.assertEqual(page_rows[1]["sid"], "ses_root2")
+
+        # /select 1 doit choisir ses_root1 (premier de la liste filtrée)
+        asyncio.run(_bridge.handle_select(int(self._cid), "1"))
+        self.assertEqual(_bridge.state[self._cid]["current"]["sid"], "ses_root1")
+
+        # /select 2 doit choisir ses_root2
+        asyncio.run(_bridge.handle_select(int(self._cid), "2"))
+        self.assertEqual(_bridge.state[self._cid]["current"]["sid"], "ses_root2")
+
+        # Vérifier que les sessions filles ne sont PAS sélectionnables via /select 3/4
+        # (elles ne sont pas dans page_rows)
+        asyncio.run(_bridge.handle_select(int(self._cid), "3"))
+        # Doit rester sur ses_root2 (sélection invalide -> message d'erreur, pas de changement)
+        self.assertEqual(_bridge.state[self._cid]["current"]["sid"], "ses_root2")
+
+
 if __name__ == "__main__":
     unittest.main()

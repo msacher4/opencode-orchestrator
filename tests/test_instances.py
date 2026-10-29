@@ -46,7 +46,7 @@ def _v2_session(sid="ses_v2"):
 
 def _assert_normalized(obj):
     """Mêmes champs normalisés quel que soit le serveur."""
-    expected_keys = {"instance", "sid", "title", "agent", "model", "tokens", "created_ms", "updated_ms"}
+    expected_keys = {"instance", "sid", "title", "agent", "model", "tokens", "created_ms", "updated_ms", "parent_id"}
     assert set(obj.keys()) == expected_keys
     assert isinstance(obj["instance"], str)
     assert isinstance(obj["sid"], str)
@@ -56,6 +56,7 @@ def _assert_normalized(obj):
     assert isinstance(obj["tokens"], int)
     assert obj["created_ms"] is None or isinstance(obj["created_ms"], (int, float))
     assert obj["updated_ms"] is None or isinstance(obj["updated_ms"], (int, float))
+    assert obj["parent_id"] is None or isinstance(obj["parent_id"], str)
 
 
 class ParseInstancesTests(unittest.TestCase):
