@@ -856,6 +856,17 @@ function manifestFor(sid) {
   return LEGACY_MANIFEST
 }
 
+// Session issue d'une règle récurrente ? Le moteur écrit .opencode/orch/<sid>/recurring.json
+// au lancement. Absent => session ordinaire, aucun verrou supplémentaire.
+function recurringFor(sid) {
+  if (!sid) return null
+  const p = ORCH_DIR + "/" + sid + "/recurring.json"
+  if (!fileExists(p)) return null
+  const rec = readJson(p, null)
+  if (!rec || typeof rec !== "object" || !rec.manifest) return null
+  return rec
+}
+
 // Le premier qui écrit le global en devient propriétaire : les autres sessions sont
 // redirigées vers leur propre dossier, mais une session déjà propriétaire garde l'accès
 // (aucun chantier en cours ne peut être verrouillé par un second cycle).
@@ -999,6 +1010,10 @@ function scopeList(step) {
     .split(/,|·|\n/)
     .map((s) => s.trim().replace(/^`|`$/g, "").replace(/^\.\./, "").replace(/^\.\//, ""))
     .filter(Boolean)
+}
+
+function normScope(s) {
+  return String(s || "").replace(/[`*]/g, "").replace(/\s+/g, " ").trim()
 }
 
 function inScope(path, scopes) {
@@ -1603,6 +1618,48 @@ export function check(input) {
         }
 
         const model = cleanModelId(String(args.model || ""))
+
+        // ---- VERROU MANIFEST RÉCURRENT GRAVÉ ----
+        // Si la session a un marqueur recurring.json, on verrouille : Qui, Modèle, Périmètre
+        // ne peuvent pas dériver du manifest source déclaré dans le marqueur.
+        const blockedBefore = blocked.length
+        const rec = recurringFor(sid)
+        if (rec) {
+          const srcTxt = readText(absPath(rec.manifest))
+          if (!srcTxt) {
+            blocked.push("manifest récurrent introuvable : " + rec.manifest)
+          } else {
+            const srcSteps = parseSteps(srcTxt).filter((s) => !s.superseded)
+            if (!step) {
+              blocked.push("aucune étape ouverte pour " + sub + " dans " + rec.manifest)
+            } else {
+              const src = srcSteps.find((s) => s.id === step.id)
+              if (!src) {
+                blocked.push(
+                  "l'étape " + step.id + " n'existe pas dans le manifest récurrent gravé (" + rec.manifest + ") — un run récurrent ne peut pas ajouter d'étape. Édite le fichier Recurring."
+                )
+              } else {
+                if (src.qui !== sub) {
+                  blocked.push("Qui gravé pour l'étape " + step.id + " : « " + src.qui + " » — reçu « " + sub + " »")
+                }
+                if (cleanModelId(src.model) !== model) {
+                  blocked.push(
+                    "Modèle gravé pour l'étape " + step.id + " : " + src.model + " — reçu : " + (model || "(aucun)") + ". Pour changer de modèle, édite le fichier Recurring."
+                  )
+                }
+                if (normScope(src.scope) !== normScope(step.scope)) {
+                  blocked.push(
+                    "Périmètre gravé pour l'étape " + step.id + " : " + src.scope + " — reçu : " + step.scope + ". Pour changer le périmètre, édite le fichier Recurring."
+                  )
+                }
+              }
+            }
+            // Note d'audit pour chaque refus recurring-drift
+            if (blocked.length > blockedBefore) {
+              notes.push("recurring-drift " + (step ? step.id : "unknown"))
+            }
+          }
+        }
 
         // SOUS VERROU ACTIF : modèle explicite OBLIGATOIRE
         if (nightActive && !model) {
