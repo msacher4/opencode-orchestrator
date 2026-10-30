@@ -867,6 +867,26 @@ function recurringFor(sid) {
   return rec
 }
 
+// Le manifest de session peut déclarer sa source : "- Source: .opencode/Recurring/<f>.md".
+// Couvre les runs lancés à la main, sans marqueur écrit par le moteur.
+function sourceFromManifest(sid) {
+  if (!sid) return null
+  const p = sessionManifest(sid)
+  if (!fileExists(p)) return null
+  const m = readText(p).match(/^\s*-\s*Source\s*:\s*(\S+)\s*$/im)
+  if (!m) return null
+  const norm = normalizeUnderProject(absPath(m[1]))
+  if (!norm || !isUnder(norm, PROJECT + "/.opencode/Recurring")) return null
+  return { manifest: m[1], source: "manifest" }
+}
+
+// Référence figée : la copie prise au lancement par le moteur, sinon le fichier vivant.
+function recurringRef(sid, rec) {
+  const snap = ORCH_DIR + "/" + sid + "/recurring-source.md"
+  if (fileExists(snap) && readText(snap).trim()) return snap
+  return absPath(rec.manifest)
+}
+
 // Le premier qui écrit le global en devient propriétaire : les autres sessions sont
 // redirigées vers leur propre dossier, mais une session déjà propriétaire garde l'accès
 // (aucun chantier en cours ne peut être verrouillé par un second cycle).
@@ -1505,7 +1525,11 @@ function audit(entry) {
 }
 
 export function check(input) {
-  const agent = input && input.agent ? String(input.agent) : ""
+  const rawAgent = input && input.agent ? String(input.agent) : ""
+  // orchestrator-auto est l'orchestrateur généré par le plugin goal : même frontière,
+  // mêmes murs. Sans cette normalisation, le guard l'ignore complètement (constaté le
+  // 2026-10-30 : il a écrit dans .opencode/Recurring/ sans être contrôlé).
+  const agent = rawAgent === "orchestrator-auto" ? "orchestrator" : rawAgent
   const sid = sessionId(input)
   const tool = String((input && input.tool) || "")
   const args = (input && input.input) || {}
@@ -1524,6 +1548,19 @@ export function check(input) {
   const isShell = SHELL_TOOL.test(tool)
   const isWrite = WRITE_TOOL.test(tool)
   const cmd = isShell ? cmdOf(args) : ""
+
+  // Manifest récurrent : lecture seule pendant le run, pour TOUS les agents.
+  const recCtx = recurringFor(sid) || sourceFromManifest(sid)
+  if (recCtx) {
+    const recDir = PROJECT + "/.opencode/Recurring"
+    const writeTarget = isWrite ? normalizeUnderProject(absPath(firstPath(args))) : null
+    const shellHit = isShell && segments(cmd).some((seg) => mutating(seg) && /\.opencode\/Recurring\//.test(seg))
+    if ((writeTarget && isUnder(writeTarget, recDir)) || shellHit) {
+      blocked.push(
+        "manifest récurrent gravé : lecture seule pendant le run (écriture sous .opencode/Recurring/ refusée). Copie les étapes dans ton manifest de session.",
+      )
+    }
+  }
 
   if (agent === "orchestrator") {
     if (isWrite) {
@@ -1625,7 +1662,7 @@ export function check(input) {
         const blockedBefore = blocked.length
         const rec = recurringFor(sid)
         if (rec) {
-          const srcTxt = readText(absPath(rec.manifest))
+          const srcTxt = readText(recurringRef(sid, rec))
           if (!srcTxt) {
             blocked.push("manifest récurrent introuvable : " + rec.manifest)
           } else {
