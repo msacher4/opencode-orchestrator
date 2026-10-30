@@ -1169,6 +1169,7 @@ const POOL = {
         manifest: String(s.manifest || ""),
         since,
         bg: Boolean(s.bg),
+        child: String(s.child || ""),
       })
     }
     if (live.length !== slots.length || ttlPurged) POOL.save(live)
@@ -1185,9 +1186,10 @@ const POOL = {
     }
   },
   // Refus explicite, nommant la ressource saturée, le cap et le nombre courant.
-  check(model) {
+  check(model, ctx) {
     const m = String(model || "")
     if (!m) return { ok: true, why: "" }
+    if (ctx && ctx.continuation === true) return { ok: true, why: "" }
     const live = POOL.load()
     const provider = POOL.providerOf(m)
     const mcap = POOL.modelCap(m)
@@ -1216,6 +1218,7 @@ const POOL = {
   add(model, ctx) {
     const m = String(model || "")
     if (!m) return
+    if (ctx && ctx.continuation === true) return null
     const live = POOL.load()
     const step = String((ctx && ctx.step) || "")
     const manifest = String((ctx && ctx.manifest) || "")
@@ -1241,6 +1244,7 @@ const POOL = {
       manifest: manifest,
       since: Date.now(),
       bg,
+      child: "",
     })
     POOL.save(live)
   },
@@ -1339,6 +1343,54 @@ const POOL = {
         parent: p,
       })
       return true
+    }
+    return false
+  },
+  // Nouveau : libère un slot par son child sessionID (fin/annulation subagent background).
+  // Parcourt live, retire le slot dont String(s.child||"") === String(child||"").
+  // POOL.save, audit slot-release, retourne true/false. Aucun throw.
+  releaseByChild(child, reason = "fin subagent") {
+    const live = POOL.load()
+    const c = String(child || "")
+    if (!c) return false
+    let idx = -1
+    for (let i = 0; i < live.length; i++) {
+      const s = live[i]
+      if (String(s.child || "") === c) {
+        idx = i
+        break
+      }
+    }
+    if (idx >= 0) {
+      const removed = live.splice(idx, 1)[0]
+      POOL.save(live)
+      audit({
+        kind: "slot-release",
+        reason,
+        step: String(removed.step || ""),
+        agent: String(removed.agent || ""),
+        model: String(removed.model || ""),
+        parent: String(removed.parent || ""),
+      })
+      return true
+    }
+    return false
+  },
+  // Rattache le child sessionID au slot du parent dès `session.created`
+  // (data.parentID). Parcourt live de la fin vers le début, remplit le premier
+  // slot du parent encore sans child. POOL.save, true/false. Aucun throw.
+  setChildByParent(parent, child) {
+    const live = POOL.load()
+    const p = String(parent || "")
+    const c = String(child || "")
+    if (!p || !c) return false
+    for (let i = live.length - 1; i >= 0; i--) {
+      const s = live[i]
+      if (String(s.parent || "") === p && !String(s.child || "")) {
+        live[i].child = c
+        POOL.save(live)
+        return true
+      }
     }
     return false
   },
@@ -1607,7 +1659,7 @@ export function check(input) {
             }
           }
         }
-        const pool = model ? POOL.check(model) : { ok: true, why: "" }
+        const pool = model ? POOL.check(model, { continuation: Boolean(args.sessionID || args.session_id) && String(args.sessionID || args.session_id) !== String(sid) }) : { ok: true, why: "" }
         if (!pool.ok) blocked.push(pool.why)
         if (!manifestPath) {
           // déjà bloqué plus haut (pas de manifest à cette session) : on n'ajoute pas de bruit
@@ -1633,7 +1685,9 @@ export function check(input) {
           // existante refuse ce modèle, on refuse en l'expliquant — on ne choisit jamais
           // un autre modèle à sa place.
           if (step.model) {
-            if (model !== step.model) {
+            if (Boolean(args.sessionID || args.session_id) && String(args.sessionID || args.session_id) !== String(sid)) {
+              notes.push("continuation : épinglage ignoré")
+            } else if (model !== step.model) {
               blocked.push(
                 "ordre prioritaire de Marc : l'étape " + step.id + " est épinglée sur le modèle " + step.model +
                   " (sélection manuelle via /orchestrator)" +
@@ -1657,6 +1711,7 @@ export function check(input) {
             step: st ? st.id : "",
             manifest: manifestPath,
             background: Boolean(args.background === true),
+            continuation: Boolean(args.sessionID || args.session_id) && String(args.sessionID || args.session_id) !== String(sid),
           })
           if (refused) blocked.push(refused)
         }
@@ -1891,6 +1946,16 @@ export default {
             "Rappel : le frontière planifie et juge, le flash exécute. Annonce l'étape dans ton manifest (.opencode/orch/<session>/orchestration.md).",
         )
       }
+      // Relance : interrompt le tour en cours du subagent avant de lui livrer le message.
+      // Best-effort : une session déjà idle renvoie une erreur, on l'ignore.
+      try {
+        const relArgs = (input && input.args) || {}
+        const contSession = String(relArgs.sessionID || relArgs.session_id || "")
+        const selfSid = sessionId(input)
+        if (contSession && contSession !== String(selfSid)) {
+          await ctx.client.session.abort({ path: { id: contSession } })
+        }
+      } catch {}
     })
     // tool.execute.after sur subagent : si le runtime refuse/interrompt le spawn,
     // on libère le slot qu'il occupait (sinon bloqué 45 min par le TTL).
@@ -1898,13 +1963,42 @@ export default {
     // récent pour ce parent. Que le spawn ait réussi ou échoué, le tool est rendu ⇒
     // le foreground est fini. input.error / output.status === "error" servent
     // UNIQUEMENT à choisir la raison ("échec spawn" sinon "fin spawn").
+    // NOUVEAU 2 : extrait l'id de session enfant (ses_...) depuis l'output et l'écrit
+    // dans le slot le plus récent du parent (champ `child`) pour permettre la libération
+    // par événement (session.idle/succeeded/failed/deleted).
     await ctx.tool.hook("execute.after", async (input) => {
       // Ce hook ne doit JAMAIS lever : une exception ici casserait l'agent.
       try {
         const tool = String((input && input.tool) || "")
         if (!SPAWN_TOOL.test(tool)) return
         const output = (input && input.output) || {}
-        const outText = String(output.title || output.output || output.metadata || "")
+        const outText = [output.title, output.output, output.metadata].map((v) => (v == null ? "" : String(v))).join(" ")
+        // NOUVEAU : capture l'id de session enfant (ses_...) pour le slot parent
+        const sid = sessionId(input)
+        if (sid) {
+          const m = /(ses_[A-Za-z0-9]{10,})/.exec(outText)
+          if (m) {
+            const childSid = m[1]
+            // Écrit child dans le slot le plus récent de ce parent
+            const live = POOL.load()
+            let idx = -1
+            let latestSince = -1
+            for (let i = 0; i < live.length; i++) {
+              const s = live[i]
+              if (String(s.parent || "") === sid) {
+                const since = Number(s.since || 0)
+                if (since > latestSince) {
+                  latestSince = since
+                  idx = i
+                }
+              }
+            }
+            if (idx >= 0) {
+              live[idx].child = childSid
+              POOL.save(live)
+            }
+          }
+        }
         // Détection d'échec STRICTE :
         // - input.error truthy (runtime throw)
         // - output.error
@@ -1914,7 +2008,6 @@ export default {
           Boolean((input && input.error) || output.error) ||
           (output && output.status === "error") ||
           /invalid model|model not found|no such model|rate limit/i.test(outText)
-        const sid = sessionId(input)
         if (!sid) return
         const reason = failed ? "échec spawn" : "fin spawn"
         // releaseLatestFor gère le bg check en interne : si le slot le plus récent
@@ -1924,5 +2017,31 @@ export default {
         // jamais casser l'agent : la libération du slot est best-effort (TTL en filet)
       }
     })
+
+    // Boucle d'événements pour libérer les slots background à la fin du subagent
+    // Modèle : loop-guard.ts l.192-214
+    let controller = new AbortController()
+    const runEvents = async () => {
+      try {
+        for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+          const type = String((ev && ev.type) || "")
+          const sid = String((ev && ev.data && ev.data.sessionID) || "")
+          if (!sid) continue
+          if (type === "session.created") {
+            const parent = String((ev && ev.data && ev.data.parentID) || "")
+            if (parent && sid) POOL.setChildByParent(parent, sid)
+          } else if (
+            type === "session.idle" ||
+            type === "session.execution.succeeded" ||
+            type === "session.execution.failed" ||
+            type === "session.deleted"
+          ) {
+            POOL.releaseByChild(sid, "fin subagent")
+          }
+        }
+      } catch {}
+    }
+    runEvents()
+    return () => controller.abort()
   },
 }
