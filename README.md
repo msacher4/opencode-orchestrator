@@ -28,26 +28,62 @@ Contient **tous les secrets** et la config partagée :
 
 > **⚠️ Jamais de secret dans une unit `644`**. Les deux fichiers `.env` sont en `600`, ignorés par git, et ne sont **jamais** affichés ni commités.
 
-## Commandes Telegram
+## Commandes
+
+### Commandes du pont (jamais envoyées au modèle)
 
 | Commande | Description |
 |---|---|
 | `/start` / `/help` | Affiche l'aide |
-| `/sessions [v1\|v2\|suite]` | Liste paginée (10/page) des sessions. Sans arg = toutes les instances. `suite` = page suivante. |
+| `/status` | Instance, session active, agent, contexte (utilisé/limite) + cumul facturé et coût. |
+| `/sessions [v1\|v2\|all\|suite]` | Liste paginée (10/page). Sans arg = sessions racines des deux instances. `all` = toutes, `suite` = page suivante. |
 | `/select <n>` | Choisit la session n° n de la page affichée (même numérotation). |
 | `/newsession [v1\|v2]` | Nouvelle session sur l'instance donnée (défaut = instance courante). |
-| `/status` | Instance, session active, agent, contexte tokens. |
 | `/plan` | Passe l'agent en mode `plan` (lecture seule) pour la session active. |
 | `/build` | Passe l'agent en mode `build` (actions) pour la session active. |
-| `#emp <texte>` | Canal employé : `pause`, `resume`, `status`, `digest`, `liste`, `ok <id>`, `ko <id> "raison"`. Tout autre texte = consigne pour le planner. |
-| `#push <cmd>` | Ordres du jour : `ok`, `skip`, `pause`, `status`. |
+| `/compact` | Compacte le contexte de la session active. Refusé (`⏳ un compactage est déjà en cours`) si un compactage tourne déjà — pas de second envoi. |
+| `/stop` (alias `/esc`) | Interrompt le tour en cours : `⏹ interrompu`, ou `❌ rien à interrompre (code N)`. |
+| `/cmds` | Liste les commandes OpenCode disponibles sur l'instance. |
+| `/say <texte>` | Envoie le texte **tel quel** au modèle (échappatoire pour un message qui commence par `/`). |
 
-### Format des réponses
-Toute réponse du modèle est préfixée par un en-tête :
+Les canaux spéciaux ne partent jamais dans une session :
+`#emp <texte>` → employé autonome (`pause`, `resume`, `status`, `digest`, `liste`, `ok <id>`, `ko <id> "raison"`) ;
+`#push <cmd>` → ordres du jour (`ok`, `skip`, `pause`, `status`).
+
+### Commandes OpenCode (exécutées par le serveur)
+
+`/orch`, `/task`, `/init`, `/review`, `/goal`, `/label`, `/night`… ne sont **pas** traitées par
+le pont : elles sont exécutées par le serveur OpenCode via
+`POST /api/session/{id}/command` (`{"name": …, "text": …}`) et **jamais envoyées au modèle**
+comme du texte.
+
+- La liste qui fait foi est `GET /api/command` (cache 5 min).
+- Une commande **inconnue** est refusée : `❌ commande inconnue`, la liste des commandes
+  disponibles, et **aucun POST**.
+- Après l'exécution, la réponse assistant est éditée dans le message `⏳` et marquée vue
+  (pas de doublon avec le miroir).
+
+### Redémarrage
+
+Un simple `kill` du process `bridge.py` suffit : `telegram-bridge.service` est en
+`Restart=always` / `RestartSec=5`, systemd le relance automatiquement au bout de 5 s.
+`systemctl restart telegram-bridge` reste possible mais n'est pas nécessaire pour recharger
+le code. Aucune commande n'est nécessaire côté OpenCode.
+
+> Au démarrage, le pont publie son menu de commandes Telegram (`setMyCommands`). Un refus de
+> Telegram est journalisé et **non bloquant** : le pont démarre quand même.
+
+### En-tête des messages
+
+Chaque réponse du modèle (et chaque message du miroir) est préfixée par :
 ```
-[v2] Mon titre · build · ctx 12K
+[v2] Mon titre · build · ctx 115K/200K (58%)
 <réponse du modèle>
 ```
+`ctx utilisé/limite (pourcentage)` est la place réellement occupée dans la fenêtre du modèle
+(dernier message assistant, pas le cumul de facturation) ; `Mon titre` est le titre de la
+session. Limite inconnue → `ctx 115K` ; session vide → `ctx 0` ; échec réseau → `ctx ?`.
+Le cumul facturé et le coût sont dans `/status`.
 
 ## Modes de preuve (exécutables sans Marc)
 
@@ -134,5 +170,5 @@ Ce script est idempotent : copie les units dans `/etc/systemd/system/`, `daemon-
 ```bash
 cd /home/marcs/.telegram-bridge-venv
 ./bin/python3 -m py_compile bridge.py          # syntaxe OK
-./bin/python3 -m unittest discover -s tests    # 31+ tests hors réseau (MockTransport)
+./bin/python3 -m unittest discover -s tests    # 113 tests hors réseau (MockTransport)
 ```

@@ -74,6 +74,8 @@ def _backoff_schedule(attempt: int, base: float = 5.0, max_delay: float = 60.0) 
 # de tests ; en production, None = client standard.
 TRANSPORT = None
 TELEGRAM_TRANSPORT = None
+# Point d'injection des tests pour la boucle de polling getUpdates de main().
+POLL_TRANSPORT = None
 
 # Employé autonome : les messages « #emp … » ne vont JAMAIS dans une session.
 EMPLOYEE_SUPERVISOR = os.getenv(
@@ -208,6 +210,45 @@ async def send_message(chat_id: int, text: str) -> None:
 async def _send_plain(chat_id: int, text: str) -> None:
     """Enveloppe de tg_send sans parse_mode (sortie pusher avec _ et *)."""
     await tg_send(chat_id, text, markdown=False)
+
+
+# Menu Telegram (setMyCommands). Sans slash : l'API l'ajoute elle-même.
+BOT_COMMANDS = [
+    {"command": "start", "description": "Aide"},
+    {"command": "help", "description": "Aide détaillée"},
+    {"command": "status", "description": "Session, agent, contexte, cumul"},
+    {"command": "sessions", "description": "Lister les sessions"},
+    {"command": "select", "description": "Choisir une session"},
+    {"command": "newsession", "description": "Nouvelle session"},
+    {"command": "plan", "description": "Mode planification"},
+    {"command": "build", "description": "Mode construction"},
+    {"command": "compact", "description": "Compacter le contexte"},
+    {"command": "stop", "description": "Interrompre le tour en cours"},
+    {"command": "cmds", "description": "Commandes OpenCode disponibles"},
+    {"command": "say", "description": "Envoyer un texte commençant par /"},
+]
+
+
+async def register_bot_commands() -> bool:
+    """Publie le menu de commandes du bot. True si Telegram répond ok:true.
+
+    Jamais bloquant : toute erreur (réseau, refus, corps illisible) est loguée
+    et retourne False sans lever — le pont doit démarrer même sans menu.
+    """
+    payload = {"commands": [dict(c) for c in BOT_COMMANDS]}
+    try:
+        async with httpx.AsyncClient(transport=TELEGRAM_TRANSPORT, timeout=httpx.Timeout(10.0)) as cl:
+            resp = await cl.post(f"{API_BASE}/setMyCommands", json=payload)
+            log.debug("POST setMyCommands -> %s", resp.status_code)
+            data = resp.json()
+    except Exception as e:
+        log.warning("setMyCommands impossible: %s", e)
+        return False
+    if isinstance(data, dict) and data.get("ok") is True:
+        log.info("Menu de commandes publié (%d commandes)", len(payload["commands"]))
+        return True
+    log.warning("setMyCommands refusé: %s", str(data)[:200])
+    return False
 
 
 def _load_state() -> dict:
@@ -373,21 +414,10 @@ async def _send_mirror_message(chat_id: int, inst: dict, sid: str, msg: dict):
 
 
 async def _fetch_latest_assistant_message_id(inst: dict, sid: str) -> str | None:
-    """Récupère l'ID du dernier message assistant de la session."""
-    kind = await detect_kind(inst)
+    """ID du dernier message assistant de la session (via _latest_assistant_id,
+    qui gère l'ordre v2 décroissant comme l'ordre v1 croissant). Ne lève jamais."""
     try:
-        if kind == "api":
-            data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
-            items = (data or {}).get("data", []) if isinstance(data, dict) else []
-        else:
-            data, _ = await _http_get(inst, f"/session/{sid}/message", timeout=10.0)
-            items = data if isinstance(data, list) else []
-        # Parcourir en sens inverse pour trouver le dernier assistant
-        for item in reversed(items):
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "assistant":
-                return item.get("id")
+        return await _latest_assistant_id(inst, sid)
     except Exception as e:
         log.debug("Impossible de récupérer le dernier message assistant %s/%s: %s", inst.get("name"), sid, e)
     return None
@@ -516,10 +546,6 @@ async def api_patch(path, body):
         return r.json()
 
 
-async def list_sessions():
-    return await api_get("/session")
-
-
 async def create_session() -> dict:
     return await api_post("/session", {})
 
@@ -548,31 +574,167 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-async def get_session_context_tokens(inst: dict, sid: str) -> int:
-    """Lit les tokens de contexte depuis l'objet session (pas depuis les messages).
-    v1 (legacy) : session.tokens.input + session.tokens.output
-    v2 (api)    : session.data.tokens.input + session.data.tokens.output
-    Repli tolérant à 0 si absent ou si l'appel échoue, sans lever, en journalisant.
+_CTX_LIMIT_CACHE = {}
+_CTX_LIMIT_TTL = 600.0
+
+
+class ContextUnavailable(Exception):
+    """Lecture du contexte impossible (HTTP ≠ 200, réseau) : à distinguer d'une session vide."""
+
+
+async def model_context_limit(inst, provider_id, model_id) -> int | None:
+    """Limite de contexte du modèle (cache mémoire 10 min, /api/model est coûteux).
+    None si inconnue, kind legacy ou erreur : jamais d'exception."""
+    if not provider_id or not model_id:
+        return None
+    key = f"{inst['name']}:{provider_id}/{model_id}"
+    now = time.monotonic()
+    cached = _CTX_LIMIT_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        kind = await detect_kind(inst)
+        if kind != "api":
+            return None
+        data, _ = await _http_get(inst, "/api/model", timeout=10.0)
+        items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        limit = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") == model_id and item.get("providerID") == provider_id:
+                limit = (item.get("limit") or {}).get("context")
+                break
+        # Cache uniquement une limite réellement trouvée : un échec ou une
+        # absence ne doit pas empoisonner l'en-tête pendant 10 minutes.
+        if limit and limit > 0:
+            _CTX_LIMIT_CACHE[key] = (now + _CTX_LIMIT_TTL, limit)
+        return limit
+    except Exception as e:
+        log.debug("Limite de contexte indisponible (%s): %s", key, e)
+        return None
+
+
+async def context_usage(inst, sid) -> tuple[int, int | None]:
+    """(tokens réellement occupés dans le contexte, limite du modèle).
+
+    session.tokens est un cumul de facturation sur toute la vie de la session :
+    on lit donc les tokens du DERNIER message assistant.
+    v2 (api) : GET /api/session/{sid}/message, trié du plus récent au plus ancien.
+    v1 (legacy) : dernier item dont info.role == "assistant".
+    Lève ContextUnavailable si la lecture échoue (panne ≠ session vide) ;
+    la limite seule ne peut jamais faire perdre `used`.
     """
     try:
-        session = await cli_get_session(inst, sid)
-        if not session:
-            return 0
         kind = await detect_kind(inst)
         if kind == "api":
-            # v2 : session est déjà l'objet data (cli_get_session dépaquette l'enveloppe)
-            t = session.get("tokens") or {}
+            data, code = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
         else:
-            # v1 : session est l'objet brut
-            t = session.get("tokens") or {}
-        return (t.get("input", 0) or 0) + (t.get("output", 0) or 0)
+            data, code = await _http_get(inst, f"/session/{sid}/message", timeout=10.0)
+        if code != 200:
+            log.debug(
+                "Contexte indisponible (HTTP %s) pour %s sur %s", code, sid, inst.get("name")
+            )
+            raise ContextUnavailable(f"HTTP {code}")
+    except ContextUnavailable:
+        raise
+    except Exception as e:
+        log.debug("Contexte indisponible pour %s sur %s: %s", sid, inst.get("name"), e)
+        raise ContextUnavailable(str(e)) from e
+
+    t = None
+    if kind == "api":
+        items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "assistant" and isinstance(item.get("tokens"), dict):
+                t = item["tokens"]
+                break
+    else:
+        items = data if isinstance(data, list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            info = item.get("info") or {}
+            if info.get("role") == "assistant" and isinstance(info.get("tokens"), dict):
+                t = info["tokens"]
+
+    # 200 sans message assistant = session vide, pas une panne.
+    used = 0
+    if t:
+        cache = t.get("cache") or {}
+        used = (
+            int(t.get("input") or 0)
+            + int(cache.get("read") or 0)
+            + int(cache.get("write") or 0)
+            + int(t.get("output") or 0)
+        )
+
+    limit = None
+    try:
+        s = await cli_get_session(inst, sid)
+        model = (s or {}).get("model") or {}
+        if not isinstance(model, dict):
+            model = {}
+        try:
+            limit = await model_context_limit(inst, model.get("providerID"), model.get("id"))
+        except Exception as e:
+            log.debug("Limite de contexte indisponible pour %s: %s", sid, e)
+            limit = None
+    except Exception as e:
+        log.debug("Session %s illisible (limite inconnue): %s", sid, e)
+        limit = None
+    return (used, limit)
+
+
+def _fmt_ctx(used: int, limit: int | None, failed: bool = False) -> str:
+    """'115K/200K (57%)' si la limite est connue, sinon '115K'."""
+    if failed:
+        return "?"
+    if limit:
+        if used > 0:
+            return f"{_fmt_tokens(used)}/{_fmt_tokens(limit)} ({100 * used // limit}%)"
+        return f"0/{_fmt_tokens(limit)} (0%)"
+    return _fmt_tokens(used)
+
+
+async def get_session_context_tokens(inst: dict, sid: str) -> int:
+    """Taille réelle du contexte : tokens du dernier message assistant.
+    Ne lève jamais : 0 si le contexte est indisponible."""
+    try:
+        used, _ = await context_usage(inst, sid)
+        return used
+    except ContextUnavailable:
+        return 0
     except Exception:
-        log.exception("Contexte tokens indisponible pour %s sur instance %s", sid, inst.get("name"))
-    return 0
+        return 0
 
 
-async def get_session_info(sid: str) -> dict:
-    return await api_get(f"/session/{sid}")
+def _fmt_billing(sess) -> str:
+    """'cumul 1.4M · cache 14.9M · $0.31' ; chaque morceau absent est omis."""
+    if not isinstance(sess, dict):
+        return ""
+    toks = sess.get("tokens")
+    toks = toks if isinstance(toks, dict) else {}
+    parts = []
+    inp, out = toks.get("input"), toks.get("output")
+    if isinstance(inp, (int, float)) or isinstance(out, (int, float)):
+        parts.append(f"cumul {_fmt_tokens(int(inp or 0) + int(out or 0))}")
+    cache = toks.get("cache")
+    cache = cache if isinstance(cache, dict) else {}
+    read = cache.get("read")
+    if isinstance(read, (int, float)):
+        parts.append(f"cache {_fmt_tokens(int(read))}")
+    cost = sess.get("cost")
+    if isinstance(cost, (int, float)):
+        parts.append(f"${float(cost):.2f}")
+    return " · ".join(parts)
+
+
+async def get_session_info(inst, sid: str) -> dict:
+    """Objet session dépaqueté, v1 (legacy) comme v2 (api)."""
+    return await cli_get_session(inst, sid)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +790,8 @@ async def _http_post(inst, path, body=None, timeout=10.0):
     async with httpx.AsyncClient(base_url=inst["url"], transport=TRANSPORT, timeout=httpx.Timeout(timeout)) as cl:
         r = await cl.post(path, json=body or {}, headers=headers)
         log.debug("POST %s -> %s", path, r.status_code)
-        if r.status_code != 200:
+        # 2xx = succès (les commandes v2 répondent 204 sans corps).
+        if r.status_code >= 300 or r.status_code < 200:
             # Capturer le corps pour les erreurs (utile pour messages lisibles)
             try:
                 error_data = r.json()
@@ -772,12 +935,15 @@ async def cli_prompt(inst, sid, text, agent=None):
     (timeout 180 s, intervalle 1 s)."""
     kind = await detect_kind(inst)
     if kind == "api":
+        # Baseline capturée AVANT le POST : le premier assistant de la liste est
+        # encore la réponse du tour précédent tant que le nouveau tour n'a pas démarré.
+        baseline = await _latest_assistant_id(inst, sid)
         payload = {"text": text}
         if agent:
             # L'API v2 attend "name" (AgentAttachment), pas "id" (cf. SDK @opencode/protocol)
             payload["agents"] = [{"name": agent}]
         data, code = await _http_post(inst, f"/api/session/{sid}/prompt", payload, timeout=180.0)
-        if code != 200:
+        if not (200 <= code < 300):
             # Erreur lisible avec le corps de la réponse (sans exposer de secret)
             body = json.dumps(data, ensure_ascii=False) if data else "(corps vide)"
             raise httpx.HTTPStatusError(
@@ -785,28 +951,263 @@ async def cli_prompt(inst, sid, text, agent=None):
                 request=None,
                 response=httpx.Response(code, json=data),
             )
-        return await _poll_api(inst, sid)
+        return await _poll_api(inst, sid, baseline_id=baseline)
     result, _ = await _http_post(inst, f"/session/{sid}/message", {"parts": [{"type": "text", "text": text}]}, timeout=180.0)
     parts = (result or {}).get("parts", []) if isinstance(result, dict) else []
     out = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
     return out or "(pas de réponse textuelle)"
 
 
-async def _poll_api(inst, sid, timeout=180.0, interval=1.0):
-    deadline = time.monotonic() + timeout
-    while True:
+def _assistant_text(item) -> str:
+    """Texte d'un message assistant : concaténation de ses content[].type == "text"."""
+    contents = item.get("content", []) if isinstance(item, dict) else []
+    if not isinstance(contents, list):
+        return ""
+    chunks = [
+        c.get("text", "")
+        for c in contents
+        if isinstance(c, dict) and c.get("type") == "text"
+    ]
+    return "\n".join(chunks).strip()
+
+
+async def _latest_assistant_id(inst, sid) -> str | None:
+    """Id du dernier message assistant de la session, None si absent.
+
+    v2 (api) : la liste /api/session/{sid}/message va du plus récent au plus ancien
+    -> premier item de type "assistant".
+    v1 (legacy) : la liste va du plus ancien au plus récent
+    -> dernier item dont info.role == "assistant".
+    """
+    kind = await detect_kind(inst)
+    if kind == "api":
         data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
         items = (data or {}).get("data", []) if isinstance(data, dict) else []
         for item in items:
             if isinstance(item, dict) and item.get("type") == "assistant":
-                contents = item.get("content", [])
-                if isinstance(contents, list):
-                    for c in contents:
-                        if isinstance(c, dict) and c.get("type") == "text":
-                            return c.get("text", "").strip()
+                return item.get("id")
+        return None
+    data, _ = await _http_get(inst, f"/session/{sid}/message", timeout=10.0)
+    items = data if isinstance(data, list) else []
+    latest = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("info")
+        if isinstance(info, dict) and info.get("role") == "assistant":
+            latest = info.get("id") or item.get("id")
+    return latest
+
+
+async def _poll_api(inst, sid, baseline_id=None, timeout=180.0, interval=1.0):
+    """Attend une réponse assistant *nouvelle* (id différent de baseline_id).
+
+    La liste v2 est triée du plus récent au plus ancien : tant que le premier
+    assistant a l'id de la baseline, le tour demandé n'a pas encore démarré.
+    baseline_id is None => comportement historique (premier assistant avec texte).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        data, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+        items = (data or {}).get("data", []) if isinstance(data, dict) else []
+        assistants = [
+            item for item in items
+            if isinstance(item, dict) and item.get("type") == "assistant"
+        ]
+        if baseline_id is None:
+            for item in assistants:
+                text = _assistant_text(item)
+                if text:
+                    return text
+        else:
+            # Seul le premier assistant compte : les suivants sont plus anciens que
+            # la baseline et ne peuvent pas être la réponse du tour demandé.
+            if assistants and assistants[0].get("id") != baseline_id:
+                text = _assistant_text(assistants[0])
+                if text:
+                    return text
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Timeout polling v2 après {timeout}s : aucune réponse assistant pour {sid}")
         await asyncio.sleep(interval)
+
+
+class CommandNotFound(Exception):
+    """Commande inconnue côté OpenCode (400 CommandNotFoundError)."""
+
+    def __init__(self, command):
+        super().__init__(f"Commande inconnue : {command}")
+        self.command = command
+
+
+_COMMANDS_CACHE = {}
+_COMMANDS_TTL = 300.0
+
+
+async def cli_commands_list(inst, force=False) -> list[dict]:
+    """Commandes serveur. v2 : GET /api/command (cache 300 s par instance, écrit
+    uniquement sur un 200) ; v1 : liste vide sans requête."""
+    name = inst.get("name")
+    now = time.monotonic()
+    cached = _COMMANDS_CACHE.get(name)
+    if not force and cached and (now - cached[0]) < _COMMANDS_TTL:
+        return [dict(c) for c in cached[1]]
+    kind = await detect_kind(inst)
+    if kind != "api":
+        return []
+    data, code = await _http_get(inst, "/api/command", timeout=10.0)
+    if code != 200:
+        # Pas de cache négatif : une panne passagère (500, réseau) ne doit pas faire
+        # passer toutes les commandes pour inconnues pendant 300 s (cf. _CTX_LIMIT_CACHE).
+        log.debug("Liste des commandes indisponible (HTTP %s) pour %s", code, name)
+        return []
+    raw = (data or {}).get("data", []) if isinstance(data, dict) else []
+    commands = [
+        {"name": entry.get("name"), "description": entry.get("description") or ""}
+        for entry in raw
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+    _COMMANDS_CACHE[name] = (now, commands)
+    return [dict(c) for c in commands]
+
+
+def _command_http_error(path, code, data):
+    """HTTPStatusError lisible, corps tronqué à 300 caractères (comme cli_prompt)."""
+    body = json.dumps(data, ensure_ascii=False) if data is not None else "(corps vide)"
+    return httpx.HTTPStatusError(
+        f"POST {path} → {code}: {body[:300]}",
+        request=None,
+        response=httpx.Response(code, json=data),
+    )
+
+
+async def cli_command(inst, sid, name, arguments="", agent=None) -> str:
+    """Exécute une commande serveur et renvoie la réponse assistant.
+
+    v2 : POST /api/session/{sid}/command (204, asynchrone) puis polling ;
+    v1 : POST /session/{sid}/command (synchrone, parts[])."""
+    kind = await detect_kind(inst)
+    if kind == "api":
+        baseline = await _latest_assistant_id(inst, sid)
+        payload = {"name": name, "text": arguments}
+        if agent:
+            payload["agents"] = [{"name": agent}]
+        path = f"/api/session/{sid}/command"
+        data, code = await _http_post(inst, path, payload, timeout=180.0)
+        if code < 200 or code >= 300:
+            body = json.dumps(data, ensure_ascii=False) if data is not None else "(corps vide)"
+            if code == 400 and "CommandNotFoundError" in body:
+                raise CommandNotFound(name)
+            raise _command_http_error(path, code, data)
+        return await _poll_api(inst, sid, baseline_id=baseline)
+    payload = {"command": name, "arguments": arguments}
+    if agent:
+        payload["agent"] = agent
+    path = f"/session/{sid}/command"
+    result, code = await _http_post(inst, path, payload, timeout=180.0)
+    if code < 200 or code >= 300:
+        body = json.dumps(result, ensure_ascii=False) if result is not None else "(corps vide)"
+        if code == 400 and "CommandNotFoundError" in body:
+            raise CommandNotFound(name)
+        raise _command_http_error(path, code, result)
+    parts = (result or {}).get("parts", []) if isinstance(result, dict) else []
+    out = "\n".join(
+        p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"
+    ).strip()
+    return out or "(pas de réponse textuelle)"
+
+
+async def cli_compact(inst, sid) -> str:
+    """Demande un compactage. Retourne "completed", "failed", "timeout" (v2) ou
+    "unsupported" (v1 sans modèle lisible).
+
+    Cas particulier v2 : si le POST ne renvoie pas d'id de message de compactage,
+    aucun poll n'est possible et la fonction retourne "running" (compactage lancé,
+    résultat inconnu) — hors du contrat completed|failed|timeout.
+    """
+    kind = await detect_kind(inst)
+    if kind == "api":
+        path = f"/api/session/{sid}/compact"
+        data, code = await _http_post(inst, path, {}, timeout=180.0)
+        if code < 200 or code >= 300:
+            raise _command_http_error(path, code, data)
+        payload = (data or {}).get("data") if isinstance(data, dict) else None
+        msg_id = payload.get("id") if isinstance(payload, dict) else None
+        if not msg_id:
+            return "running"
+        deadline = time.monotonic() + 300.0
+        while True:
+            msgs, _ = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+            items = (msgs or {}).get("data", []) if isinstance(msgs, dict) else []
+            for item in items:
+                if isinstance(item, dict) and item.get("id") == msg_id:
+                    status = item.get("status")
+                    if status and status != "running":
+                        return "completed" if status == "completed" else "failed"
+                    break
+            if time.monotonic() >= deadline:
+                return "timeout"
+            await asyncio.sleep(2.0)
+    session = await cli_get_session(inst, sid)
+    model = session.get("model") if isinstance(session, dict) else None
+    provider = model.get("providerID") if isinstance(model, dict) else None
+    model_id = model.get("id") if isinstance(model, dict) else None
+    if not provider or not model_id:
+        return "unsupported"
+    path = f"/session/{sid}/summarize"
+    data, code = await _http_post(
+        inst, path, {"providerID": provider, "modelID": model_id}, timeout=180.0
+    )
+    if code < 200 or code >= 300:
+        raise _command_http_error(path, code, data)
+    return "completed" if data is True else "failed"
+
+
+async def _interrupt_request(inst, sid) -> tuple[bool, int | str]:
+    """(succès, code HTTP) de la demande d'interruption.
+
+    v2 : POST /api/session/{sid}/interrupt ; v1 : POST /session/{sid}/abort.
+    Le code vaut "?" si la requête n'a pas abouti (réseau, kind illisible).
+    """
+    try:
+        kind = await detect_kind(inst)
+        path = (
+            f"/api/session/{sid}/interrupt"
+            if kind == "api"
+            else f"/session/{sid}/abort"
+        )
+        _data, code = await _http_post(inst, path, {}, timeout=30.0)
+    except Exception as e:
+        log.warning("Interruption impossible: %s", e)
+        return False, "?"
+    return 200 <= code < 300, code
+
+
+async def cli_interrupt(inst, sid) -> bool:
+    """Arrête le tour en cours. True si le code est 2xx, False sinon (sans lever)."""
+    ok, code = await _interrupt_request(inst, sid)
+    if not ok:
+        log.info("Interruption non aboutie (code %s) sur %s", code, sid)
+    return ok
+
+
+async def has_running_compaction(inst, sid) -> bool:
+    """True si un message de type compaction est encore à l'état running.
+
+    v2 : GET /api/session/{sid}/message. v1 : False (pas de notion d'état).
+    """
+    if await detect_kind(inst) != "api":
+        return False
+    data, code = await _http_get(inst, f"/api/session/{sid}/message", timeout=10.0)
+    if code != 200 or not isinstance(data, dict):
+        return False
+    for item in data.get("data") or []:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "compaction"
+            and item.get("status") == "running"
+        ):
+            return True
+    return False
 
 
 async def api_probe(instances):
@@ -842,10 +1243,10 @@ async def ensure_session_titled(cid: str, sid: str, first_text: str):
     inst_name = cur.get("instance", default_instance())
     inst = instances()[inst_name]
     try:
-        info = await get_session_info(sid)
+        info = await get_session_info(inst, sid)
     except Exception:
         return
-    current_title = info.get("title", "")
+    current_title = (info or {}).get("title") or ""
     if current_title and not current_title.startswith("New session"):
         state.setdefault(cid, {}).setdefault("titled", []).append(sid)
         _save_state(state)
@@ -880,19 +1281,23 @@ async def handle_status(chat_id: int):
     sid = cur.get("sid", "")
     agent = cur.get("agent", "build")
 
-    # Tokens
-    tokens = "?"
+    # Contexte réellement occupé (dernier message assistant)
+    failed = False
     try:
         if sid:
-            n = await get_session_context_tokens(inst, sid)
-            tokens = _fmt_tokens(n) if n > 0 else "0"
+            used, limit = await context_usage(inst, sid)
+        else:
+            used, limit = 0, None
+    except ContextUnavailable:
+        used, limit, failed = 0, None, True
     except Exception:
-        pass
+        used, limit, failed = 0, None, True
+    tokens = _fmt_ctx(used, limit, failed)
 
     title = ""
     try:
-        info = await get_session_info(sid) if sid else {}
-        title = info.get("title", "") or sid[:12] if sid else ""
+        info = await get_session_info(inst, sid) if sid else {}
+        title = ((info or {}).get("title") or "") or (sid[:12] if sid else "")
     except Exception:
         pass
 
@@ -900,6 +1305,15 @@ async def handle_status(chat_id: int):
         f"[{inst_name}] {title} · {agent} · ctx {tokens}",
         f"Session : {sid or '(aucune)'}",
     ]
+    # Cumul facturé de la session (spec : 'cumul · cache · $coût').
+    if sid:
+        try:
+            billing = _fmt_billing(await cli_get_session(inst, sid))
+        except Exception as e:
+            log.debug("Cumul indisponible pour %s: %s", sid, e)
+            billing = ""
+        if billing:
+            lines.append(billing)
     await send_message(chat_id, "\n".join(lines))
 
 
@@ -1243,23 +1657,284 @@ async def _status_header(chat_id: int) -> str:
     sid = cur.get("sid", "")
     agent = cur.get("agent", "build")
 
-    tokens = "?"
+    failed = False
     try:
         if sid:
-            n = await get_session_context_tokens(inst, sid)
-            tokens = _fmt_tokens(n) if n > 0 else "0"
+            used, limit = await context_usage(inst, sid)
+        else:
+            used, limit = 0, None
+    except ContextUnavailable:
+        used, limit, failed = 0, None, True
     except Exception:
-        pass
+        used, limit, failed = 0, None, True
 
     title = ""
     try:
         if sid:
-            info = await get_session_info(sid)
-            title = info.get("title", "") or sid[:12]
+            info = await get_session_info(inst, sid)
+            title = (info or {}).get("title") or sid[:12]
     except Exception:
         pass
 
-    return f"[{inst_name}] {title} · {agent} · ctx {tokens}"
+    return f"[{inst_name}] {title} · {agent} · ctx {_fmt_ctx(used, limit, failed)}"
+
+
+# ---------------------------------------------------------------------------
+# Routage des commandes slash (/compact, /cmds, /say, /<commande serveur>)
+# ---------------------------------------------------------------------------
+
+# Commandes natives traitées par main() AVANT handle_slash : jamais routées ici.
+_PONT_MAIN_COMMANDS = (
+    "start", "help", "status", "sessions", "select", "newsession", "plan", "build",
+)
+
+# Commandes natives du pont au sens large (pour le rappel de /cmds et /help).
+_PONT_NATIVE_COMMANDS = _PONT_MAIN_COMMANDS + ("cmds", "say", "stop", "esc")
+
+
+def _split_slash(text: str) -> tuple[str, str] | None:
+    """"/Compact@opencode4578_bot  a b" -> ("compact", "a b").
+
+    Retourne None si le texte ne commence pas par "/" (ou si le nom est vide).
+    """
+    raw = (text or "").strip()
+    if not raw.startswith("/"):
+        return None
+    head, _, rest = raw.partition(" ")
+    name = head[1:].split("@", 1)[0].lower()
+    if not name:
+        return None
+    return name, rest.strip()
+
+
+def _http_error_line(err) -> str:
+    """'❌ erreur (500) : <corps tronqué à 200>' depuis un HTTPStatusError."""
+    response = getattr(err, "response", None)
+    code = getattr(response, "status_code", "?")
+    body = ""
+    if response is not None:
+        try:
+            body = json.dumps(response.json(), ensure_ascii=False)
+        except Exception:
+            body = getattr(response, "text", "") or ""
+    return f"❌ erreur ({code}) : {body[:200]}"
+
+
+async def _slash_ctx_now(inst, sid) -> str:
+    """Formate le contexte courant ; '?' si la lecture échoue (jamais d'exception)."""
+    try:
+        used, limit = await context_usage(inst, sid)
+        return _fmt_ctx(used, limit)
+    except Exception as e:
+        log.debug("Contexte indisponible après compactage: %s", e)
+        return _fmt_ctx(0, None, failed=True)
+
+
+async def _slash_compact(chat_id: int, inst, sid) -> None:
+    """⏳ puis édition du MÊME message avec le résultat du compactage.
+
+    Refus explicite si un compactage tourne déjà : un second POST sur une
+    session en cours de compactage n'a aucun sens et abîme le contexte.
+    """
+    try:
+        running = await has_running_compaction(inst, sid)
+    except Exception as e:
+        # Repli : une vérification illisible ne doit jamais bloquer un compactage légitime.
+        log.debug("État du compactage illisible, compactage lancé: %s", e)
+        running = False
+    if running:
+        await tg_send(
+            chat_id,
+            "⏳ un compactage est déjà en cours sur cette session",
+            markdown=False,
+        )
+        return
+
+    ack = await tg_send(chat_id, "⏳ compactage…", markdown=False)
+    try:
+        result = await cli_compact(inst, sid)
+    except httpx.HTTPStatusError as e:
+        log.error("Compactage refusé: %s", e)
+        await tg_edit(chat_id, ack, _http_error_line(e), markdown=False)
+        return
+    except TimeoutError:
+        log.error("Compactage : timeout")
+        await tg_edit(chat_id, ack, "❌ timeout", markdown=False)
+        return
+    except httpx.TimeoutException:
+        log.error("Compactage : timeout réseau")
+        await tg_edit(chat_id, ack, "❌ timeout", markdown=False)
+        return
+    except Exception as e:
+        log.exception("Erreur inattendue pendant le compactage: %s", e)
+        await tg_edit(chat_id, ack, "❌ erreur interne", markdown=False)
+        return
+
+    if result == "completed":
+        # Le compactage peut produire un message assistant (v1 notamment) : on le
+        # marque vu AVANT l'édition, sinon le miroir peut le relivrer en double.
+        try:
+            await _mark_latest_assistant_seen(chat_id, inst, sid)
+        except Exception as e:
+            log.debug("Marquage du message compacté impossible: %s", e)
+        text = f"✅ compacté · ctx {await _slash_ctx_now(inst, sid)}"
+    elif result == "failed":
+        text = "❌ compactage échoué"
+    elif result == "timeout":
+        text = "❌ compactage trop long (300 s)"
+    elif result == "running":
+        text = "⏳ compactage lancé (non suivi)"
+    else:
+        text = "❌ compactage non supporté sur cette instance"
+    await tg_edit(chat_id, ack, text, markdown=False)
+
+
+async def _slash_stop(chat_id: int, inst, sid) -> None:
+    """Arrête le tour en cours : ⏹ sur succès, ❌ avec le code sinon."""
+    ack = await tg_send(chat_id, "⏳ interruption…", markdown=False)
+    ok, code = await _interrupt_request(inst, sid)
+    text = "⏹ interrompu" if ok else f"❌ rien à interrompre (code {code})"
+    await tg_edit(chat_id, ack, text, markdown=False)
+
+
+async def _slash_cmds(chat_id: int, inst) -> None:
+    """Liste les commandes serveur, plus le rappel des commandes natives."""
+    commands = await cli_commands_list(inst)
+    lines = ["Commandes du pont : " + " ".join(f"/{c}" for c in _PONT_NATIVE_COMMANDS), ""]
+    if commands:
+        for cmd in commands:
+            description = (cmd.get("description") or "").strip()
+            line = f"/{cmd.get('name')}"
+            if description:
+                line += f" — {description[:60]}"
+            lines.append(line)
+    else:
+        lines.append("Aucune commande serveur disponible (instance v1 ou liste inaccessible).")
+    lines.append("")
+    lines.append("Les autres commandes sont exécutées par OpenCode, pas envoyées au modèle.")
+    await tg_send(chat_id, "\n".join(lines), markdown=False)
+
+
+async def _slash_unknown(chat_id: int, name: str, commands) -> None:
+    """Commande inconnue : AUCUN POST, liste des noms disponibles + échappatoire /say."""
+    names = [c.get("name") for c in commands if c.get("name")]
+    lines = [f"❌ commande inconnue : /{name}"]
+    if names:
+        lines.append("Disponibles : " + ", ".join(f"/{n}" for n in names))
+    else:
+        lines.append("Aucune commande serveur disponible sur cette instance.")
+    lines.append("Pour envoyer un texte commençant par « / », écris /say <texte>.")
+    await tg_send(chat_id, "\n".join(lines), markdown=False)
+
+
+async def handle_slash(chat_id: int, text: str) -> None:
+    """Route une commande slash : native du pont, compactage, /cmds, /say, ou
+    commande serveur OpenCode. Aucune exception ne remonte hors de cette fonction."""
+    # Défense en profondeur : main() a déjà filtré à la racine, on répète le
+    # contrôle pour tout appel direct (aucun handler slash n'est anonyme).
+    if not _is_authorized(chat_id):
+        log.warning("Chat non autorisé (slash): %s", chat_id)
+        await tg_send(chat_id, "⛔ Chat non autorisé.", markdown=False)
+        return
+    try:
+        await _handle_slash(chat_id, text)
+    except Exception as e:  # filet de sécurité : le pont ne doit jamais mourir ici
+        log.exception("Erreur inattendue dans handle_slash: %s", e)
+        try:
+            await tg_send(chat_id, "❌ erreur interne", markdown=False)
+        except Exception:
+            log.debug("Message d'erreur non envoyé", exc_info=True)
+
+
+async def _handle_slash(chat_id: int, text: str) -> None:
+    parsed = _split_slash(text)
+    if parsed is None:
+        return
+    name, arguments = parsed
+
+    # Commandes natives : traitées dans main(), y compris la forme /cmd@bot que
+    # main() normalise ; on ne les double pas ici.
+    if name in _PONT_MAIN_COMMANDS:
+        return
+
+    cur = _cur(chat_id) or {}
+    inst_name = cur.get("instance") or default_instance()
+    inst = instances().get(inst_name) or instances()[default_instance()]
+    sid = cur.get("sid") or ""
+
+    # /cmds ne dépend pas d'une session : la liste vient du serveur.
+    if name == "cmds":
+        await _slash_cmds(chat_id, inst)
+        return
+
+    # /say délègue à handle_message, qui crée la session si nécessaire.
+    if name == "say":
+        if not arguments:
+            await tg_send(
+                chat_id,
+                "Usage : /say <texte> — envoie le texte tel quel au modèle.",
+                markdown=False,
+            )
+            return
+        await handle_message(chat_id, arguments)
+        return
+
+    if not sid:
+        await tg_send(
+            chat_id,
+            "❌ aucune session active — envoie d'abord un message.",
+            markdown=False,
+        )
+        return
+
+    if name == "compact":
+        await _slash_compact(chat_id, inst, sid)
+        return
+
+    # /stop et son alias /esc : jamais envoyés au modèle.
+    if name in ("stop", "esc"):
+        await _slash_stop(chat_id, inst, sid)
+        return
+
+    # Commande serveur : la liste fait foi, sinon aucun POST.
+    commands = await cli_commands_list(inst)
+    if name not in [c.get("name") for c in commands]:
+        await _slash_unknown(chat_id, name, commands)
+        return
+
+    agent = state.get(str(chat_id), {}).get("agent", "build")
+    ack = await tg_send(chat_id, "⏳", markdown=False)
+    try:
+        reponse = await cli_command(inst, sid, name, arguments, agent)
+    except CommandNotFound:
+        await tg_edit(
+            chat_id, ack, f"❌ commande inconnue côté OpenCode : /{name}", markdown=False
+        )
+        return
+    except httpx.HTTPStatusError as e:
+        log.error("Commande /%s refusée: %s", name, e)
+        await tg_edit(chat_id, ack, _http_error_line(e), markdown=False)
+        return
+    except TimeoutError:
+        log.error("Commande /%s : timeout", name)
+        await tg_edit(chat_id, ack, "❌ timeout", markdown=False)
+        return
+    except httpx.TimeoutException:
+        log.error("Commande /%s : timeout réseau", name)
+        await tg_edit(chat_id, ack, "❌ timeout", markdown=False)
+        return
+    except Exception as e:
+        log.exception("Erreur inattendue sur /%s: %s", name, e)
+        await tg_edit(chat_id, ack, "❌ erreur interne", markdown=False)
+        return
+
+    # Le miroir ne doit pas relivrer cette réponse : on la marque vue AVANT l'édition.
+    try:
+        await _mark_latest_assistant_seen(chat_id, inst, sid)
+    except Exception as e:
+        log.debug("Marquage du message assistant impossible: %s", e)
+    header = await _status_header(chat_id)
+    await tg_edit(chat_id, ack, f"{header}\n{reponse}", markdown=False)
 
 
 async def handle_message(chat_id: int, text: str):
@@ -1362,15 +2037,43 @@ async def handle_message(chat_id: int, text: str):
             break
 
 
+_HELP_TEXT = (
+    "🤖 *Pont Telegram → OpenCode*\n\n"
+    "Envoie un message → OpenCode répond.\n\n"
+    "*/newsession* — nouvelle session\n"
+    "*/sessions* — liste sessions racines (sans sous-agents)\n"
+    "*/sessions all* — liste TOUTES les sessions\n"
+    "*/sessions suite* — page suivante\n"
+    "*/select <n>* — choisir une session active\n"
+    "*/plan* — mode planification (lecture seule)\n"
+    "*/build* — mode construction (actions)\n"
+    "*/compact* — compacte la session (contexte)\n"
+    "*/stop* (ou */esc*) — interrompt le tour en cours\n"
+    "*/cmds* — commandes OpenCode disponibles\n"
+    "*/say <texte>* — envoie un texte commençant par `/`\n"
+    "*#emp <texte>* — l'employé autonome (pause/resume/status)\n"
+    "*/help* — cette aide\n\n"
+    "Les autres commandes (`/orch`, `/task`, `/init`…) sont exécutées "
+    "par OpenCode, pas envoyées au modèle."
+)
+
+
 async def main():
     offset = 0
     log.info("Pont Telegram → OpenCode démarré (polling direct)")
+
+    # Menu de commandes Telegram : publié une fois au démarrage. Un refus de
+    # Telegram (ou un réseau absent) ne doit pas empêcher le pont de démarrer.
+    try:
+        await register_bot_commands()
+    except Exception as e:
+        log.warning("Menu de commandes non publié: %s", e)
 
     # B6 — backoff borné 5 s → 60 s sur erreur réseau (pas de boucle serrée,
     # pas d'attente infinie), calculable sans dormir réellement pour être testable.
     poll_attempt = 0
 
-    async with httpx.AsyncClient() as cl:
+    async with httpx.AsyncClient(transport=POLL_TRANSPORT) as cl:
         while True:
             try:
                 resp = await cl.post(
@@ -1401,6 +2104,15 @@ async def main():
                     log.info("Message de %s: %.80s", chat_id, text)
 
                     try:
+                        # Autorisation à la racine : AVANT toute interception
+                        # (#push, #emp, commandes natives, routage slash). Un chat
+                        # non autorisé ne peut ni lancer de commande ni inscrire
+                        # une session (cf. /sessions + /select) pour agir ensuite.
+                        if not _is_authorized(chat_id):
+                            log.warning("Chat non autorisé: %s", chat_id)
+                            await send_message(chat_id, "⛔ Chat non autorisé.")
+                            continue
+
                         # Canal ordres du jour : intercepté AVANT #emp, jamais transmis.
                         if text.startswith("#push"):
                             await handle_push(chat_id, text[5:].strip())
@@ -1411,23 +2123,13 @@ async def main():
                             await handle_emp(chat_id, text[4:].strip())
                             continue
 
-                        cmd = text.lower().split()[0] if text else ""
+                        # Forme nue exigée par les branches ci-dessous : en groupe
+                        # Telegram envoie « /status@opencode4578_bot », on retire le
+                        # suffixe @bot une seule fois, ici.
+                        cmd = (text.lower().split()[0] if text else "").split("@")[0]
 
                         if cmd in ("/start", "/help"):
-                            await send_message(
-                                chat_id,
-                                "🤖 *Pont Telegram → OpenCode*\n\n"
-                                "Envoie un message → OpenCode répond.\n\n"
-                                "*/newsession* — nouvelle session\n"
-                                "*/sessions* — liste sessions racines (sans sous-agents)\n"
-                                "*/sessions all* — liste TOUTES les sessions\n"
-                                "*/sessions suite* — page suivante\n"
-                                "*/select <n>* — choisir une session active\n"
-                                "*/plan* — mode planification (lecture seule)\n"
-                                "*/build* — mode construction (actions)\n"
-                                "*#emp <texte>* — l'employé autonome (pause/resume/status)\n"
-                                "*/help* — cette aide",
-                            )
+                            await send_message(chat_id, _HELP_TEXT)
 
                         elif cmd == "/newsession":
                             await handle_newsession(
@@ -1462,7 +2164,10 @@ async def main():
                             await send_message(chat_id, f"{emoji} Mode passé à `build` pour la session active.")
 
                         else:
-                            await handle_message(chat_id, text)
+                            if text.startswith("/"):
+                                await handle_slash(chat_id, text)
+                            else:
+                                await handle_message(chat_id, text)
 
                     except Exception as e:
                         log.error("Erreur handler: %s", e)

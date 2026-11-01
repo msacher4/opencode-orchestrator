@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -766,6 +767,1830 @@ class SessionFilterTests(unittest.TestCase):
         asyncio.run(_bridge.handle_select(int(self._cid), "3"))
         # Doit rester sur ses_root2 (sélection invalide -> message d'erreur, pas de changement)
         self.assertEqual(_bridge.state[self._cid]["current"]["sid"], "ses_root2")
+
+
+class ContextUsageTests(unittest.TestCase):
+    """context_usage lit le DERNIER message assistant, pas le cumul de session."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_state = _bridge.state
+        _bridge._KIND_CACHE.clear()
+        _bridge._CTX_LIMIT_CACHE.clear()
+        self.inst = {"name": "v2", "url": "http://127.0.0.1:4097", "auth": "", "kind": None}
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+        _bridge._CTX_LIMIT_CACHE.clear()
+
+    def _api_handler(self, messages, model_items=None, session=None, fail=False):
+        async def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if path == "/api/model":
+                return httpx.Response(200, json={"data": model_items or []})
+            if path.endswith("/message"):
+                if fail:
+                    return httpx.Response(500, json={})
+                return httpx.Response(200, json={"data": messages})
+            if path.startswith("/api/session/"):
+                return httpx.Response(200, json={"data": session or {}})
+            return httpx.Response(404, json={})
+
+        return handler
+
+    def _legacy_handler(self, messages, session=None):
+        async def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(500, json={})
+            if path.endswith("/message"):
+                return httpx.Response(200, json=messages)
+            if path == "/session":
+                return httpx.Response(200, json=[{"id": "ses_x"}])
+            if path.startswith("/session/"):
+                return httpx.Response(200, json=session or {})
+            return httpx.Response(404, json={})
+
+        return handler
+
+    _ASSISTANT = {
+        "type": "assistant",
+        "tokens": {"input": 1864, "output": 72, "cache": {"read": 113408, "write": 0}},
+    }
+
+    def test_v2_last_assistant_tokens_not_billing_cumul(self):
+        _bridge.TRANSPORT = httpx.MockTransport(self._api_handler([self._ASSISTANT]))
+        used, limit = asyncio.run(_bridge.context_usage(self.inst, "ses_abc"))
+        self.assertEqual(used, 115344)
+        self.assertIsNone(limit)
+
+    def test_v2_skips_user_item_first(self):
+        messages = [
+            {"type": "user", "tokens": {"input": 1, "output": 0}},
+            self._ASSISTANT,
+            {"type": "assistant", "tokens": {"input": 9, "output": 9}},
+        ]
+        _bridge.TRANSPORT = httpx.MockTransport(self._api_handler(messages))
+        used, _ = asyncio.run(_bridge.context_usage(self.inst, "ses_abc"))
+        self.assertEqual(used, 115344)
+
+    def test_v2_model_context_limit(self):
+        session = {"model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode-go"}}
+        models = [
+            {"id": "other", "providerID": "opencode-go", "limit": {"context": 1000}},
+            {
+                "id": "deepseek-v4.1-flash-free",
+                "providerID": "opencode-go",
+                "limit": {"context": 200000},
+            },
+        ]
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._api_handler([self._ASSISTANT], model_items=models, session=session)
+        )
+        self.assertEqual(
+            asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (115344, 200000)
+        )
+
+    def test_legacy_last_assistant(self):
+        messages = [
+            {"info": {"role": "user", "tokens": {"input": 500}}},
+            {"info": {"role": "assistant", "tokens": {"input": 9, "output": 1}}},
+            {
+                "info": {
+                    "role": "assistant",
+                    "tokens": {"input": 1864, "output": 72, "cache": {"read": 113408}},
+                }
+            },
+        ]
+        _bridge.TRANSPORT = httpx.MockTransport(self._legacy_handler(messages))
+        self.assertEqual(
+            asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (115344, None)
+        )
+
+    def test_empty_session(self):
+        _bridge.TRANSPORT = httpx.MockTransport(self._api_handler([]))
+        self.assertEqual(asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (0, None))
+
+    def test_empty_200_session_keeps_limit_without_raising(self):
+        session = {"model": {"id": "m", "providerID": "p"}}
+        models = [{"id": "m", "providerID": "p", "limit": {"context": 200000}}]
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._api_handler([], model_items=models, session=session)
+        )
+        # Session vide = 200 sans message assistant : (0, limite), jamais d'exception.
+        self.assertEqual(
+            asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (0, 200000)
+        )
+
+    def test_http_500_raises_context_unavailable(self):
+        _bridge.TRANSPORT = httpx.MockTransport(self._api_handler([], fail=True))
+        with self.assertRaises(_bridge.ContextUnavailable):
+            asyncio.run(_bridge.context_usage(self.inst, "ses_abc"))
+
+    def test_http_error_returns_zero_without_raising(self):
+        # context_usage lève ; get_session_context_tokens, lui, ne lève jamais.
+        _bridge.TRANSPORT = httpx.MockTransport(self._api_handler([], fail=True))
+        self.assertEqual(
+            asyncio.run(_bridge.get_session_context_tokens(self.inst, "ses_abc")), 0
+        )
+
+    def test_model_limit_failure_not_cached(self):
+        calls = {"n": 0}
+
+        async def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if path == "/api/model":
+                calls["n"] += 1
+                return httpx.Response(500, json={})
+            return httpx.Response(404, json={})
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        self.assertIsNone(asyncio.run(_bridge.model_context_limit(self.inst, "p", "m")))
+        self.assertIsNone(asyncio.run(_bridge.model_context_limit(self.inst, "p", "m")))
+        # Un échec ne doit pas être mémorisé : la 2e requête repart sur le réseau.
+        self.assertEqual(calls["n"], 2)
+
+    def test_model_limit_success_is_cached(self):
+        calls = {"n": 0}
+        models = [{"id": "m", "providerID": "p", "limit": {"context": 200000}}]
+
+        async def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if path == "/api/model":
+                calls["n"] += 1
+                return httpx.Response(200, json={"data": models})
+            return httpx.Response(404, json={})
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        self.assertEqual(asyncio.run(_bridge.model_context_limit(self.inst, "p", "m")), 200000)
+        self.assertEqual(asyncio.run(_bridge.model_context_limit(self.inst, "p", "m")), 200000)
+        self.assertEqual(calls["n"], 1)
+
+    def test_fmt_ctx_with_limit(self):
+        self.assertEqual(_bridge._fmt_ctx(115344, 200000), "115K/200K (57%)")
+
+
+class StatusContextTests(unittest.TestCase):
+    """En-tête et /status : panne (ctx ?) vs session vide, plus le cumul facturé."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg = _bridge.TELEGRAM_TRANSPORT
+        self._saved_state = _bridge.state
+        self._saved_kind = dict(_bridge._KIND_CACHE)
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._KIND_CACHE.clear()
+        _bridge._CTX_LIMIT_CACHE.clear()
+        self._cid = "4242"
+        _bridge.state = {
+            self._cid: {"current": {"instance": "v1", "sid": "ses_ctx"}, "agent": "build"}
+        }
+        self.tg_bodies = []
+
+        def tg_handler(request):
+            self.tg_bodies.append(request.content.decode("utf-8", "replace"))
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind)
+        _bridge._CTX_LIMIT_CACHE.clear()
+
+    def _handler(self, message_code=200, messages=None, model_items=None, session=None):
+        async def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if path == "/api/model":
+                return httpx.Response(200, json={"data": model_items or []})
+            if path.endswith("/message"):
+                return httpx.Response(message_code, json={"data": messages or []})
+            if path.startswith("/api/session/"):
+                return httpx.Response(200, json={"data": session or {}})
+            return httpx.Response(404, json={})
+
+        return handler
+
+    def test_header_shows_question_mark_on_500(self):
+        _bridge.TRANSPORT = httpx.MockTransport(self._handler(message_code=500))
+        header = asyncio.run(_bridge._status_header(int(self._cid)))
+        self.assertIn("ctx ?", header)
+
+    def test_header_empty_session_with_limit(self):
+        session = {"model": {"id": "m", "providerID": "p"}}
+        models = [{"id": "m", "providerID": "p", "limit": {"context": 200000}}]
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler(model_items=models, session=session)
+        )
+        header = asyncio.run(_bridge._status_header(int(self._cid)))
+        self.assertIn("ctx 0/200K (0%)", header)
+
+    def test_status_shows_billing_cumul(self):
+        session = {
+            "model": {"id": "m", "providerID": "p"},
+            "tokens": {
+                "input": 1278997,
+                "output": 86692,
+                "cache": {"read": 14912640},
+            },
+            "cost": 0.31,
+        }
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler(
+                messages=[{"type": "assistant", "tokens": {"input": 10, "output": 2}}],
+                session=session,
+            )
+        )
+        asyncio.run(_bridge.handle_status(int(self._cid)))
+        sent = " ".join(self.tg_bodies)
+        self.assertIn("cumul 1.4M", sent)
+        self.assertIn("cache 14.9M", sent)
+        self.assertIn("$0.31", sent)
+        self.assertIn("ctx", sent)
+
+    def test_status_without_billing_fields_adds_no_line(self):
+        session = {"model": {"id": "m", "providerID": "p"}}
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler(
+                messages=[{"type": "assistant", "tokens": {"input": 10, "output": 2}}],
+                session=session,
+            )
+        )
+        asyncio.run(_bridge.handle_status(int(self._cid)))
+        sent = " ".join(self.tg_bodies)
+        self.assertNotIn("cumul", sent)
+        self.assertNotIn("$", sent)
+
+
+class SessionTitleTests(unittest.TestCase):
+    """Titre de session : en-tête, /status et titrage automatique (v1 et v2)."""
+
+    SID = "ses_title_1234"
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_tg = _bridge.TELEGRAM_TRANSPORT
+        self._saved_state = _bridge.state
+        self._saved_kind = dict(_bridge._KIND_CACHE)
+        self._saved_instances = _bridge._INSTANCES
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._INSTANCES = None
+        _bridge._KIND_CACHE.clear()
+        _bridge._CTX_LIMIT_CACHE.clear()
+        self._cid = "5151"
+        _bridge.state = {
+            self._cid: {
+                "current": {"instance": "v2", "sid": self.SID},
+                "agent": "build",
+            }
+        }
+        self.requests = []
+        self.tg_bodies = []
+
+        def tg_handler(request):
+            self.tg_bodies.append(request.content.decode("utf-8", "replace"))
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(tg_handler)
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.TELEGRAM_TRANSPORT = self._saved_tg
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind)
+        _bridge._INSTANCES = self._saved_instances
+        _bridge._CTX_LIMIT_CACHE.clear()
+
+    def _handler(self, session, kind="api"):
+        async def handler(request):
+            path = request.url.path
+            self.requests.append((request.method, path, request.content))
+            if kind == "api":
+                if path == "/api/session":
+                    return httpx.Response(200, json={"data": []})
+                if path == "/api/model":
+                    return httpx.Response(200, json={"data": []})
+                if path.endswith("/message"):
+                    return httpx.Response(200, json={"data": []})
+                if path.startswith("/api/session/"):
+                    if request.method == "PATCH":
+                        return httpx.Response(200, json={"data": {}})
+                    return httpx.Response(200, json={"data": session})
+                return httpx.Response(404, json={})
+            # legacy (v1)
+            if path == "/api/session":
+                return httpx.Response(404, json={})
+            if path == "/session":
+                return httpx.Response(200, json=[{"id": self.SID}])
+            if path.endswith("/message"):
+                return httpx.Response(200, json=[])
+            if path.startswith("/session/"):
+                if request.method == "PATCH":
+                    return httpx.Response(200, json={})
+                return httpx.Response(200, json=session)
+            return httpx.Response(404, json={})
+
+        return handler
+
+    def _patches(self):
+        return [r for r in self.requests if r[0] == "PATCH"]
+
+    # 1) le titre de l'API apparaît dans l'en-tête, en v2 comme en v1
+    def test_header_contains_title_v2(self):
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler({"id": self.SID, "title": "Mon chantier"}, kind="api")
+        )
+        header = asyncio.run(_bridge._status_header(int(self._cid)))
+        self.assertIn("Mon chantier", header)
+        self.assertNotIn("None", header)
+
+    def test_header_contains_title_v1(self):
+        _bridge.state[self._cid]["current"]["instance"] = "v1"
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler({"id": self.SID, "title": "Mon chantier"}, kind="legacy")
+        )
+        header = asyncio.run(_bridge._status_header(int(self._cid)))
+        self.assertIn("Mon chantier", header)
+        self.assertNotIn("None", header)
+
+    # 2) pas de titre : repli sur les 12 premiers caractères du sid, sans exception
+    def test_header_falls_back_to_sid_when_no_title(self):
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler({"id": self.SID, "title": None}, kind="api")
+        )
+        header = asyncio.run(_bridge._status_header(int(self._cid)))
+        self.assertIn(self.SID[:12], header)
+        self.assertNotIn("None", header)
+
+    # 3) session encore « New session … » : le pont PATCH le titre
+    def test_ensure_session_titled_patches_new_session(self):
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler({"id": self.SID, "title": "New session - 2026-11-01"}, kind="api")
+        )
+        asyncio.run(
+            _bridge.ensure_session_titled(self._cid, self.SID, "Mon premier message")
+        )
+        patches = self._patches()
+        self.assertEqual(len(patches), 1)
+        body = patches[0][2].decode("utf-8")
+        self.assertIn("Mon premier message", body)
+        self.assertIn(self.SID, _bridge.state[self._cid]["titled"])
+
+    def test_ensure_session_titled_skips_already_titled(self):
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler({"id": self.SID, "title": "Mon chantier"}, kind="api")
+        )
+        asyncio.run(
+            _bridge.ensure_session_titled(self._cid, self.SID, "Mon premier message")
+        )
+        self.assertEqual(self._patches(), [])
+        self.assertIn(self.SID, _bridge.state[self._cid]["titled"])
+
+    # 4) /status affiche le titre
+    def test_handle_status_shows_title(self):
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._handler({"id": self.SID, "title": "Mon chantier"}, kind="api")
+        )
+        asyncio.run(_bridge.handle_status(int(self._cid)))
+        sent = " ".join(self.tg_bodies)
+        self.assertIn("Mon chantier", sent)
+
+
+class CommandsApiTests(unittest.TestCase):
+    """Socle bas niveau des commandes serveur : liste, exécution, compactage et
+    polling robuste (baseline). Aucun routage Telegram : les fonctions sont
+    appelées directement, tout le réseau passe par TRANSPORT (MockTransport)."""
+
+    SID = "ses_cmd_1"
+
+    def setUp(self):
+        self._saved_transport = _bridge.TRANSPORT
+        self._saved_kind = dict(_bridge._KIND_CACHE)
+        self._saved_cmds = dict(_bridge._COMMANDS_CACHE)
+        self._saved_state = _bridge.state
+        _bridge._KIND_CACHE.clear()
+        _bridge._COMMANDS_CACHE.clear()
+        self.requests = []
+        self.inst_v2 = {"name": "t2-api", "url": "http://v2.test", "auth": "", "kind": "api"}
+        self.inst_v1 = {"name": "t2-legacy", "url": "http://v1.test", "auth": "", "kind": "legacy"}
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved_transport
+        _bridge.state = self._saved_state
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved_kind)
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._COMMANDS_CACHE.update(self._saved_cmds)
+
+    # --- helpers ---------------------------------------------------------
+    def _transport(self, handler):
+        def wrapped(request):
+            self.requests.append((request.method, request.url.path, request.content))
+            return handler(request)
+
+        _bridge.TRANSPORT = httpx.MockTransport(wrapped)
+
+    @staticmethod
+    def _assistant(msg_id, text):
+        return {
+            "id": msg_id,
+            "type": "assistant",
+            "agent": "build",
+            "content": [{"type": "text", "text": text}],
+        }
+
+    def _count(self, path, method=None):
+        return len([
+            r for r in self.requests
+            if r[1] == path and (method is None or r[0] == method)
+        ])
+
+    @staticmethod
+    def _json_body(raw):
+        return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+
+    @staticmethod
+    def _noop_sleep():
+        async def _sleep(_seconds):
+            return None
+
+        return patch.object(_bridge.asyncio, "sleep", _sleep)
+
+    # 1) v2 : POST attendu, puis texte de la NOUVELLE réponse
+    def test_command_v2_posts_and_returns_new_text(self):
+        state = {"posted": False}
+
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                if not state["posted"]:
+                    return httpx.Response(
+                        200, json={"data": [self._assistant("msg_old", "ancienne réponse")]}
+                    )
+                return httpx.Response(
+                    200, json={"data": [self._assistant("msg_new", "nouvelle réponse")]}
+                )
+            if request.method == "POST" and path == f"/api/session/{self.SID}/command":
+                state["posted"] = True
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        self._transport(handler)
+        out = asyncio.run(
+            _bridge.cli_command(self.inst_v2, self.SID, "orch", "mon chantier", agent="build")
+        )
+        self.assertEqual(out, "nouvelle réponse")
+        posts = [r for r in self.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1], f"/api/session/{self.SID}/command")
+        body = self._json_body(posts[0][2])
+        self.assertEqual(body["name"], "orch")
+        self.assertEqual(body["text"], "mon chantier")
+        self.assertEqual(body["agents"], [{"name": "build"}])
+
+    # 2) course : le 1er poll renvoie encore la baseline ⇒ on attend le nouveau tour
+    def test_command_v2_waits_for_new_turn_not_previous(self):
+        state = {"posted": False, "polls": 0}
+
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                if not state["posted"]:
+                    return httpx.Response(
+                        200, json={"data": [self._assistant("msg_old", "ancienne réponse")]}
+                    )
+                state["polls"] += 1
+                if state["polls"] == 1:
+                    # le nouveau tour n'a pas démarré : baseline toujours en tête
+                    return httpx.Response(
+                        200, json={"data": [self._assistant("msg_old", "ancienne réponse")]}
+                    )
+                if state["polls"] == 2:
+                    # nouveau tour démarré mais pas encore de texte : ne PAS renvoyer
+                    # l'ancienne réponse qui traîne plus bas dans la liste
+                    return httpx.Response(
+                        200,
+                        json={
+                            "data": [
+                                {
+                                    "id": "msg_new",
+                                    "type": "assistant",
+                                    "content": [{"type": "step-start"}],
+                                },
+                                self._assistant("msg_old", "ancienne réponse"),
+                            ]
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            self._assistant("msg_new", "nouvelle réponse"),
+                            self._assistant("msg_old", "ancienne réponse"),
+                        ]
+                    },
+                )
+            if request.method == "POST" and path == f"/api/session/{self.SID}/command":
+                state["posted"] = True
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        self._transport(handler)
+        with self._noop_sleep():
+            out = asyncio.run(_bridge.cli_command(self.inst_v2, self.SID, "orch"))
+        self.assertEqual(out, "nouvelle réponse")
+        self.assertEqual(state["polls"], 3)
+        # Sans agent fourni, le corps du POST ne doit pas contenir de clé "agents"
+        posts = [r for r in self.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        body = self._json_body(posts[0][2])
+        self.assertNotIn("agents", body)
+        self.assertEqual(body, {"name": "orch", "text": ""})
+
+    # 3) 400 CommandNotFoundError ⇒ CommandNotFound(.command)
+    def test_command_v2_400_command_not_found(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path.endswith("/message"):
+                return httpx.Response(
+                    200, json={"data": [self._assistant("msg_old", "ancien")]}
+                )
+            if request.method == "POST" and path == f"/api/session/{self.SID}/command":
+                return httpx.Response(
+                    400, json={"_tag": "CommandNotFoundError", "command": "nope"}
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        with self.assertRaises(_bridge.CommandNotFound) as ctx:
+            asyncio.run(_bridge.cli_command(self.inst_v2, self.SID, "nope"))
+        self.assertEqual(ctx.exception.command, "nope")
+
+    # 4) v1 : réponse synchrone, parts[] text concaténés
+    def test_command_v1_synchronous_parts(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(404)
+            if request.method == "GET" and path == "/session":
+                return httpx.Response(200, json=[{"id": self.SID}])
+            if request.method == "POST" and path == f"/session/{self.SID}/command":
+                return httpx.Response(
+                    200,
+                    json={
+                        "info": {"id": "msg_1"},
+                        "parts": [
+                            {"type": "text", "text": "ligne 1"},
+                            {"type": "tool", "text": "ignoré"},
+                            {"type": "text", "text": "ligne 2"},
+                        ],
+                    },
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        out = asyncio.run(
+            _bridge.cli_command(self.inst_v1, self.SID, "orch", "a b", agent="build")
+        )
+        self.assertEqual(out, "ligne 1\nligne 2")
+        posts = [r for r in self.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1], f"/session/{self.SID}/command")
+        self.assertEqual(
+            self._json_body(posts[0][2]),
+            {"command": "orch", "arguments": "a b", "agent": "build"},
+        )
+
+    # 5) v2 : filtre des entrées sans nom + cache 300 s + force
+    def test_commands_list_v2_cache_and_force(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == "/api/command":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"name": "init", "description": "Initialiser"},
+                            {"name": "orch", "description": "Lancer un chantier"},
+                            {"description": "sans nom"},
+                            {"name": "", "description": "nom vide"},
+                        ]
+                    },
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        first = asyncio.run(_bridge.cli_commands_list(self.inst_v2))
+        self.assertEqual([c["name"] for c in first], ["init", "orch"])
+        self.assertEqual(first[0]["description"], "Initialiser")
+        # Le succès est bien mis en cache
+        self.assertIn("t2-api", _bridge._COMMANDS_CACHE)
+        second = asyncio.run(_bridge.cli_commands_list(self.inst_v2))
+        self.assertEqual(second, first)
+        self.assertEqual(self._count("/api/command"), 1)
+        forced = asyncio.run(_bridge.cli_commands_list(self.inst_v2, force=True))
+        self.assertEqual(len(forced), 2)
+        self.assertEqual(self._count("/api/command"), 2)
+
+    # 5bis) v2 : un 500 ne doit PAS empoisonner le cache 300 s
+    def test_commands_list_v2_error_not_cached(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == "/api/command":
+                return httpx.Response(500, json={"error": "boom"})
+            return httpx.Response(404)
+
+        self._transport(handler)
+        self.assertEqual(asyncio.run(_bridge.cli_commands_list(self.inst_v2)), [])
+        self.assertNotIn("t2-api", _bridge._COMMANDS_CACHE)
+        # Le second appel refait la requête (pas de cache négatif)
+        self.assertEqual(asyncio.run(_bridge.cli_commands_list(self.inst_v2)), [])
+        self.assertEqual(self._count("/api/command"), 2)
+
+    # 6) v1 : liste vide, aucune requête
+    def test_commands_list_v1_empty_without_request(self):
+        _bridge._KIND_CACHE["t2-legacy"] = "legacy"
+
+        def handler(request):
+            return httpx.Response(500)
+
+        self._transport(handler)
+        out = asyncio.run(_bridge.cli_commands_list(self.inst_v1))
+        self.assertEqual(out, [])
+        self.assertEqual(self.requests, [])
+
+    # 7) v2 : POST compact puis running → completed
+    def test_compact_v2_running_then_completed(self):
+        state = {"polls": 0}
+
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "POST" and path == f"/api/session/{self.SID}/compact":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "id": "msg_comp",
+                            "type": "compaction",
+                            "status": "running",
+                            "reason": "manual",
+                        }
+                    },
+                )
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                state["polls"] += 1
+                status = "running" if state["polls"] == 1 else "completed"
+                return httpx.Response(
+                    200, json={"data": [{"id": "msg_comp", "type": "compaction", "status": status}]}
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        with self._noop_sleep():
+            out = asyncio.run(_bridge.cli_compact(self.inst_v2, self.SID))
+        self.assertEqual(out, "completed")
+        self.assertEqual(self._count(f"/api/session/{self.SID}/compact", "POST"), 1)
+
+    def test_compact_v2_failed(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "POST" and path == f"/api/session/{self.SID}/compact":
+                return httpx.Response(200, json={"data": {"id": "msg_comp", "status": "running"}})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                return httpx.Response(
+                    200, json={"data": [{"id": "msg_comp", "type": "compaction", "status": "failed"}]}
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        with self._noop_sleep():
+            out = asyncio.run(_bridge.cli_compact(self.inst_v2, self.SID))
+        self.assertEqual(out, "failed")
+
+    # 8) v1 : summarize avec les ids du modèle ; absent ⇒ unsupported sans POST
+    def test_compact_v1_summarize_with_model_ids(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(404)
+            if request.method == "GET" and path == "/session":
+                return httpx.Response(200, json=[{"id": self.SID}])
+            if request.method == "GET" and path == f"/session/{self.SID}":
+                return httpx.Response(
+                    200, json={"id": self.SID, "model": {"providerID": "prov", "id": "mod"}}
+                )
+            if request.method == "POST" and path == f"/session/{self.SID}/summarize":
+                return httpx.Response(200, json=True)
+            return httpx.Response(404)
+
+        self._transport(handler)
+        out = asyncio.run(_bridge.cli_compact(self.inst_v1, self.SID))
+        self.assertEqual(out, "completed")
+        posts = [r for r in self.requests if r[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1], f"/session/{self.SID}/summarize")
+        self.assertEqual(
+            self._json_body(posts[0][2]), {"providerID": "prov", "modelID": "mod"}
+        )
+
+    def test_compact_v1_unsupported_without_model(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(404)
+            if request.method == "GET" and path == "/session":
+                return httpx.Response(200, json=[{"id": self.SID}])
+            if request.method == "GET" and path == f"/session/{self.SID}":
+                return httpx.Response(200, json={"id": self.SID})
+            return httpx.Response(404)
+
+        self._transport(handler)
+        out = asyncio.run(_bridge.cli_compact(self.inst_v1, self.SID))
+        self.assertEqual(out, "unsupported")
+        self.assertEqual([r for r in self.requests if r[0] == "POST"], [])
+
+    # 9) aucun nouveau message textuel ⇒ TimeoutError
+    def test_poll_api_timeout_when_no_new_text(self):
+        def handler(request):
+            return httpx.Response(
+                200, json={"data": [self._assistant("msg_old", "ancien")]}
+            )
+
+        self._transport(handler)
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                _bridge._poll_api(
+                    self.inst_v2,
+                    self.SID,
+                    baseline_id="msg_old",
+                    timeout=0.05,
+                    interval=0.01,
+                )
+            )
+
+    # 10) cli_prompt v2 fonctionne toujours après le changement de signature
+    def test_cli_prompt_v2_still_returns_new_turn(self):
+        state = {"posted": False}
+
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                if not state["posted"]:
+                    return httpx.Response(
+                        200, json={"data": [self._assistant("msg_old", "ancien")]}
+                    )
+                return httpx.Response(
+                    200, json={"data": [self._assistant("msg_new", "nouveau")]}
+                )
+            if request.method == "POST" and path == f"/api/session/{self.SID}/prompt":
+                state["posted"] = True
+                return httpx.Response(200, json={"data": {"id": "msg_x"}})
+            return httpx.Response(404)
+
+        self._transport(handler)
+        out = asyncio.run(
+            _bridge.cli_prompt(self.inst_v2, self.SID, "salut", agent="build")
+        )
+        self.assertEqual(out, "nouveau")
+
+    # 11) v2 : un 204 au POST /prompt n'est pas une erreur (2xx accepté)
+    def test_cli_prompt_v2_accepts_204(self):
+        state = {"posted": False}
+
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                if not state["posted"]:
+                    return httpx.Response(
+                        200, json={"data": [self._assistant("msg_old", "ancien")]}
+                    )
+                return httpx.Response(
+                    200, json={"data": [self._assistant("msg_new", "nouveau")]}
+                )
+            if request.method == "POST" and path == f"/api/session/{self.SID}/prompt":
+                state["posted"] = True
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        self._transport(handler)
+        out = asyncio.run(_bridge.cli_prompt(self.inst_v2, self.SID, "salut"))
+        self.assertEqual(out, "nouveau")
+
+    # 12) v2 : liste décroissante => le PREMIER assistant est le plus récent
+    def test_fetch_latest_assistant_id_v2_most_recent_first(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            self._assistant("msg_recent", "réponse récente"),
+                            self._assistant("msg_ancien", "réponse ancienne"),
+                        ]
+                    },
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        msg_id = asyncio.run(
+            _bridge._fetch_latest_assistant_message_id(self.inst_v2, self.SID)
+        )
+        self.assertEqual(msg_id, "msg_recent")
+
+    # 13) v1 : liste croissante => le DERNIER assistant (info.role) est le plus récent
+    def test_fetch_latest_assistant_id_v1_most_recent_last(self):
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == f"/session/{self.SID}/message":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"info": {"id": "msg_ancien", "role": "assistant"}, "parts": []},
+                        {"info": {"id": "msg_user", "role": "user"}, "parts": []},
+                        {"info": {"id": "msg_recent", "role": "assistant"}, "parts": []},
+                    ],
+                )
+            return httpx.Response(404)
+
+        _bridge._KIND_CACHE["t2-legacy"] = "legacy"
+        self._transport(handler)
+        msg_id = asyncio.run(
+            _bridge._fetch_latest_assistant_message_id(self.inst_v1, self.SID)
+        )
+        self.assertEqual(msg_id, "msg_recent")
+
+    # 14) v2 : _mark_latest_assistant_seen écrit l'id du message le plus récent
+    def test_mark_latest_assistant_seen_v2_uses_most_recent(self):
+        _bridge.state = {
+            "555": {
+                "current": {"instance": "t2-api", "sid": self.SID},
+                "mirror": {"last_seen_id": "msg_ancien", "seen_ids": ["msg_ancien"]},
+            }
+        }
+
+        def handler(request):
+            path = request.url.path
+            if request.method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if request.method == "GET" and path == f"/api/session/{self.SID}/message":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            self._assistant("msg_recent", "réponse récente"),
+                            self._assistant("msg_ancien", "réponse ancienne"),
+                        ]
+                    },
+                )
+            return httpx.Response(404)
+
+        self._transport(handler)
+        asyncio.run(_bridge._mark_latest_assistant_seen(555, self.inst_v2, self.SID))
+
+        mirror = _bridge.state["555"]["mirror"]
+        self.assertEqual(mirror["last_seen_id"], "msg_recent")
+        self.assertIn("msg_recent", mirror["seen_ids"])
+        # L'état persisté (STATE_FILE temporaire) pointe le même message
+        with open(_bridge.STATE_FILE) as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["555"]["mirror"]["last_seen_id"], "msg_recent")
+
+
+# ---------------------------------------------------------------------------
+# Routage des commandes slash (/compact, /cmds, /say, /<commande serveur>)
+# ---------------------------------------------------------------------------
+
+
+class SlashRoutingTests(unittest.TestCase):
+    """Une commande slash ne doit plus jamais partir comme du texte au modèle.
+    Tout le réseau passe par MockTransport et tg_send/tg_edit sont remplacés par
+    des enregistreurs en mémoire : aucun appel réel, aucune session de Marc."""
+
+    SID = "ses_slash_1"
+    CID = 4242
+    TOKENS = {"input": 1000, "output": 200, "cache": {"read": 800, "write": 0}}
+
+    def setUp(self):
+        self._saved = {
+            "transport": _bridge.TRANSPORT,
+            "kind": dict(_bridge._KIND_CACHE),
+            "cmds": dict(_bridge._COMMANDS_CACHE),
+            "state": _bridge.state,
+            "instances": _bridge._INSTANCES,
+        }
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._INSTANCES = None
+        _bridge._KIND_CACHE.clear()
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._KIND_CACHE["v2"] = "api"
+        self.requests = []
+        self.sent = []
+        self.edited = []
+        self.posted_compact = False
+        self.posted_command = False
+        self.opts = {
+            "commands": [],
+            "compact_status": None,
+            "command_response": "réponse serveur",
+        }
+        _bridge.state = {
+            str(self.CID): {
+                "current": {"instance": "v2", "sid": self.SID},
+                "agent": "build",
+                "mirror": {"last_seen_id": "msg_old", "seen_ids": ["msg_old"]},
+            }
+        }
+        self._patchers = [
+            patch.object(_bridge, "tg_send", self._fake_send),
+            patch.object(_bridge, "tg_edit", self._fake_edit),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in self._patchers:
+            patcher.stop()
+        _bridge.TRANSPORT = self._saved["transport"]
+        _bridge.state = self._saved["state"]
+        _bridge._INSTANCES = self._saved["instances"]
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved["kind"])
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._COMMANDS_CACHE.update(self._saved["cmds"])
+
+    # --- helpers ---------------------------------------------------------
+    async def _fake_send(self, chat_id, text, markdown=True):
+        self.sent.append((chat_id, text))
+        return 5000 + len(self.sent)
+
+    async def _fake_edit(self, chat_id, message_id, text, markdown=True):
+        self.edited.append((chat_id, message_id, text))
+
+    @staticmethod
+    def _assistant(msg_id, text):
+        return {
+            "id": msg_id,
+            "type": "assistant",
+            "agent": "build",
+            "content": [{"type": "text", "text": text}],
+            "tokens": SlashRoutingTests.TOKENS,
+        }
+
+    def _messages(self):
+        items = []
+        status = self.opts.get("compact_status")
+        # Le message de compactage n'existe qu'APRÈS le POST : avant, la session
+        # n'en a aucun (sinon le garde anti double-compactage le verrait "running"
+        # et refuserait un compactage pourtant légitime).
+        if status and self.posted_compact:
+            items.append(
+                {
+                    "id": "msg_comp",
+                    "type": "compaction",
+                    "status": status,
+                }
+            )
+        if self.posted_command and self.opts.get("command_response"):
+            items.append(self._assistant("msg_new", self.opts["command_response"]))
+        items.append(self._assistant("msg_old", "ancienne réponse"))
+        return items
+
+    def _install_handler(self):
+        def handler(request):
+            path, method = request.url.path, request.method
+            self.requests.append((method, path, request.content))
+            if method == "GET" and path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if method == "GET" and path == "/api/command":
+                return httpx.Response(200, json={"data": self.opts["commands"]})
+            if method == "GET" and path == f"/api/session/{self.SID}/message":
+                return httpx.Response(200, json={"data": self._messages()})
+            if method == "GET" and path == f"/api/session/{self.SID}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "id": self.SID,
+                            "title": "Session test",
+                            "model": {"id": "mod", "providerID": "prov"},
+                        }
+                    },
+                )
+            if method == "GET" and path == "/api/model":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "mod",
+                                "providerID": "prov",
+                                "limit": {"context": 200000},
+                            }
+                        ]
+                    },
+                )
+            if method == "POST" and path == f"/api/session/{self.SID}/compact":
+                if self.opts.get("compact_error"):
+                    return httpx.Response(self.opts["compact_error"], json={"error": "boom"})
+                self.posted_compact = True
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "id": "msg_comp",
+                            "type": "compaction",
+                            "status": "running",
+                        }
+                    },
+                )
+            if method == "POST" and path == f"/api/session/{self.SID}/command":
+                if self.opts.get("command_error"):
+                    return httpx.Response(
+                        self.opts["command_error"],
+                        json=self.opts.get("command_error_body") or {},
+                    )
+                self.posted_command = True
+                return httpx.Response(204)
+            if method == "PATCH":
+                return httpx.Response(200, json={})
+            return httpx.Response(404)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def _posts(self, path):
+        return [r for r in self.requests if r[0] == "POST" and r[1] == path]
+
+    @staticmethod
+    def _noop_sleep():
+        async def _sleep(_seconds):
+            return None
+
+        return patch.object(_bridge.asyncio, "sleep", _sleep)
+
+    # 1) Normalisation : casse, suffixe @bot, arguments
+    def test_split_slash(self):
+        self.assertEqual(
+            _bridge._split_slash("/Compact@opencode4578_bot  a b"), ("compact", "a b")
+        )
+        self.assertIsNone(_bridge._split_slash("bonjour"))
+        self.assertEqual(_bridge._split_slash("/cmds"), ("cmds", ""))
+
+    # 2) /compact : POST, puis ÉDITION du même message (pas un 2e envoi)
+    def test_compact_posts_and_edits_ack(self):
+        self.opts["compact_status"] = "completed"
+        self._install_handler()
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/compact"))
+
+        self.assertEqual(len(self._posts(f"/api/session/{self.SID}/compact")), 1)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("compactage", self.sent[0][1])
+        self.assertEqual(len(self.edited), 1)
+        self.assertEqual(self.edited[0][1], 5001)
+        self.assertIn("✅ compacté", self.edited[0][2])
+        self.assertIn("ctx", self.edited[0][2])
+
+    # 3) /compact en échec ⇒ édition avec ❌, rien ne remonte
+    def test_compact_failed_edits_error(self):
+        self.opts["compact_status"] = "failed"
+        self._install_handler()
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/compact"))
+
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("❌", self.edited[0][2])
+        self.assertIn("échoué", self.edited[0][2])
+
+    # 4) /orch t1 : commande listée ⇒ POST /command + édition avec la réponse
+    def test_server_command_posts_and_edits_with_response(self):
+        self.opts["commands"] = [
+            {"name": "orch", "description": "Lancer un chantier"},
+            {"name": "init", "description": "Initialiser"},
+        ]
+        self._install_handler()
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/orch t1"))
+
+        posts = self._posts(f"/api/session/{self.SID}/command")
+        self.assertEqual(len(posts), 1)
+        body = json.loads(posts[0][2].decode("utf-8"))
+        self.assertEqual(body["name"], "orch")
+        self.assertEqual(body["text"], "t1")
+        self.assertEqual(body["agents"], [{"name": "build"}])
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("réponse serveur", self.edited[0][2])
+
+    # 5) /nope : aucun POST, message « commande inconnue » + noms disponibles
+    def test_unknown_command_no_post_and_lists_names(self):
+        self.opts["commands"] = [
+            {"name": "orch", "description": "Lancer un chantier"},
+            {"name": "init", "description": "Initialiser"},
+        ]
+        self._install_handler()
+        asyncio.run(_bridge.handle_slash(self.CID, "/nope"))
+
+        self.assertEqual(self._posts(f"/api/session/{self.SID}/command"), [])
+        self.assertEqual(self.edited, [])
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertIn("commande inconnue", message)
+        self.assertIn("/orch", message)
+
+    # 6) /say <texte> : le texte part littéralement, slash compris
+    def test_say_sends_literal_text_to_model(self):
+        calls = []
+
+        async def fake_handle_message(chat_id, text):
+            calls.append((chat_id, text))
+
+        self._install_handler()
+        with patch.object(_bridge, "handle_message", fake_handle_message):
+            asyncio.run(_bridge.handle_slash(self.CID, "/say /etc/passwd"))
+
+        self.assertEqual(calls, [(self.CID, "/etc/passwd")])
+        self.assertEqual(self._posts(f"/api/session/{self.SID}/command"), [])
+
+    # 7) /status reste natif du pont : aucun POST vers /command
+    def test_native_status_not_routed(self):
+        self.opts["commands"] = [{"name": "orch", "description": "Lancer un chantier"}]
+        self._install_handler()
+        asyncio.run(_bridge.handle_slash(self.CID, "/status"))
+
+        self.assertEqual(self._posts(f"/api/session/{self.SID}/command"), [])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.edited, [])
+
+    # 8) après une commande serveur, le dernier assistant est marqué vu
+    def test_server_command_marks_latest_assistant_seen(self):
+        self.opts["commands"] = [{"name": "orch", "description": "Lancer un chantier"}]
+        self._install_handler()
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/orch t1"))
+
+        mirror = _bridge.state[str(self.CID)]["mirror"]
+        self.assertEqual(mirror["last_seen_id"], "msg_new")
+        self.assertIn("msg_new", mirror["seen_ids"])
+
+    # 9) course liste/POST : CommandNotFound ⇒ message clair, pas d'exception
+    def test_command_not_found_race_message(self):
+        self.opts["commands"] = [{"name": "orch", "description": "Lancer un chantier"}]
+        self.opts["command_error"] = 400
+        self.opts["command_error_body"] = {
+            "_tag": "CommandNotFoundError",
+            "command": "orch",
+        }
+        self._install_handler()
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/orch t1"))
+
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("commande inconnue côté OpenCode", self.edited[0][2])
+
+    # 10) /compact sur erreur HTTP : ❌ édité, aucune exception ne remonte
+    def test_compact_http_error_is_reported_not_raised(self):
+        self.opts["compact_error"] = 500
+        self._install_handler()
+        asyncio.run(_bridge.handle_slash(self.CID, "/compact"))
+
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("❌", self.edited[0][2])
+        self.assertIn("500", self.edited[0][2])
+
+
+# ---------------------------------------------------------------------------
+# Autorisation à la racine (boucle de polling) et forme /<native>@bot
+# ---------------------------------------------------------------------------
+
+
+class _PollStop(BaseException):
+    """Sentinelle de test : sort de la boucle infinie de main() sans la mimer."""
+
+
+class RootAuthorizationTests(unittest.TestCase):
+    """Le garde d'autorisation est évalué dans main(), AVANT toute interception :
+    un chat inconnu ne peut ni lancer /orch ni inscrire un sid via /sessions ; les
+    commandes natives fonctionnent avec le suffixe @bot des groupes."""
+
+    CID_AUTH = 4242
+    CID_FOREIGN = 666
+    SID = "ses_root_1"
+
+    def setUp(self):
+        self._saved = {
+            "transport": _bridge.TRANSPORT,
+            "tg": _bridge.TELEGRAM_TRANSPORT,
+            "poll": _bridge.POLL_TRANSPORT,
+            "kind": dict(_bridge._KIND_CACHE),
+            "cmds": dict(_bridge._COMMANDS_CACHE),
+            "state": _bridge.state,
+            "instances": _bridge._INSTANCES,
+            "auth_env": os.environ.get("AUTHORIZED_CHAT_IDS"),
+        }
+        os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._INSTANCES = None
+        _bridge._KIND_CACHE.clear()
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._KIND_CACHE["v2"] = "api"
+        self.api_requests = []
+        self.sent = []
+        # Seul CID_AUTH est présent dans l'état -> seul chat autorisé (repli).
+        _bridge.state = {
+            str(self.CID_AUTH): {
+                "current": {"instance": "v2", "sid": self.SID},
+                "agent": "build",
+                "mirror": {"last_seen_id": "msg_old", "seen_ids": ["msg_old"]},
+            }
+        }
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved["transport"]
+        _bridge.TELEGRAM_TRANSPORT = self._saved["tg"]
+        _bridge.POLL_TRANSPORT = self._saved["poll"]
+        _bridge.state = self._saved["state"]
+        _bridge._INSTANCES = self._saved["instances"]
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved["kind"])
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._COMMANDS_CACHE.update(self._saved["cmds"])
+        if self._saved["auth_env"] is None:
+            os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        else:
+            os.environ["AUTHORIZED_CHAT_IDS"] = self._saved["auth_env"]
+
+    # --- helpers ---------------------------------------------------------
+    def _opencode_handler(self, request):
+        path, method = request.url.path, request.method
+        self.api_requests.append((method, path, request.content))
+        if method == "GET" and path == "/api/session":
+            return httpx.Response(200, json={"data": []})
+        if method == "GET" and path == "/api/command":
+            return httpx.Response(
+                200, json={"data": [{"name": "orch", "description": "Lancer un chantier"}]}
+            )
+        if method == "GET" and path == f"/api/session/{self.SID}/message":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "msg_old",
+                            "type": "assistant",
+                            "content": [{"type": "text", "text": "ancienne réponse"}],
+                            "tokens": {"input": 1000, "output": 200},
+                        }
+                    ]
+                },
+            )
+        if method == "GET" and path == f"/api/session/{self.SID}":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": self.SID,
+                        "title": "Session test",
+                        "model": {"id": "mod", "providerID": "prov"},
+                    }
+                },
+            )
+        if method == "GET" and path == "/api/model":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "mod", "providerID": "prov", "limit": {"context": 200000}}
+                    ]
+                },
+            )
+        if method == "POST" and path == f"/api/session/{self.SID}/command":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    def _tg_handler(self, request):
+        payload = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if "sendMessage" in str(request.url) or "editMessageText" in str(request.url):
+            self.sent.append(payload.get("text", ""))
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+        return httpx.Response(200, json={"ok": True})
+
+    def _run_main(self, updates):
+        """Fait tourner le vrai main() le temps d'un lot d'updates, puis l'arrête."""
+        polls = {"n": 0}
+
+        def poll_handler(request):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return httpx.Response(200, json={"ok": True, "result": updates})
+            raise _PollStop()
+
+        _bridge.POLL_TRANSPORT = httpx.MockTransport(poll_handler)
+        _bridge.TRANSPORT = httpx.MockTransport(self._opencode_handler)
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(self._tg_handler)
+        with self.assertRaises(_PollStop):
+            asyncio.run(_bridge.main())
+
+    # 1) chat non autorisé + /orch x : aucune requête OpenCode, un seul refus
+    def test_unauthorized_orch_makes_no_api_call(self):
+        slash_calls = []
+
+        async def fake_handle_slash(chat_id, text):
+            slash_calls.append((chat_id, text))
+
+        with patch.object(_bridge, "handle_slash", fake_handle_slash):
+            self._run_main(
+                [
+                    {
+                        "update_id": 1,
+                        "message": {"chat": {"id": self.CID_FOREIGN}, "text": "/orch x"},
+                    }
+                ]
+            )
+        self.assertEqual(slash_calls, [], "le garde de main() passe AVANT le routage slash")
+        self.assertEqual(self.api_requests, [], "aucun appel ne doit partir vers OpenCode")
+        self.assertEqual(len(self.sent), 1, "un seul message : le refus")
+        self.assertIn("⛔", self.sent[0])
+
+    # 2) chat non autorisé + /sessions : preuve que le garde est en amont du handler
+    def test_unauthorized_sessions_never_lists(self):
+        self._run_main(
+            [{"update_id": 2, "message": {"chat": {"id": self.CID_FOREIGN}, "text": "/sessions"}}]
+        )
+        self.assertEqual(
+            [r for r in self.api_requests if r[1] == "/api/session"],
+            [],
+            "/sessions ne doit jamais interroger l'API pour un chat inconnu",
+        )
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("⛔", self.sent[0])
+
+    # 3) chat autorisé + /status : comportement inchangé
+    def test_authorized_status_unchanged(self):
+        self._run_main(
+            [{"update_id": 3, "message": {"chat": {"id": self.CID_AUTH}, "text": "/status"}}]
+        )
+        self.assertEqual(
+            [r for r in self.api_requests if r[0] == "POST" and r[1].endswith("/command")], []
+        )
+        text = " ".join(self.sent)
+        self.assertIn("[v2]", text)
+        self.assertIn("Session :", text)
+
+    # 4) /status@opencode4578_bot (groupes) exécute bien la commande native
+    def test_native_command_with_bot_suffix_executes(self):
+        self._run_main(
+            [
+                {
+                    "update_id": 4,
+                    "message": {
+                        "chat": {"id": self.CID_AUTH},
+                        "text": "/status@opencode4578_bot",
+                    },
+                }
+            ]
+        )
+        self.assertEqual(
+            [r for r in self.api_requests if r[0] == "POST" and r[1].endswith("/command")],
+            [],
+            "la forme @bot ne doit pas être routée comme une commande serveur",
+        )
+        text = " ".join(self.sent)
+        self.assertIn("[v2]", text)
+        self.assertIn("Session :", text)
+
+
+# ---------------------------------------------------------------------------
+# /compact marque vu, /cmds et /say sans session, garde de handle_slash
+# ---------------------------------------------------------------------------
+
+
+class SlashGuardTests(unittest.TestCase):
+    """Défense en profondeur de handle_slash, /compact marqué vu, commandes qui
+    ne dépendent pas d'une session active."""
+
+    CID = 4242
+    SID = "ses_c"
+
+    def setUp(self):
+        self._saved = {
+            "transport": _bridge.TRANSPORT,
+            "tg_send": _bridge.tg_send,
+            "tg_edit": _bridge.tg_edit,
+            "kind": dict(_bridge._KIND_CACHE),
+            "cmds": dict(_bridge._COMMANDS_CACHE),
+            "state": _bridge.state,
+            "instances": _bridge._INSTANCES,
+            "auth_env": os.environ.get("AUTHORIZED_CHAT_IDS"),
+        }
+        os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._INSTANCES = None
+        _bridge._KIND_CACHE.clear()
+        _bridge._COMMANDS_CACHE.clear()
+        self.api_requests = []
+        self.sent = []
+        self.edited = []
+        _bridge.state = {str(self.CID): {"agent": "build"}}
+
+        async def fake_send(chat_id, text, markdown=True):
+            self.sent.append((chat_id, text))
+            return 5000 + len(self.sent)
+
+        async def fake_edit(chat_id, message_id, text, markdown=True):
+            self.edited.append((chat_id, message_id, text))
+
+        _bridge.tg_send = fake_send
+        _bridge.tg_edit = fake_edit
+        self._install(lambda request: httpx.Response(404))
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved["transport"]
+        _bridge.tg_send = self._saved["tg_send"]
+        _bridge.tg_edit = self._saved["tg_edit"]
+        _bridge.state = self._saved["state"]
+        _bridge._INSTANCES = self._saved["instances"]
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved["kind"])
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._COMMANDS_CACHE.update(self._saved["cmds"])
+        if self._saved["auth_env"] is None:
+            os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        else:
+            os.environ["AUTHORIZED_CHAT_IDS"] = self._saved["auth_env"]
+
+    def _install(self, handler):
+        def wrapped(request):
+            self.api_requests.append((request.method, request.url.path))
+            return handler(request)
+
+        _bridge.TRANSPORT = httpx.MockTransport(wrapped)
+
+    # 5) cli_compact -> "completed" ⇒ le dernier assistant est marqué vu
+    def test_compact_completed_marks_latest_assistant_seen(self):
+        _bridge.state = {
+            str(self.CID): {
+                "current": {"instance": "v2", "sid": self.SID},
+                "agent": "build",
+            }
+        }
+        marked = []
+
+        async def fake_mark(chat_id, inst, sid):
+            marked.append((chat_id, inst.get("name"), sid))
+
+        async def fake_compact(inst, sid):
+            return "completed"
+
+        with patch.object(_bridge, "cli_compact", fake_compact), patch.object(
+            _bridge, "_mark_latest_assistant_seen", fake_mark
+        ):
+            asyncio.run(_bridge.handle_slash(self.CID, "/compact"))
+
+        self.assertEqual(marked, [(self.CID, "v2", self.SID)])
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("✅ compacté", self.edited[0][2])
+
+    # 6) /cmds sans session courante : la liste est renvoyée quand même
+    def test_cmds_without_current_session_lists_commands(self):
+        _bridge._KIND_CACHE["v1"] = "api"
+
+        def handler(request):
+            if request.method == "GET" and request.url.path == "/api/command":
+                return httpx.Response(
+                    200, json={"data": [{"name": "orch", "description": "Lancer un chantier"}]}
+                )
+            return httpx.Response(404)
+
+        self._install(handler)
+        asyncio.run(_bridge.handle_slash(self.CID, "/cmds"))
+
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertIn("Commandes du pont", message)
+        self.assertIn("/orch", message)
+        self.assertNotIn("aucune session active", message)
+
+    # 7) /say bonjour sans session : délégué à handle_message, aucun refus
+    def test_say_without_current_session_delegates(self):
+        calls = []
+
+        async def fake_handle_message(chat_id, text):
+            calls.append((chat_id, text))
+
+        with patch.object(_bridge, "handle_message", fake_handle_message):
+            asyncio.run(_bridge.handle_slash(self.CID, "/say bonjour"))
+
+        self.assertEqual(calls, [(self.CID, "bonjour")])
+        self.assertEqual(self.sent, [], "aucun message de refus")
+
+    # 8) /say vide : message d'usage, handle_message jamais appelé
+    def test_say_empty_shows_usage_without_calling_model(self):
+        calls = []
+
+        async def fake_handle_message(chat_id, text):
+            calls.append((chat_id, text))
+
+        with patch.object(_bridge, "handle_message", fake_handle_message):
+            asyncio.run(_bridge.handle_slash(self.CID, "/say"))
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Usage", self.sent[0][1])
+
+    # 9) défense en profondeur : handle_slash refuse aussi un chat inconnu
+    def test_handle_slash_refuses_unauthorized_chat(self):
+        _bridge.state = {}  # aucun chat dans l'état, aucune variable d'env
+        asyncio.run(_bridge.handle_slash(self.CID, "/orch x"))
+
+        self.assertEqual(self.api_requests, [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("⛔", self.sent[0][1])
+
+
+class InterruptAndCompactGuardTests(unittest.TestCase):
+    """Garde-fous : /stop (alias /esc) et refus d'un second compactage.
+    MockTransport + tg_send/tg_edit remplacés : aucun appel réel, aucune session
+    de Marc, état sur STATE_FILE temporaire."""
+
+    CID = 5151
+    SID = "ses_stop_1"
+
+    def setUp(self):
+        self._saved = {
+            "transport": _bridge.TRANSPORT,
+            "tg_send": _bridge.tg_send,
+            "tg_edit": _bridge.tg_edit,
+            "kind": dict(_bridge._KIND_CACHE),
+            "cmds": dict(_bridge._COMMANDS_CACHE),
+            "state": _bridge.state,
+            "instances": _bridge._INSTANCES,
+            "auth_env": os.environ.get("AUTHORIZED_CHAT_IDS"),
+        }
+        os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._INSTANCES = None
+        _bridge._KIND_CACHE.clear()
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._KIND_CACHE["v2"] = "api"
+        self.requests = []
+        self.sent = []
+        self.edited = []
+        self.interrupt_code = 200
+        self.compaction_running = False
+        self.compact_posted = False
+        _bridge.state = {
+            str(self.CID): {
+                "current": {"instance": "v2", "sid": self.SID},
+                "agent": "build",
+            }
+        }
+
+        async def fake_send(chat_id, text, markdown=True):
+            self.sent.append((chat_id, text))
+            return 5000 + len(self.sent)
+
+        async def fake_edit(chat_id, message_id, text, markdown=True):
+            self.edited.append((chat_id, message_id, text))
+
+        _bridge.tg_send = fake_send
+        _bridge.tg_edit = fake_edit
+        self._install_api()
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved["transport"]
+        _bridge.tg_send = self._saved["tg_send"]
+        _bridge.tg_edit = self._saved["tg_edit"]
+        _bridge.state = self._saved["state"]
+        _bridge._INSTANCES = self._saved["instances"]
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved["kind"])
+        _bridge._COMMANDS_CACHE.clear()
+        _bridge._COMMANDS_CACHE.update(self._saved["cmds"])
+        if self._saved["auth_env"] is None:
+            os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        else:
+            os.environ["AUTHORIZED_CHAT_IDS"] = self._saved["auth_env"]
+
+    # --- helpers ---------------------------------------------------------
+    def _install_api(self):
+        def handler(request):
+            path, method = request.url.path, request.method
+            self.requests.append((method, path, request.content))
+            if method == "GET" and path == f"/api/session/{self.SID}/message":
+                items = []
+                if self.compaction_running:
+                    items.append(
+                        {
+                            "id": "msg_comp_running",
+                            "type": "compaction",
+                            "status": "running",
+                        }
+                    )
+                if self.compact_posted:
+                    items.append(
+                        {"id": "msg_comp", "type": "compaction", "status": "completed"}
+                    )
+                items.append(
+                    {
+                        "id": "msg_a",
+                        "type": "assistant",
+                        "agent": "build",
+                        "content": [{"type": "text", "text": "réponse"}],
+                        "tokens": {
+                            "input": 1000,
+                            "output": 200,
+                            "cache": {"read": 800, "write": 0},
+                        },
+                    }
+                )
+                return httpx.Response(200, json={"data": items})
+            if method == "GET" and path == f"/api/session/{self.SID}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "id": self.SID,
+                            "title": "Session test",
+                            "model": {"id": "mod", "providerID": "prov"},
+                        }
+                    },
+                )
+            if method == "GET" and path == "/api/model":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "mod",
+                                "providerID": "prov",
+                                "limit": {"context": 200000},
+                            }
+                        ]
+                    },
+                )
+            if method == "POST" and path == f"/api/session/{self.SID}/interrupt":
+                if self.interrupt_code >= 400:
+                    return httpx.Response(self.interrupt_code, json={"error": "boom"})
+                return httpx.Response(200, json={"data": True})
+            if method == "POST" and path == f"/api/session/{self.SID}/compact":
+                self.compact_posted = True
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "id": "msg_comp",
+                            "type": "compaction",
+                            "status": "running",
+                        }
+                    },
+                )
+            return httpx.Response(404, json={})
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def _posts(self, path):
+        return [r for r in self.requests if r[0] == "POST" and r[1] == path]
+
+    @staticmethod
+    def _noop_sleep():
+        async def _sleep(_seconds):
+            return None
+
+        return patch.object(_bridge.asyncio, "sleep", _sleep)
+
+    # 1) /stop ⇒ POST interrupt + message édité « ⏹ interrompu »
+    def test_stop_posts_interrupt_and_edits(self):
+        asyncio.run(_bridge.handle_slash(self.CID, "/stop"))
+
+        posts = self._posts(f"/api/session/{self.SID}/interrupt")
+        self.assertEqual(len(posts), 1)
+        body = json.loads(posts[0][2].decode("utf-8")) if posts[0][2] else {}
+        self.assertEqual(body, {})
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("⏹", self.edited[0][2])
+        self.assertEqual(self._posts(f"/api/session/{self.SID}/command"), [])
+
+    # 2) /esc (alias) ⇒ exactement le même comportement
+    def test_esc_alias_posts_interrupt_and_edits(self):
+        asyncio.run(_bridge.handle_slash(self.CID, "/esc"))
+
+        self.assertEqual(len(self._posts(f"/api/session/{self.SID}/interrupt")), 1)
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("⏹", self.edited[0][2])
+
+    # 3) /stop sur un 500 ⇒ ❌ édité, aucune exception qui remonte
+    def test_stop_http_error_reported_not_raised(self):
+        self.interrupt_code = 500
+        asyncio.run(_bridge.handle_slash(self.CID, "/stop"))
+
+        self.assertEqual(len(self._posts(f"/api/session/{self.SID}/interrupt")), 1)
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("❌", self.edited[0][2])
+        self.assertIn("500", self.edited[0][2])
+
+    # 4) /compact alors qu'un compactage tourne ⇒ refus, aucun POST /compact
+    def test_compact_refused_when_one_already_running(self):
+        self.compaction_running = True
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/compact"))
+
+        self.assertEqual(self._posts(f"/api/session/{self.SID}/compact"), [])
+        self.assertEqual(self.edited, [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("déjà en cours", self.sent[0][1])
+
+    # 5) /compact sans compactage en cours ⇒ POST bien émis (non-régression)
+    def test_compact_posts_when_nothing_running(self):
+        with self._noop_sleep():
+            asyncio.run(_bridge.handle_slash(self.CID, "/compact"))
+
+        self.assertEqual(len(self._posts(f"/api/session/{self.SID}/compact")), 1)
+        self.assertEqual(len(self.edited), 1)
+        self.assertIn("✅ compacté", self.edited[0][2])
+
+
+class BotCommandsRegistrationTests(unittest.TestCase):
+    """setMyCommands : corps exact, échec Telegram non bloquant."""
+
+    def setUp(self):
+        self._saved_transport = _bridge.TELEGRAM_TRANSPORT
+        self.tg_requests = []
+
+    def tearDown(self):
+        _bridge.TELEGRAM_TRANSPORT = self._saved_transport
+
+    def _install(self, response_handler):
+        def handler(request):
+            self.tg_requests.append(request)
+            return response_handler(request)
+
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(handler)
+
+    # 6) corps envoyé : 12 commandes, compact + stop présents, aucun slash
+    def test_register_bot_commands_payload(self):
+        self._install(lambda r: httpx.Response(200, json={"ok": True, "result": True}))
+
+        self.assertTrue(asyncio.run(_bridge.register_bot_commands()))
+        self.assertEqual(len(self.tg_requests), 1)
+        request = self.tg_requests[0]
+        self.assertTrue(str(request.url).endswith("/setMyCommands"))
+        commands = json.loads(request.content.decode("utf-8"))["commands"]
+        self.assertEqual(len(commands), 12)
+        names = [c["command"] for c in commands]
+        self.assertIn("compact", names)
+        self.assertIn("stop", names)
+        self.assertEqual([n for n in names if n.startswith("/")], [])
+        self.assertTrue(all(c.get("description") for c in commands))
+
+    # 7) réponse Telegram en erreur ⇒ False, sans lever
+    def test_register_bot_commands_error_returns_false(self):
+        self._install(
+            lambda r: httpx.Response(
+                400, json={"ok": False, "description": "Bad Request: command list too long"}
+            )
+        )
+
+        self.assertFalse(asyncio.run(_bridge.register_bot_commands()))
+
+    # 8) /help mentionne les commandes ajoutées
+    def test_help_text_mentions_new_commands(self):
+        for name in ("stop", "compact", "cmds", "say"):
+            self.assertIn(f"/{name}", _bridge._HELP_TEXT)
 
 
 if __name__ == "__main__":

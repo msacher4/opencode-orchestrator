@@ -247,11 +247,19 @@ class GetSessionContextTokensTests(unittest.TestCase):
         _bridge._KIND_CACHE.update(self._saved_kind_cache)
 
     def _legacy_transport_with_tokens(self, input_tokens=150, output_tokens=75):
-        """Transport legacy (v1) avec session contenant tokens."""
+        """Transport legacy (v1) avec messages : dernier assistant porteur des tokens."""
         def handler(request):
             path = request.url.path
             if request.method == "GET" and path == "/session":
                 return httpx.Response(200, json=[_v1_session()])
+            if request.method == "GET" and path == "/session/ses_v1/message":
+                return httpx.Response(200, json=[
+                    {"info": {"role": "user", "tokens": {"input": 999, "output": 0}}, "parts": []},
+                    {"info": {"role": "assistant", "tokens": {
+                        "input": input_tokens, "output": output_tokens,
+                        "reasoning": 0, "cache": {"read": 10, "write": 5},
+                    }}, "parts": []},
+                ])
             if request.method == "GET" and path == "/session/ses_v1":
                 return httpx.Response(200, json={
                     "id": "ses_v1",
@@ -302,10 +310,6 @@ class GetSessionContextTokensTests(unittest.TestCase):
                 )
             if path == "/api/session/ses_v2/message":
                 _API_AUTH_STATE["msg_calls"] += 1
-                if _API_AUTH_STATE["msg_calls"] == 1:
-                    return httpx.Response(
-                        200, json={"data": [], "cursor": {"previous": None, "next": None}}
-                    )
                 return httpx.Response(
                     200,
                     json={
@@ -313,6 +317,10 @@ class GetSessionContextTokensTests(unittest.TestCase):
                             {
                                 "type": "assistant",
                                 "agent": "build",
+                                "tokens": {
+                                    "input": input_tokens, "output": output_tokens,
+                                    "reasoning": 0, "cache": {"read": 20, "write": 10},
+                                },
                                 "content": [{"type": "text", "text": "réponse v2"}],
                                 "finish": "stop",
                             }
@@ -325,18 +333,18 @@ class GetSessionContextTokensTests(unittest.TestCase):
         _bridge.TRANSPORT = httpx.MockTransport(handler)
 
     def test_legacy_tokens_from_session_object(self):
-        """v1 (legacy) : tokens = session.tokens.input + session.tokens.output."""
+        """v1 (legacy) : tokens du dernier message assistant (pas le cumul session)."""
         self._legacy_transport_with_tokens(input_tokens=150, output_tokens=75)
         inst = {"name": "v1", "url": "http://127.0.0.1:4096", "auth": "", "kind": "legacy"}
         n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_v1"))
-        self.assertEqual(n, 225)  # 150 + 75
+        self.assertEqual(n, 240)  # 150 + 75 + cache 10 + 5
 
     def test_api_tokens_from_session_object(self):
-        """v2 (api) : tokens = session.data.tokens.input + session.data.tokens.output."""
+        """v2 (api) : tokens du dernier message assistant (pas le cumul session)."""
         self._api_transport_with_tokens(input_tokens=300, output_tokens=150)
         inst = {"name": "v2", "url": "http://127.0.0.1:4097", "auth": "opencode:pass", "kind": "api"}
         n = asyncio.run(_bridge.get_session_context_tokens(inst, "ses_v2"))
-        self.assertEqual(n, 450)  # 300 + 150
+        self.assertEqual(n, 480)  # 300 + 150 + cache 20 + 10
 
     def test_missing_tokens_field_returns_zero(self):
         """Session sans champ tokens -> 0, pas d'exception."""
