@@ -785,11 +785,15 @@ class ContextUsageTests(unittest.TestCase):
         _bridge._KIND_CACHE.clear()
         _bridge._CTX_LIMIT_CACHE.clear()
 
-    def _api_handler(self, messages, model_items=None, session=None, fail=False):
+    def _api_handler(self, messages, model_items=None, session=None, fail=False, default_model=None):
         async def handler(request):
             path = request.url.path
             if path == "/api/session":
                 return httpx.Response(200, json={"data": []})
+            if path == "/api/model/default":
+                if default_model is None:
+                    return httpx.Response(404, json={})
+                return httpx.Response(200, json={"location": {"directory": "."}, "data": default_model})
             if path == "/api/model":
                 return httpx.Response(200, json={"data": model_items or []})
             if path.endswith("/message"):
@@ -854,6 +858,103 @@ class ContextUsageTests(unittest.TestCase):
         self.assertEqual(
             asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (115344, 200000)
         )
+
+    # Forme réelle relevée sur l'instance v2 le 2026-11-01 :
+    # GET /api/model/default -> {"location": {...}, "data": {Model}} où Model
+    # porte id / modelID / providerID / name / limit.context / limit.output.
+    _DEFAULT_MODEL = {
+        "id": "particle-ai/particle-1",
+        "modelID": "particle-ai/particle-1",
+        "providerID": "openrouter",
+        "name": "Particle-1",
+        "limit": {"context": 1048576, "output": 131072},
+    }
+
+    def test_session_model_none_uses_default_model(self):
+        """Session créée par le pont (model null) : la limite vient du modèle par défaut."""
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._api_handler(
+                [self._ASSISTANT], session={"model": None}, default_model=self._DEFAULT_MODEL
+            )
+        )
+        self.assertEqual(
+            asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (115344, 1048576)
+        )
+
+    def test_default_limit_resolved_through_model_list(self):
+        """Défaut sans limit.context : /api/model est consulté avec ses ids."""
+        default_model = {"id": "particle-ai/particle-1", "providerID": "openrouter"}
+        models = [
+            {
+                "id": "particle-ai/particle-1",
+                "providerID": "openrouter",
+                "limit": {"context": 1000000},
+            }
+        ]
+        _bridge.TRANSPORT = httpx.MockTransport(
+            self._api_handler([], default_model=default_model, model_items=models)
+        )
+        self.assertEqual(
+            asyncio.run(_bridge.default_context_limit(self.inst)), 1000000
+        )
+
+    def test_default_limit_success_is_cached(self):
+        calls = {"n": 0}
+        base = self._api_handler([], default_model=self._DEFAULT_MODEL)
+
+        async def handler(request):
+            if request.url.path == "/api/model/default":
+                calls["n"] += 1
+            return await base(request)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        self.assertEqual(asyncio.run(_bridge.default_context_limit(self.inst)), 1048576)
+        self.assertEqual(asyncio.run(_bridge.default_context_limit(self.inst)), 1048576)
+        self.assertEqual(calls["n"], 1)
+
+    def test_default_limit_failure_not_cached(self):
+        calls = {"n": 0}
+
+        async def handler(request):
+            path = request.url.path
+            if path == "/api/session":
+                return httpx.Response(200, json={"data": []})
+            if path == "/api/model/default":
+                calls["n"] += 1
+                return httpx.Response(500, json={})
+            return httpx.Response(404, json={})
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        self.assertIsNone(asyncio.run(_bridge.default_context_limit(self.inst)))
+        self.assertIsNone(asyncio.run(_bridge.default_context_limit(self.inst)))
+        # Pas de cache négatif : la 2e requête repart sur le réseau.
+        self.assertEqual(calls["n"], 2)
+
+    def test_default_limit_none_on_legacy(self):
+        _bridge.TRANSPORT = httpx.MockTransport(self._legacy_handler([]))
+        self.assertIsNone(asyncio.run(_bridge.default_context_limit(self.inst)))
+
+    def test_session_model_set_does_not_use_default(self):
+        """Non-régression : model renseigné -> /api/model, jamais /api/model/default."""
+        seen = []
+        session = {"model": {"id": "m", "providerID": "p"}}
+        models = [{"id": "m", "providerID": "p", "limit": {"context": 200000}}]
+        base = self._api_handler(
+            [self._ASSISTANT],
+            model_items=models,
+            session=session,
+            default_model=self._DEFAULT_MODEL,
+        )
+
+        async def handler(request):
+            seen.append(request.url.path)
+            return await base(request)
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+        self.assertEqual(
+            asyncio.run(_bridge.context_usage(self.inst, "ses_abc")), (115344, 200000)
+        )
+        self.assertNotIn("/api/model/default", seen)
 
     def test_legacy_last_assistant(self):
         messages = [
@@ -2591,6 +2692,68 @@ class BotCommandsRegistrationTests(unittest.TestCase):
     def test_help_text_mentions_new_commands(self):
         for name in ("stop", "compact", "cmds", "say"):
             self.assertIn(f"/{name}", _bridge._HELP_TEXT)
+
+
+class PollingTimeoutTests(unittest.TestCase):
+    """La boucle de polling doit survivre au long-poll getUpdates (timeout: 30).
+
+    Avec le timeout httpx par défaut (5 s), chaque tour inactif expirait, le
+    backoff montait jusqu'à ~72 s et la livraison des messages de Marc était
+    retardée d'une minute.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "poll": _bridge.POLL_TRANSPORT,
+            "tg": _bridge.TELEGRAM_TRANSPORT,
+            "state": _bridge.state,
+        }
+        self.created = []
+        self.call_timeouts = []
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            self.call_timeouts.append(dict(request.extensions.get("timeout") or {}))
+            raise _PollStop()
+
+        _bridge.POLL_TRANSPORT = httpx.MockTransport(handler)
+        _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"ok": True, "result": True})
+        )
+
+        test = self
+
+        class RecordingClient(real_client):
+            def __init__(inner_self, *args, **kwargs):
+                test.created.append(dict(kwargs))
+                super().__init__(*args, **kwargs)
+
+        self._client_patch = patch("httpx.AsyncClient", RecordingClient)
+        self._client_patch.start()
+
+    def tearDown(self):
+        self._client_patch.stop()
+        _bridge.POLL_TRANSPORT = self._saved["poll"]
+        _bridge.TELEGRAM_TRANSPORT = self._saved["tg"]
+        _bridge.state = self._saved["state"]
+
+    def test_polling_client_and_getupdates_timeout(self):
+        async def _noop():
+            return True
+
+        with patch.object(_bridge, "register_bot_commands", _noop):
+            with self.assertRaises(_PollStop):
+                asyncio.run(_bridge.main())
+
+        # Un seul client est créé dans main() : celui du polling.
+        self.assertEqual(len(self.created), 1)
+        timeout = self.created[0].get("timeout")
+        self.assertIsInstance(timeout, httpx.Timeout)
+        self.assertGreaterEqual(timeout.read, 40.0)
+
+        # L'appel getUpdates porte en plus son propre timeout (marge > 30 s).
+        self.assertTrue(self.call_timeouts, "getUpdates n'a pas été appelé")
+        self.assertGreaterEqual(self.call_timeouts[0]["read"], 40.0)
 
 
 if __name__ == "__main__":

@@ -615,6 +615,50 @@ async def model_context_limit(inst, provider_id, model_id) -> int | None:
         return None
 
 
+async def default_context_limit(inst) -> int | None:
+    """Limite de contexte du modèle PAR DÉFAUT de l'instance.
+
+    Nécessaire aux sessions créées par le pont : POST /api/session {} laisse
+    `model` à null, donc `context_usage` n'a aucun provider/model à résoudre.
+    GET /api/model/default (v2) répond {"location": {...}, "data": {Model}} où
+    Model porte id / modelID / providerID / limit.context ; si le Model ne porte
+    pas la limite, on la résout via /api/model (model_context_limit).
+    Cache mémoire (TTL _CTX_LIMIT_TTL, clé « default:<instance> »), jamais écrit
+    sur un échec. Ne lève jamais : None si inconnue, kind legacy ou erreur.
+    """
+    key = f"default:{inst['name']}"
+    now = time.monotonic()
+    cached = _CTX_LIMIT_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        kind = await detect_kind(inst)
+        if kind != "api":
+            return None
+        data, code = await _http_get(inst, "/api/model/default", timeout=10.0)
+        if code != 200:
+            return None
+        model = (data or {}).get("data") if isinstance(data, dict) else None
+        if not isinstance(model, dict):
+            return None
+        raw = (model.get("limit") or {}).get("context")
+        limit = int(raw) if isinstance(raw, (int, float)) and raw > 0 else None
+        if limit is None:
+            limit = await model_context_limit(
+                inst,
+                model.get("providerID"),
+                model.get("modelID") or model.get("id"),
+            )
+        # Comme model_context_limit : on ne cache qu'une limite réellement trouvée.
+        if isinstance(limit, int) and limit > 0:
+            _CTX_LIMIT_CACHE[key] = (now + _CTX_LIMIT_TTL, limit)
+            return limit
+        return None
+    except Exception as e:
+        log.debug("Limite de contexte par défaut indisponible (%s): %s", key, e)
+        return None
+
+
 async def context_usage(inst, sid) -> tuple[int, int | None]:
     """(tokens réellement occupés dans le contexte, limite du modèle).
 
@@ -678,7 +722,14 @@ async def context_usage(inst, sid) -> tuple[int, int | None]:
         if not isinstance(model, dict):
             model = {}
         try:
-            limit = await model_context_limit(inst, model.get("providerID"), model.get("id"))
+            provider_id = model.get("providerID")
+            model_id = model.get("id")
+            if not provider_id or not model_id:
+                # Session créée par le pont (POST /api/session {}) : model est null,
+                # la limite vient donc du modèle par défaut.
+                limit = await default_context_limit(inst)
+            else:
+                limit = await model_context_limit(inst, provider_id, model_id)
         except Exception as e:
             log.debug("Limite de contexte indisponible pour %s: %s", sid, e)
             limit = None
@@ -2073,12 +2124,15 @@ async def main():
     # pas d'attente infinie), calculable sans dormir réellement pour être testable.
     poll_attempt = 0
 
-    async with httpx.AsyncClient(transport=POLL_TRANSPORT) as cl:
+    async with httpx.AsyncClient(
+        transport=POLL_TRANSPORT, timeout=httpx.Timeout(60.0)
+    ) as cl:
         while True:
             try:
                 resp = await cl.post(
                     f"{API_BASE}/getUpdates",
                     json={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                    timeout=45.0,
                 )
                 data = resp.json()
 
