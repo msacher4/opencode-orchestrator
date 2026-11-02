@@ -1101,6 +1101,116 @@ function afterGate(txt, step) {
   return out
 }
 
+// ---------- relecture à froid : preuve par le journal d'audit ----------
+// Le canal de preuve est .opencode/orch-audit.jsonl, et lui seul : le frontière n'a pas le
+// droit d'y écrire (voir orchestratorWrite), alors qu'il peut écrire dans
+// .opencode/orch/<session>/ et dans orch-state.json — un marqueur posé là serait forgeable.
+const RELECTURE_OPTION = "relire le plan à froid"
+const RELECTURE_REFUS =
+  "relecture : pose la question à Marc (« relire le plan à froid » ou « sans relecture »), puis inscris sa réponse en tête du manifest dans une ligne - Relecture: panel|aucune"
+
+// Première ligne de titre (`# …`) du manifest. La ligne `- Relecture:` n'en est pas un.
+function manifestTitle(txt) {
+  for (const line of String(txt || "").split("\n")) {
+    const m = line.match(/^#\s+(.+)$/)
+    if (!m) continue
+    const title = m[1].trim()
+    if (/^relecture\s*:/i.test(title)) continue
+    return title
+  }
+  return ""
+}
+
+// Libellés d'options d'une question : la forme exacte de l'outil n'est pas devinée, on
+// ramasse tout champ `label` et tout élément de tableau `options`.
+function questionOptionLabels(node, out) {
+  const labels = out || []
+  if (!node || typeof node !== "object") return labels
+  if (Array.isArray(node)) {
+    for (const item of node) questionOptionLabels(item, labels)
+    return labels
+  }
+  for (const key of Object.keys(node)) {
+    const v = node[key]
+    if (key === "label" && typeof v === "string") labels.push(v)
+    else if (key === "options" && Array.isArray(v)) {
+      for (const o of v) typeof o === "string" ? labels.push(o) : questionOptionLabels(o, labels)
+    } else if (v && typeof v === "object") questionOptionLabels(v, labels)
+  }
+  return labels
+}
+
+// Ligne écrite à la pose de la question : `at` en millisecondes (l'audit générique y met
+// un ISO, il ne peut donc pas servir ici).
+function auditRelectureQuestion(entry) {
+  try {
+    mkdirSync(dirname(AUDIT), { recursive: true })
+    appendFileSync(AUDIT, JSON.stringify(entry) + "\n")
+  } catch {
+    // la preuve ne doit jamais casser l'agent
+  }
+}
+
+// Dernière question « relire le plan à froid » tracée pour cette session, si elle existe.
+function lastRelectureQuestion(sid) {
+  let last = null
+  for (const line of readText(AUDIT).split("\n")) {
+    const s = line.trim()
+    if (!s) continue
+    let e
+    try {
+      e = JSON.parse(s)
+    } catch {
+      continue
+    }
+    if (!e || e.type !== "relecture-question") continue
+    if (String(e.session || "") !== String(sid || "")) continue
+    last = e
+  }
+  return last
+}
+
+// Ligne `- Relecture:` de l'en-tête (avant le premier bloc `## …`), en minuscules.
+function relectureHeader(txt) {
+  for (const line of String(txt || "").split("\n")) {
+    if (/^#{2,4}\s/.test(line)) break
+    const m = line.match(/^-\s*Relecture\s*:\s*`?([A-Za-zÀ-ÿ]+)`?\s*$/i)
+    if (m) return m[1].toLowerCase()
+  }
+  return ""
+}
+
+// Première carte worker non close : seule celle-là porte l'exigence de relecture.
+function firstOpenWorker(txt) {
+  return parseSteps(txt)
+    .filter((s) => !s.superseded)
+    .find((s) => s.qui === "worker" && !stepClosed(s)) || null
+}
+
+// Refus (vide = gate franchi) pour la première carte worker non close. L'identité d'un
+// chantier est son titre : jamais de comparaison de date — le manifest est réécrit à
+// chaque clôture d'étape, une comparaison de date bloquerait tout.
+function relectureGate(txt, step, manifestPath, sid) {
+  const first = firstOpenWorker(txt)
+  if (!first || !step || first.id !== step.id) return []
+  const refus = (why) => [RELECTURE_REFUS + " — " + why]
+  const q = lastRelectureQuestion(sid)
+  if (!q) return refus("question jamais posée sur ce manifest")
+  if (String(q.manifest || "") !== String(manifestPath || "")) return refus("manifest remplacé depuis la question")
+  if (String(q.titre || "") !== manifestTitle(txt)) return refus("manifest remplacé depuis la question")
+  const value = relectureHeader(txt)
+  if (!value) return refus("ligne Relecture absente")
+  if (value === "panel") {
+    const steps = parseSteps(txt).filter((s) => !s.superseded)
+    const ok = afterList(first).some((depId) => {
+      const dep = steps.find((s) => s.id === depId)
+      return !!dep && dep.qui === "reviewer" && stepClosed(dep) && verdictPass(dep)
+    })
+    if (!ok) return refus("relecture déclarée mais aucune étape reviewer close avec verdict PASS")
+  }
+  return []
+}
+
 function normScope(s) {
   return String(s || "").replace(/[`*]/g, "").replace(/\s+/g, " ").trim()
 }
@@ -1869,6 +1979,16 @@ export function check(input) {
             blocked.push(...afterRefusals)
             notes.push("gate Après refusé pour l'étape " + step.id + " : " + afterList(step).join(", "))
           }
+          // Relecture à froid : la première carte worker non close exige la question posée
+          // sur CE manifest (preuve dans .opencode/orch-audit.jsonl) et la ligne
+          // `- Relecture:` en tête. Exemptions : manifests sous .opencode/night/ et mode nuit.
+          if (!nightActive && !isUnder(String(manifestPath || ""), PROJECT + "/.opencode/night")) {
+            const relectureRefusals = relectureGate(txt, step, manifestPath, sid)
+            if (relectureRefusals.length) {
+              blocked.push(...relectureRefusals)
+              notes.push("relecture refusée pour l'étape " + step.id)
+            }
+          }
         }
       }
       if (!blocked.length) {
@@ -1892,6 +2012,24 @@ export function check(input) {
     // A. Verrou de nuit : blocage question pour orchestrator
     if (nightActive && tool === "question") {
       blocked.push("mode nuit : aucune question posée à un humain")
+    }
+
+    // Preuve de la question de relecture : seule la ligne d'audit compte, et elle porte le
+    // manifest + son titre au moment de la question. Exempté en mode nuit (aucune question).
+    if (tool === "question" && !nightActive) {
+      const labels = questionOptionLabels(args, []).map((l) => l.toLowerCase())
+      if (labels.some((l) => l.includes(RELECTURE_OPTION))) {
+        const mp = manifestFor(sid)
+        if (mp) {
+          auditRelectureQuestion({
+            type: "relecture-question",
+            session: sid,
+            manifest: mp,
+            titre: manifestTitle(readText(mp)),
+            at: Date.now(),
+          })
+        }
+      }
     }
 
     // Fail closed : verrou corrompu → tous les spawns refusés
