@@ -226,6 +226,8 @@ BOT_COMMANDS = [
     {"command": "stop", "description": "Interrompre le tour en cours"},
     {"command": "cmds", "description": "Commandes OpenCode disponibles"},
     {"command": "say", "description": "Envoyer un texte commençant par /"},
+    {"command": "model", "description": "Voir ou changer le modèle de la session"},
+    {"command": "models", "description": "Chercher un modèle (ex. /models claude)"},
 ]
 
 
@@ -1213,6 +1215,144 @@ async def cli_compact(inst, sid) -> str:
     return "completed" if data is True else "failed"
 
 
+# ---------------------------------------------------------------------------
+# Modèles : liste (cache dédié), filtre lisible et changement par session
+# ---------------------------------------------------------------------------
+
+_MODELS_CACHE = {}
+_MODELS_TTL = 300.0
+
+
+async def cli_models(inst, force=False) -> list[dict]:
+    """Modèles de l'instance. GET /api/model -> data[].
+
+    Cache mémoire de 300 s PAR NOM D'INSTANCE, jamais de cache négatif : un
+    échec (HTTP ≠ 200, réseau, corps illisible) retourne [] sans rien mémoriser,
+    sinon une panne passagère masquerait les 507 modèles pendant 5 minutes
+    (même règle que _CTX_LIMIT_CACHE et _COMMANDS_CACHE).
+    """
+    name = inst.get("name")
+    now = time.monotonic()
+    cached = _MODELS_CACHE.get(name)
+    if not force and cached and (now - cached[0]) < _MODELS_TTL:
+        return list(cached[1])
+    try:
+        data, code = await _http_get(inst, "/api/model", timeout=10.0)
+        if code != 200:
+            log.debug("Liste des modèles indisponible (HTTP %s) pour %s", code, name)
+            return []
+        raw = (data or {}).get("data", []) if isinstance(data, dict) else []
+        models = [m for m in raw if isinstance(m, dict)]
+        _MODELS_CACHE[name] = (now, models)
+        return list(models)
+    except Exception as e:
+        log.debug("Liste des modèles indisponible (%s): %s", name, e)
+        return []
+
+
+def _model_cost_label(entry) -> str:
+    """'payant' | 'gratuit' | 'coût inconnu' depuis entry.cost (liste de tarifs).
+
+    Pas de `cost` (ou liste vide) = gratuité illisible (modèles locaux) : on ne
+    devine pas. Seuls input/output comptent : `cache` peut être facturé à part.
+    """
+    cost = entry.get("cost") if isinstance(entry, dict) else None
+    if not isinstance(cost, list) or not cost:
+        return "coût inconnu"
+    seen = False
+    for c in cost:
+        if not isinstance(c, dict):
+            continue
+        seen = True
+        for field in ("input", "output"):
+            value = c.get(field)
+            if isinstance(value, (int, float)) and value > 0:
+                return "payant"
+    return "gratuit" if seen else "coût inconnu"
+
+
+def _model_ref(entry) -> dict:
+    """Référence minimale du modèle : la clé est (providerID, id), jamais id seul."""
+    return {"providerID": entry.get("providerID"), "id": entry.get("id")}
+
+
+def _model_line(index: int, entry) -> str:
+    """'<n>. <providerID>/<id> · <contexte> · <coût>' (contexte `?` s'il est absent)."""
+    limit = entry.get("limit") if isinstance(entry, dict) else None
+    raw_limit = limit.get("context") if isinstance(limit, dict) else None
+    if isinstance(raw_limit, (int, float)) and raw_limit > 0:
+        ctx = _fmt_tokens(int(raw_limit))
+    else:
+        ctx = "?"
+    return (
+        f"{index}. {entry.get('providerID')}/{entry.get('id')} · "
+        f"{ctx} · {_model_cost_label(entry)}"
+    )
+
+
+def _model_label(entry) -> str:
+    """'<providerID>/<id> · <contexte> · <coût>' (sans numéro, pour /model)."""
+    limit = entry.get("limit") if isinstance(entry, dict) else None
+    raw_limit = limit.get("context") if isinstance(limit, dict) else None
+    if isinstance(raw_limit, (int, float)) and raw_limit > 0:
+        ctx = _fmt_tokens(int(raw_limit))
+    else:
+        ctx = "?"
+    return (
+        f"{entry.get('providerID')}/{entry.get('id')} · "
+        f"{ctx} · {_model_cost_label(entry)}"
+    )
+
+
+def _model_matches(entry, terms: list[str]) -> bool:
+    """Vrai si CHAQUE terme apparaît (casse ignorée) dans providerID, id ou name.
+
+    `free` / `gratuit` est un filtre de coût, pas un mot à chercher dans les champs.
+    """
+    hay = " ".join(
+        str(entry.get(k) or "") for k in ("providerID", "id", "name")
+    ).lower()
+    for term in terms:
+        low = (term or "").lower()
+        if not low:
+            continue
+        if low in ("free", "gratuit"):
+            if _model_cost_label(entry) != "gratuit":
+                return False
+        elif low not in hay:
+            return False
+    return True
+
+
+async def cli_switch_model(inst, sid, provider_id, model_id) -> bool:
+    """Change le modèle de la SESSION (pas du serveur). True si 2xx (attendu 204).
+
+    Corps minimal exigé par l'API (additionalProperties:false) : jamais de
+    `variant`. Ne lève jamais : False sur refus, réseau ou exception.
+    """
+    try:
+        body = {"model": {"id": model_id, "providerID": provider_id}}
+        _data, code = await _http_post(
+            inst, f"/api/session/{sid}/model", body, timeout=30.0
+        )
+        if 200 <= code < 300:
+            log.info("Modèle %s/%s appliqué à la session %s", provider_id, model_id, sid)
+            return True
+        log.info("Changement de modèle refusé (%s) sur %s", code, sid)
+        return False
+    except Exception as e:
+        log.debug("Changement de modèle impossible sur %s: %s", sid, e)
+        return False
+
+
+async def _find_model(inst, provider_id, model_id):
+    """Entrée de /api/model pour le couple (providerID, id), None si absente."""
+    for entry in await cli_models(inst):
+        if entry.get("providerID") == provider_id and entry.get("id") == model_id:
+            return entry
+    return None
+
+
 async def _interrupt_request(inst, sid) -> tuple[bool, int | str]:
     """(succès, code HTTP) de la demande d'interruption.
 
@@ -1740,7 +1880,11 @@ _PONT_MAIN_COMMANDS = (
 )
 
 # Commandes natives du pont au sens large (pour le rappel de /cmds et /help).
-_PONT_NATIVE_COMMANDS = _PONT_MAIN_COMMANDS + ("cmds", "say", "stop", "esc")
+_PONT_NATIVE_COMMANDS = _PONT_MAIN_COMMANDS + ("cmds", "say", "stop", "esc", "model", "models")
+
+# /models : nombre de lignes affichées, et durée de vie de la liste mémorisée.
+_MODELS_SHOWN = 20
+_MODELS_STATE_TTL = 600.0
 
 
 def _split_slash(text: str) -> tuple[str, str] | None:
@@ -1866,6 +2010,169 @@ async def _slash_cmds(chat_id: int, inst) -> None:
     await tg_send(chat_id, "\n".join(lines), markdown=False)
 
 
+async def _slash_models(chat_id: int, inst, arguments: str) -> None:
+    """'/models' sans argument : résumé + invitation à filtrer (aucun listing).
+
+    '/models <filtre>' : filtre « tous les mots », au plus 20 lignes numérotées,
+    et mémorise TOUS les résultats filtrés par chat pour /model <n>.
+    """
+    models = await cli_models(inst)
+    if not models:
+        # Panne API ≠ catalogue vide : aucun chiffre inventé, aucun filtre accusé.
+        await tg_send(
+            chat_id,
+            "❌ impossible de récupérer la liste des modèles — réessaie dans un instant",
+            markdown=False,
+        )
+        return
+    if not arguments:
+        providers = {m.get("providerID") for m in models if m.get("providerID")}
+        await tg_send(
+            chat_id,
+            f"{len(models)} modèles · {len(providers)} fournisseurs. "
+            "Filtre : /models <mot> (ex. /models claude, /models free, "
+            "/models opencode-go)",
+            markdown=False,
+        )
+        return
+
+    terms = arguments.split()
+    filtered = [m for m in models if _model_matches(m, terms)]
+    filtered.sort(
+        key=lambda m: (str(m.get("providerID") or ""), str(m.get("id") or ""))
+    )
+
+    # Toute la liste (pas seulement les 20 affichés) : /model <n> s'y réfère.
+    cid = str(chat_id)
+    chat_state = state.setdefault(cid, {})
+    chat_state["models"] = [_model_ref(m) for m in filtered]
+    chat_state["models_at"] = time.time()
+    _save_state(state)
+
+    if not filtered:
+        providers = sorted({m.get("providerID") for m in models if m.get("providerID")})
+        lines = [f"❌ aucun modèle pour « {arguments} »"]
+        if providers:
+            lines.append("Fournisseurs : " + ", ".join(providers[:6]))
+        await tg_send(chat_id, "\n".join(lines), markdown=False)
+        return
+
+    shown = filtered[:_MODELS_SHOWN]
+    lines = [_model_line(i + 1, m) for i, m in enumerate(shown)]
+    if len(filtered) > _MODELS_SHOWN:
+        lines.append(f"… et {len(filtered) - _MODELS_SHOWN} autres — précise ta recherche")
+    await tg_send(chat_id, "\n".join(lines), markdown=False)
+
+
+async def _slash_model_switch(chat_id: int, inst, sid, provider_id, model_id) -> None:
+    """Accusé « ⏳ changement de modèle… », POST, puis édition du MÊME message."""
+    ack = await tg_send(chat_id, "⏳ changement de modèle…", markdown=False)
+    ok = await cli_switch_model(inst, sid, provider_id, model_id)
+    if not ok:
+        await tg_edit(chat_id, ack, "❌ le changement a échoué", markdown=False)
+        return
+    cid = str(chat_id)
+    state.setdefault(cid, {})["model"] = {"providerID": provider_id, "id": model_id}
+    _save_state(state)
+    entry = await _find_model(inst, provider_id, model_id)
+    label = _model_label(entry) if entry else f"{provider_id}/{model_id}"
+    await tg_edit(chat_id, ack, f"✅ modèle : {label} (tour suivant)", markdown=False)
+
+
+async def _slash_model(chat_id: int, inst, sid, arguments: str) -> None:
+    """'/model' : modèle courant ; '/model <n>' ; '/model <provider>/<id>'."""
+    arguments = (arguments or "").strip()
+
+    if not arguments:
+        if not sid:
+            await tg_send(chat_id, "🤖 aucune session active", markdown=False)
+            return
+        try:
+            session = await cli_get_session(inst, sid)
+        except Exception as e:
+            log.debug("Session %s illisible pour /model: %s", sid, e)
+            session = None
+        model = (session or {}).get("model") if isinstance(session, dict) else None
+        if (
+            not isinstance(model, dict)
+            or not model.get("id")
+            or not model.get("providerID")
+        ):
+            # Repli : dernier modèle choisi depuis ce chat (session.model absent).
+            saved = state.get(str(chat_id), {}) or {}
+            saved_model = saved.get("model") if isinstance(saved, dict) else None
+            provider_id = (
+                saved_model.get("providerID") if isinstance(saved_model, dict) else None
+            )
+            model_id = saved_model.get("id") if isinstance(saved_model, dict) else None
+            if provider_id and model_id:
+                entry = await _find_model(inst, provider_id, model_id)
+                label = (
+                    _model_label(entry) if entry else f"{provider_id}/{model_id}"
+                )
+                await tg_send(chat_id, f"🤖 {label} (dernier choisi)", markdown=False)
+                return
+            await tg_send(
+                chat_id,
+                "🤖 modèle : celui du serveur (non défini sur cette session)",
+                markdown=False,
+            )
+            return
+        entry = await _find_model(inst, model.get("providerID"), model.get("id"))
+        label = (
+            _model_label(entry)
+            if entry
+            else f"{model.get('providerID')}/{model.get('id')}"
+        )
+        await tg_send(chat_id, f"🤖 {label}", markdown=False)
+        return
+
+    if arguments.isdigit():
+        cid = str(chat_id)
+        chat_state = state.get(cid, {}) or {}
+        refs = chat_state.get("models")
+        refs = refs if isinstance(refs, list) else []
+        saved_at = chat_state.get("models_at")
+        saved_at = saved_at if isinstance(saved_at, (int, float)) else 0
+        if not refs or (time.time() - saved_at) > _MODELS_STATE_TTL:
+            await tg_send(chat_id, "❌ fais d'abord /models <filtre>", markdown=False)
+            return
+        if not sid:
+            await tg_send(chat_id, "❌ aucune session active", markdown=False)
+            return
+        index = int(arguments)
+        if index < 1 or index > len(refs):
+            await tg_send(
+                chat_id, f"❌ indice hors liste (1 à {len(refs)})", markdown=False
+            )
+            return
+        ref = refs[index - 1] if isinstance(refs[index - 1], dict) else {}
+        provider_id = ref.get("providerID")
+        model_id = ref.get("id")
+        if not provider_id or not model_id:
+            await tg_send(
+                chat_id, f"❌ indice hors liste (1 à {len(refs)})", markdown=False
+            )
+            return
+        await _slash_model_switch(chat_id, inst, sid, provider_id, model_id)
+        return
+
+    # Forme <provider>/<id> : coupe au PREMIER slash (les id contiennent des « / »).
+    provider_id, sep, model_id = arguments.partition("/")
+    provider_id, model_id = provider_id.strip(), model_id.strip()
+    if not sep or not provider_id or not model_id:
+        await tg_send(chat_id, f"❌ modèle inconnu : {arguments}", markdown=False)
+        return
+    entry = await _find_model(inst, provider_id, model_id)
+    if entry is None:
+        await tg_send(chat_id, f"❌ modèle inconnu : {arguments}", markdown=False)
+        return
+    if not sid:
+        await tg_send(chat_id, "❌ aucune session active", markdown=False)
+        return
+    await _slash_model_switch(chat_id, inst, sid, provider_id, model_id)
+
+
 async def _slash_unknown(chat_id: int, name: str, commands) -> None:
     """Commande inconnue : AUCUN POST, liste des noms disponibles + échappatoire /say."""
     names = [c.get("name") for c in commands if c.get("name")]
@@ -1928,6 +2235,16 @@ async def _handle_slash(chat_id: int, text: str) -> None:
             )
             return
         await handle_message(chat_id, arguments)
+        return
+
+    # /models et /model sont natifs : jamais envoyés au modèle. Comparaison par
+    # égalité stricte, "models" AVANT "model" (et jamais startswith).
+    if name == "models":
+        await _slash_models(chat_id, inst, arguments)
+        return
+
+    if name == "model":
+        await _slash_model(chat_id, inst, sid, arguments)
         return
 
     if not sid:
@@ -2100,6 +2417,8 @@ _HELP_TEXT = (
     "*/build* — mode construction (actions)\n"
     "*/compact* — compacte la session (contexte)\n"
     "*/stop* (ou */esc*) — interrompt le tour en cours\n"
+    "*/models <mot>* — cherche un modèle (ex. `/models claude`, `/models free`)\n"
+    "*/model* — modèle de la session ; `/model <n>` ou `/model <provider>/<id>` pour changer\n"
     "*/cmds* — commandes OpenCode disponibles\n"
     "*/say <texte>* — envoie un texte commençant par `/`\n"
     "*#emp <texte>* — l'employé autonome (pause/resume/status)\n"

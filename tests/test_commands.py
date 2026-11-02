@@ -2662,7 +2662,7 @@ class BotCommandsRegistrationTests(unittest.TestCase):
 
         _bridge.TELEGRAM_TRANSPORT = httpx.MockTransport(handler)
 
-    # 6) corps envoyé : 12 commandes, compact + stop présents, aucun slash
+    # 6) corps envoyé : 14 commandes, compact/stop/model/models présents, aucun slash
     def test_register_bot_commands_payload(self):
         self._install(lambda r: httpx.Response(200, json={"ok": True, "result": True}))
 
@@ -2671,10 +2671,12 @@ class BotCommandsRegistrationTests(unittest.TestCase):
         request = self.tg_requests[0]
         self.assertTrue(str(request.url).endswith("/setMyCommands"))
         commands = json.loads(request.content.decode("utf-8"))["commands"]
-        self.assertEqual(len(commands), 12)
+        self.assertEqual(len(commands), 14)
         names = [c["command"] for c in commands]
         self.assertIn("compact", names)
         self.assertIn("stop", names)
+        self.assertIn("model", names)
+        self.assertIn("models", names)
         self.assertEqual([n for n in names if n.startswith("/")], [])
         self.assertTrue(all(c.get("description") for c in commands))
 
@@ -2754,6 +2756,394 @@ class PollingTimeoutTests(unittest.TestCase):
         # L'appel getUpdates porte en plus son propre timeout (marge > 30 s).
         self.assertTrue(self.call_timeouts, "getUpdates n'a pas été appelé")
         self.assertGreaterEqual(self.call_timeouts[0]["read"], 40.0)
+
+
+class ModelCommandsTests(unittest.TestCase):
+    """'/models' (filtre) et '/model' (courant / changement) sur MockTransport.
+
+    Aucun appel réel, aucune session de Marc, aucun changement de modèle réel :
+    le POST /api/session/{sid}/model est intercepté, STATE_FILE est temporaire.
+    """
+
+    CID = 6161
+    SID = "ses_model_1"
+    PAID = [{"input": 3.0, "output": 15.0}]
+    # `cache` facturé mais input/output à 0 : doit rester « gratuit ».
+    FREE = [{"input": 0, "output": 0, "cache": {"read": 0.3, "write": 1.0}}]
+
+    def setUp(self):
+        self._saved = {
+            "transport": _bridge.TRANSPORT,
+            "tg_send": _bridge.tg_send,
+            "tg_edit": _bridge.tg_edit,
+            "kind": dict(_bridge._KIND_CACHE),
+            "models": dict(_bridge._MODELS_CACHE),
+            "state": _bridge.state,
+            "instances": _bridge._INSTANCES,
+            "auth_env": os.environ.get("AUTHORIZED_CHAT_IDS"),
+        }
+        os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        os.environ.pop("OPENCODE_INSTANCES", None)
+        _bridge._INSTANCES = None
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE["v2"] = "api"
+        _bridge._MODELS_CACHE.clear()
+
+        self.requests = []
+        self.sent = []
+        self.edited = []
+        self.model_post_code = 204
+        # Codes HTTP imposés à GET /api/model, consommés dans l'ordre (sinon 200).
+        self.model_codes = []
+        self.session_model = {
+            "id": "deepseek-v4.1-flash",
+            "providerID": "opencode-go",
+            "variant": "default",
+        }
+        self.catalog = self._catalog()
+        _bridge.state = {
+            str(self.CID): {
+                "current": {"instance": "v2", "sid": self.SID},
+                "agent": "build",
+            }
+        }
+
+        async def fake_send(chat_id, text, markdown=True):
+            self.sent.append((chat_id, text))
+            return 7000 + len(self.sent)
+
+        async def fake_edit(chat_id, message_id, text, markdown=True):
+            self.edited.append((chat_id, message_id, text))
+
+        _bridge.tg_send = fake_send
+        _bridge.tg_edit = fake_edit
+        self._install()
+
+    def tearDown(self):
+        _bridge.TRANSPORT = self._saved["transport"]
+        _bridge.tg_send = self._saved["tg_send"]
+        _bridge.tg_edit = self._saved["tg_edit"]
+        _bridge.state = self._saved["state"]
+        _bridge._INSTANCES = self._saved["instances"]
+        _bridge._KIND_CACHE.clear()
+        _bridge._KIND_CACHE.update(self._saved["kind"])
+        _bridge._MODELS_CACHE.clear()
+        _bridge._MODELS_CACHE.update(self._saved["models"])
+        if self._saved["auth_env"] is None:
+            os.environ.pop("AUTHORIZED_CHAT_IDS", None)
+        else:
+            os.environ["AUTHORIZED_CHAT_IDS"] = self._saved["auth_env"]
+
+    # --- helpers ---------------------------------------------------------
+    def _catalog(self):
+        """25 modèles « claude » payants + 1 payant unique + 1 gratuit + 1 inconnu."""
+        entries = [
+            {
+                "id": f"claude-{i:02d}",
+                "providerID": "openrouter",
+                "name": f"Claude Model {i:02d}",
+                "limit": {"context": 200000},
+                "cost": self.PAID,
+            }
+            for i in range(1, 26)
+        ]
+        entries.append(
+            {
+                "id": "deepseek-v4.1-flash",
+                "providerID": "opencode-go",
+                "name": "DeepSeek V4.1 Flash",
+                "limit": {"context": 200000},
+                "cost": self.PAID,
+            }
+        )
+        entries.append(
+            {
+                "id": "meta/llama-3.3-70b",
+                "providerID": "nvidia",
+                "name": "Llama 3.3 70B",
+                "limit": {"context": 128000},
+                "cost": self.FREE,
+            }
+        )
+        entries.append(
+            {
+                "id": "local-small",
+                "providerID": "llama-local",
+                "name": "Local Small",
+                "limit": {"context": 32768},
+            }
+        )
+        return entries
+
+    def _install(self):
+        def handler(request):
+            path, method = request.url.path, request.method
+            self.requests.append((method, path, request.content))
+            if method == "GET" and path == "/api/model":
+                code = self.model_codes.pop(0) if self.model_codes else 200
+                if code != 200:
+                    return httpx.Response(code, json={"error": "panne"})
+                return httpx.Response(200, json={"data": self.catalog})
+            if method == "GET" and path == f"/api/session/{self.SID}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "id": self.SID,
+                            "title": "Session test",
+                            "model": self.session_model,
+                        }
+                    },
+                )
+            if method == "POST" and path == f"/api/session/{self.SID}/model":
+                if 200 <= self.model_post_code < 300:
+                    return httpx.Response(self.model_post_code)
+                return httpx.Response(self.model_post_code, json={"error": "refusé"})
+            return httpx.Response(404, json={})
+
+        _bridge.TRANSPORT = httpx.MockTransport(handler)
+
+    def _posts(self):
+        return [r for r in self.requests if r[0] == "POST"]
+
+    def _post_body(self, request):
+        return json.loads(request[2].decode("utf-8")) if request[2] else {}
+
+    def _run(self, text):
+        asyncio.run(_bridge.handle_slash(self.CID, text))
+
+    @staticmethod
+    def _numbered(text):
+        out = []
+        for line in text.splitlines():
+            head, sep, _ = line.partition(". ")
+            if sep and head.isdigit():
+                out.append(line)
+        return out
+
+    # 1) /model affiche le modèle de la session, contexte et coût résolus
+    def test_model_shows_current_session_model(self):
+        self._run("/model")
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(
+            self.sent[0][1], "🤖 opencode-go/deepseek-v4.1-flash · 200K · payant"
+        )
+        self.assertEqual(self._posts(), [])
+
+    # 2) /model sur une session sans modèle : message « serveur »
+    def test_model_null_says_server_default(self):
+        self.session_model = None
+        self._run("/model")
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("celui du serveur", self.sent[0][1])
+        self.assertEqual(self._posts(), [])
+
+    # 2b) /model session sans modèle : repli sur le dernier modèle choisi
+    def test_model_null_falls_back_to_last_chosen(self):
+        self.session_model = None
+        _bridge.state[str(self.CID)]["model"] = {
+            "providerID": "nvidia",
+            "id": "meta/llama-3.3-70b",
+        }
+        self._run("/model")
+
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertIn("nvidia/meta/llama-3.3-70b", message)
+        self.assertIn("128K · gratuit", message)
+        self.assertIn("(dernier choisi)", message)
+        self.assertEqual(self._posts(), [])
+
+    # 2c) repli mémorisé mais absent du catalogue : providerID/id seulement
+    def test_model_null_falls_back_without_catalog_entry(self):
+        self.session_model = None
+        _bridge.state[str(self.CID)]["model"] = {
+            "providerID": "ghost",
+            "id": "ghost-model",
+        }
+        self._run("/model")
+
+        message = self.sent[0][1]
+        self.assertIn("ghost/ghost-model", message)
+        self.assertIn("(dernier choisi)", message)
+        self.assertNotIn(" · ", message.split("(dernier choisi)")[0])
+
+    # 2d) cache négatif : un 500 n'est pas mémorisé, le 2ᵉ appel refait la requête
+    def test_models_cache_not_poisoned_by_failure(self):
+        inst = _bridge.instances()["v2"]
+        self.model_codes = [500]
+        first = asyncio.run(_bridge.cli_models(inst))
+        second = asyncio.run(_bridge.cli_models(inst))
+
+        gets = [r for r in self.requests if r[0] == "GET" and r[1] == "/api/model"]
+        self.assertEqual(len(gets), 2)
+        self.assertEqual(first, [])
+        self.assertTrue(second)
+        self.assertEqual(len(second), len(self.catalog))
+
+    # 2e) cache actif : deux appels réussis ⇒ une seule requête
+    def test_models_cache_serves_second_call_without_request(self):
+        inst = _bridge.instances()["v2"]
+        first = asyncio.run(_bridge.cli_models(inst))
+        second = asyncio.run(_bridge.cli_models(inst))
+
+        gets = [r for r in self.requests if r[0] == "GET" and r[1] == "/api/model"]
+        self.assertEqual(len(gets), 1)
+        self.assertTrue(first)
+        self.assertEqual(first, second)
+
+    # 3) /models <filtre> : au plus 20 lignes, format exact, reste compté
+    def test_models_filter_lists_twenty_max(self):
+        self._run("/models claude")
+
+        self.assertEqual(len(self.sent), 1)
+        lines = self.sent[0][1].splitlines()
+        numbered = self._numbered(self.sent[0][1])
+        self.assertEqual(len(numbered), 20)
+        self.assertEqual(numbered[0], "1. openrouter/claude-01 · 200K · payant")
+        self.assertEqual(lines[-1], "… et 5 autres — précise ta recherche")
+        self.assertNotIn("claude-21", self.sent[0][1])
+
+    # 4) /models sans argument : résumé, aucun listing
+    def test_models_without_argument_does_not_list(self):
+        self._run("/models")
+
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertEqual(
+            message,
+            "28 modèles · 4 fournisseurs. Filtre : /models <mot> "
+            "(ex. /models claude, /models free, /models opencode-go)",
+        )
+        self.assertEqual(self._numbered(message), [])
+        self.assertNotIn("claude-01", message)
+
+    # 5) /models free : uniquement les modèles à coût nul
+    def test_models_free_only_lists_free_models(self):
+        self._run("/models free")
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1], "1. nvidia/meta/llama-3.3-70b · 128K · gratuit")
+
+    # 6) /models zzz : aucun résultat + rappel des fournisseurs
+    def test_models_unknown_filter(self):
+        self._run("/models zzz")
+
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertIn("❌ aucun modèle pour « zzz »", message)
+        self.assertIn("Fournisseurs :", message)
+        self.assertIn("openrouter", message)
+
+    # 6b) /models sans argument sur API en panne : erreur, jamais « 0 modèles »
+    def test_models_without_argument_api_failure_is_an_error(self):
+        self.model_codes = [500]
+        self._run("/models")
+
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertIn("impossible de récupérer", message)
+        self.assertNotIn("0 modèles", message)
+        self.assertNotIn("0 fournisseurs", message)
+
+    # 6c) /models <filtre> sur API en panne : erreur, pas « aucun modèle pour »
+    def test_models_filter_api_failure_is_not_an_empty_filter(self):
+        self.model_codes = [500]
+        self._run("/models claude")
+
+        self.assertEqual(len(self.sent), 1)
+        message = self.sent[0][1]
+        self.assertIn("impossible de récupérer", message)
+        self.assertNotIn("aucun modèle pour", message)
+
+    # 7) /model 2 après une liste : bon couple (providerID ET id) dans le corps
+    def test_model_index_posts_second_listed_model(self):
+        self._run("/models claude")
+        self.sent.clear()
+        self._run("/model 2")
+
+        posts = self._posts()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1], f"/api/session/{self.SID}/model")
+        self.assertEqual(
+            self._post_body(posts[0]),
+            {"model": {"id": "claude-02", "providerID": "openrouter"}},
+        )
+        self.assertEqual(len(self.sent), 1)  # l'accusé…
+        self.assertEqual(len(self.edited), 1)  # …est édité, pas renvoyé
+        self.assertEqual(self.edited[0][1], 7001)  # message_id de l'accusé
+        self.assertEqual(
+            self.edited[0][2],
+            "✅ modèle : openrouter/claude-02 · 200K · payant (tour suivant)",
+        )
+
+    # 8) /model 99 : indice hors liste, AUCUN POST
+    def test_model_out_of_range_posts_nothing(self):
+        self._run("/models claude")
+        before = len(self._posts())
+        self._run("/model 99")
+
+        self.assertEqual(len(self._posts()), before)
+        self.assertIn("❌ indice hors liste (1 à 25)", self.sent[-1][1])
+        self.assertEqual(self.edited, [])
+
+    # 9) /model sans liste préalable : message d'usage, aucun POST
+    def test_model_without_previous_list_posts_nothing(self):
+        self._run("/model 1")
+
+        self.assertEqual(self._posts(), [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("fais d'abord /models", self.sent[0][1])
+
+    # 10) /model <provider>/<id> : résolution directe, bon corps
+    def test_model_provider_slash_id_posts_exact_body(self):
+        self._run("/model deepseek-v4.1-flash")  # id seul : refusé, aucun POST
+        self.assertEqual(self._posts(), [])
+        self.assertIn("❌ modèle inconnu : deepseek-v4.1-flash", self.sent[-1][1])
+
+        self.sent.clear()
+        self._run("/model opencode-go/deepseek-v4.1-flash")
+
+        posts = self._posts()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(
+            self._post_body(posts[0]),
+            {"model": {"id": "deepseek-v4.1-flash", "providerID": "opencode-go"}},
+        )
+        self.assertIn("✅ modèle : opencode-go/deepseek-v4.1-flash", self.edited[-1][2])
+        self.assertIn("(tour suivant)", self.edited[-1][2])
+
+    # 11) péremption : liste de plus de 600 s ⇒ refus, aucun POST
+    def test_model_expired_list_is_refused(self):
+        self._run("/models claude")
+        _bridge.state[str(self.CID)]["models_at"] = _bridge.time.time() - 601
+        self._run("/model 1")
+
+        self.assertEqual(self._posts(), [])
+        self.assertIn("fais d'abord /models", self.sent[-1][1])
+
+    # 12) le modèle choisi survit à un rechargement de STATE_FILE
+    def test_chosen_model_persisted_in_state_file(self):
+        self._run("/models claude")
+        self._run("/model 2")
+
+        reloaded = _bridge._load_state()
+        self.assertEqual(
+            reloaded[str(self.CID)]["model"],
+            {"providerID": "openrouter", "id": "claude-02"},
+        )
+
+    # 13) échec du POST : message ❌ édité, aucun état de modèle mémorisé
+    def test_model_post_refused_reports_failure(self):
+        self.model_post_code = 400
+        self._run("/models claude")
+        self._run("/model 1")
+
+        self.assertEqual(len(self._posts()), 1)
+        self.assertEqual(self.edited[-1][2], "❌ le changement a échoué")
+        self.assertNotIn("model", _bridge.state[str(self.CID)])
 
 
 if __name__ == "__main__":
