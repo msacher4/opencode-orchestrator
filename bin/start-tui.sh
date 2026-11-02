@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Lance le TUI opencode ATTACHÉ au service de fond (jamais en --standalone).
+# Lance le TUI opencode ATTACHÉ au serveur de fond unique (127.0.0.1:4097).
 #
 # Pourquoi : engine.py (mcp/opencode-recurring) n'a aucun port en dur, il résout
 # l'URL du service via $XDG_STATE_HOME/opencode/service.json. Un TUI lancé en
 # --standalone démarre son propre serveur stdio : il lit la même base SQLite mais
 # ne reçoit aucun événement des runs récurrents -> onglet figé sur une session
-# que son serveur ne sert plus. Les XDG_* sont posés par le lanceur du dépôt
-# (Opencodev2/opencode-v2) ; ce script ne fait que refuser --standalone.
+# que son serveur ne sert plus. Ce script s'attache désormais explicitement au
+# serveur systemd 4097 et garde le TUI de l'option --standalone.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 BIN="$PROJECT/Opencodev2/opencode-v2"
-SERVICE_JSON="$PROJECT/Opencodev2/state/opencode/service.json"
+SERVER_URL="${OPENCODE_SERVER_URL:-http://127.0.0.1:4097}"
+V2_ENV_FILE="/home/marcs/.telegram-bridge-venv/v2.env"
 
 # Les XDG_* / OPENCODE_DB / OPENCODE_DISABLE_PROJECT_CONFIG sont posés par le
 # lanceur du dépôt ($BIN) : plus de duplication ici, ce script ne fait que le garde.
@@ -38,49 +39,23 @@ done
 
 # --- séparation --dry-run / arguments transmis au binaire ---------------------
 DRY_RUN=0
-ARGS=()
+ALL=()
 for arg in "$@"; do
   if [ "$arg" = "--dry-run" ]; then
     DRY_RUN=1
   else
-    ARGS+=("$arg")
+    ALL+=("$arg")
   fi
 done
 
-# --- lecture de service.json (sans jq obligatoire) ----------------------------
-service_field() {
-  local field="$1" value=""
-  if [ -r "$SERVICE_JSON" ] && command -v python3 >/dev/null 2>&1; then
-    value="$(python3 - "$SERVICE_JSON" "$field" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
-        data = json.load(fh)
-except Exception:
-    sys.exit(0)
-value = data.get(sys.argv[2])
-print("" if value is None else value)
-PY
-)"
-  fi
-  if [ -z "$value" ] && [ -r "$SERVICE_JSON" ]; then
-    case "$field" in
-      url) value="$(grep -o '"url"[[:space:]]*:[[:space:]]*"[^"]*"' "$SERVICE_JSON" |
-        head -n1 | sed 's/^[^"]*"\([^"]*\)"$/\1/')" ;;
-      pid) value="$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$SERVICE_JSON" |
-        head -n1 | grep -o '[0-9]\+$')" ;;
-    esac
-  fi
-  printf '%s' "$value"
-}
-
-# --- garde : --server refuse toute URL sauf celle du service de fond ----------
+# --- extraction de --server (garde) -------------------------------------------
+# Un --server accepté est retiré des ARGS (le script l'ajoute lui-même).
 server_value=""
 server_seen=0
 prev_was_server=0
-for arg in "${ARGS[@]+"${ARGS[@]}"}"; do
+KEEP=()
+for arg in "${ALL[@]+"${ALL[@]}"}"; do
   if [ "$prev_was_server" -eq 1 ]; then
-    # cet argument est la valeur de --server (présente)
     server_value="$arg"
     server_seen=1
     prev_was_server=0
@@ -91,53 +66,74 @@ for arg in "${ARGS[@]+"${ARGS[@]}"}"; do
       server_value="${arg#--server=}"
       server_seen=1
       prev_was_server=0
+      continue
       ;;
     --server)
       server_seen=1
       prev_was_server=1
+      continue
       ;;
   esac
+  KEEP+=("$arg")
 done
 
+# --- garde : --server ne vaut que le serveur de fond unique -------------------
 if [ "$server_seen" -eq 1 ]; then
-  if [ ! -r "$SERVICE_JSON" ]; then
-    cat >&2 <<'EOF'
-start-tui.sh : option refusée (--server).
-
-Aucun service.json lisible : on ne peut pas vérifier l'URL du service de fond.
-
-Le TUI s'attache seul au service de fond ; aucune URL à indiquer.
-
-Lancez simplement :  ./tools/start-tui.sh
-EOF
-    exit 2
-  fi
-  service_url="$(service_field url)"
-  if [ -z "$service_url" ]; then
-    cat >&2 <<'EOF'
-start-tui.sh : option refusée (--server).
-
-L'URL du service de fond est vide dans service.json : on ne peut pas vérifier.
-
-Le TUI s'attache seul au service de fond ; aucune URL à indiquer.
-
-Lancez simplement :  ./tools/start-tui.sh
-EOF
-    exit 2
-  fi
-  if [ "${server_value%/}" != "${service_url%/}" ]; then
+  if [ ! "$server_value" = "$SERVER_URL" ] && [ ! "${server_value%/}" = "$SERVER_URL" ]; then
     cat >&2 <<EOF
 start-tui.sh : option refusée (--server "$server_value").
 
-L'URL fournie ne correspond pas au service de fond (URL du service : $service_url).
+L'URL fournie ne correspond pas au serveur de fond unique ($SERVER_URL).
 
-Le TUI s'attache seul au service de fond ; aucune URL à indiquer.
+Le TUI s'attache lui-même au serveur de fond ; aucune URL à indiquer.
 
 Lancez simplement :  ./tools/start-tui.sh
 EOF
     exit 2
   fi
 fi
+
+# --- attachement au serveur de fond unique (4097) : auth + sonde -------------
+# Le mot de passe est lu dans v2.env et transmis par l'environnement, jamais par
+# argv et jamais affiché. Sonde obligatoire avant tout lancement.
+if [ ! -r "$V2_ENV_FILE" ]; then
+  echo "start-tui.sh : $V2_ENV_FILE illisible — impossible de lire le mot de passe du serveur $SERVER_URL." >&2
+  exit 1
+fi
+
+auth_line="$(grep -m1 '^OPENCODE_SERVER_PASSWORD=' "$V2_ENV_FILE" || true)"
+if [ -z "$auth_line" ]; then
+  echo "start-tui.sh : OPENCODE_SERVER_PASSWORD absente de $V2_ENV_FILE — mot de passe du serveur $SERVER_URL introuvable." >&2
+  exit 1
+fi
+
+pass="${auth_line#OPENCODE_SERVER_PASSWORD=}"
+pass="${pass%$'\r'}"
+pass="${pass#\"}"; pass="${pass%\"}"
+pass="${pass#\'}"; pass="${pass%\'}"
+
+if [ -z "$pass" ]; then
+  echo "start-tui.sh : mot de passe vide dans $V2_ENV_FILE — vérifie la ligne OPENCODE_SERVER_PASSWORD." >&2
+  exit 1
+fi
+
+escaped_pass="${pass//\\/\\\\}"; escaped_pass="${escaped_pass//\"/\\\"}"
+user_line="user = \"opencode:${escaped_pass}\""
+code="$(printf '%s\n' "$user_line" | curl -s -o /dev/null -w '%{http_code}' --max-time 5 -K - "$SERVER_URL/api/info" 2>/dev/null || true)"
+
+case "$code" in
+  200)
+    ;;
+  401)
+    echo "start-tui.sh : le serveur $SERVER_URL refuse le mot de passe lu dans $V2_ENV_FILE (401)." >&2
+    echo "start-tui.sh : mot de passe du pont et mot de passe du serveur différents — à aligner dans $V2_ENV_FILE ou côté serveur, rien n'a été lancé." >&2
+    exit 1
+    ;;
+  *)
+    echo "start-tui.sh : le serveur $SERVER_URL ne répond pas (code $code) — relance opencode-serve-v2." >&2
+    exit 1
+    ;;
+esac
 
 # --- --dry-run : on affiche, on ne lance RIEN ---------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -145,19 +141,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   printf 'PROJECT  : %s\n' "$PROJECT"
   printf 'binaire  : %s\n' "$BIN"
   printf 'commande :'
-  printf ' %q' "$BIN" ${ARGS[@]+"${ARGS[@]}"}
+  printf ' %q' "$BIN" --server "$SERVER_URL" "${KEEP[@]+"${KEEP[@]}"}"
   printf '\n'
-  if [ -r "$SERVICE_JSON" ]; then
-    url="$(service_field url)"
-    pid="$(service_field pid)"
-    printf 'service  : url=%s pid=%s (%s)\n' "${url:-?}" "${pid:-?}" \
-      "$([ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo vivant || echo INACTIF)"
-    printf 'service.json : %s\n' "$SERVICE_JSON"
-  else
-    printf 'service  : pas de %s — le TUI démarrera le service au besoin.\n' "$SERVICE_JSON"
-  fi
+  printf 'serveur  : %s (%s)\n' "$SERVER_URL" "$code"
   exit 0
 fi
 
-# --- lancement : TUI attaché au service --------------------------------------
-exec "$PROJECT/Opencodev2/opencode-v2" ${ARGS[@]+"${ARGS[@]}"}
+# --- lancement : TUI attaché au serveur de fond unique -----------------------
+exec OPENCODE_PASSWORD="$pass" "$BIN" --server "$SERVER_URL" "${KEEP[@]+"${KEEP[@]}"}"
