@@ -1,23 +1,81 @@
 # factory-ui — panneau `/factory`
 
-Commande TUI qui montre ce que fait l'usine à blocs sans lire un journal :
-bloc courant et temps restant, sessions par équipe, signaux anormaux, dernière
-décision, incidents récents, prochain tick.
+Poste de pilotage de l'usine à blocs : on voit le bloc, ses règles rattachées,
+la progression de son objectif, les sessions, les signaux et les incidents
+groupés — **et on agit** (pause/reprise) sans quitter la TUI.
 
-Le plugin ne calcule **rien** : il appelle
-`python3 mcp/opencode-factory/cli.py --ui-json` et rend le JSON reçu en texte
-compact. Toute la vérité est dans le backend.
+Le plugin ne décide rien : il lit `python3 mcp/opencode-factory/cli.py --ui-json`
+et rend le JSON reçu en lignes mesurées. Les gestes passent par les
+sous-commandes réelles de `cli.py`, jamais par une chaîne exécutée librement.
 
-## Lecture seule
+## Ce que le panneau affiche
+
+| Ligne | Contenu |
+| --- | --- |
+| `BLOC` | nom, fenêtre `09:00→14:00`, état (`ouverte`, `fermée`, `EN PAUSE`), progression de l'objectif |
+| règles | une ligne par règle rattachée (`produces` du bloc), indentée, avec son état |
+| `SESSIONS` | nombre réel, équipes, âge — les entrées de test (`ses_test123`) ne s'affichent jamais |
+| `SIGNAUX` | total et trois signaux les plus récents |
+| `DÉCISION` | dernière décision : mode, actions, refus, coût |
+| `INCIDENTS` | **groupés par motif**, triés par fréquence décroissante, huit groupes visibles maximum |
+| `TICK` | verrou et prochain battement |
+| `JOUR` | runs, incidents et coût du jour |
+
+La progression vient de `milestones.progression()` (module backend t42). Si la
+source est absente, injoignable ou si le bloc n'a pas d'objectif structuré, la
+ligne affiche `inconnu : <motif>` — **jamais `0`** : un zéro inventé ferait
+croire que rien n'a été produit.
+
+Les incidents sont regroupés par motif :
+
+```
+▸ dry_run — 142 fois — 09:12 → 13:58 — 1re : mode=dry_run
+```
+
+`entrée` sur un groupe le déplie (fenêtre d'incidents), `entrée` à nouveau le
+replie.
+
+## Touches réelles
+
+| Touche | Effet | Backend |
+| --- | --- | --- |
+| `p` | pause ou reprise des récurrents | `cli.py factory pause --raison "panneau"` / `cli.py factory resume` |
+| `r` | rafraîchit le relevé | `cli.py --ui-json` |
+| `entrée` | déplie / replie un groupe d'incidents | — (état local du panneau) |
+| `q` | quitte le panneau | — |
+
+Chaque action affiche le code de sortie et la sortie du backend :
+
+```
+OK   python3 …/cli.py factory pause --raison panneau → code 0 · pause posée depuis …
+ÉCHEC python3 …/cli.py factory resume → code 2 · ERREUR : reprise non enregistrée (…)
+```
+
+Une action qui échoue ne prétend jamais avoir réussi : le code et le message
+d'erreur restent affichés en tête du panneau.
+
+## Ancien contrat : actions indisponibles
+
+Jusqu'à t30, `cli.py` n'exposait que `--ui-json` et le panneau était en lecture
+seule : aucune touche `s`/`p`/`m` n'était proposée. Depuis t45, `factory
+pause|resume` existent et sont branchées ; les autres gestes (démarrer/arrêter
+le bloc, changer `max_sessions`) restent absents et **aucune touche ne les
+simule**. Pour en ajouter un, il faudra une sous-commande réelle dans `cli.py`
+puis une entrée explicite dans `CLI_APPELS` (`tui.ts`) — le test de contrat
+refuse toute option inconnue du backend.
+
+## Lecture seule côté fichiers
 
 | Ce que le plugin fait | Ce qu'il ne fait pas |
 | --- | --- |
-| lit la sortie de `cli.py --ui-json` | aucune écriture fichier |
+| lit `cli.py --ui-json`, `blocks.json`, `recurring-tasks.json`, `paused.json` | aucune écriture fichier depuis TypeScript |
+| appelle `factory pause` / `factory resume` (le backend écrit) | aucun `exec` de chaîne arbitraire |
 | affiche `—` + la raison quand un champ vaut `null` | jamais `0` à la place d'une donnée absente |
-| ouvre une boîte de dialogue TUI | aucun appel réseau, aucune écriture en base |
 
-`cli.py` ouvre la base OpenCode en `mode=ro` et ne sonde pas le CDP. Le plugin
-n'écrit ni `blocks.json`, ni `state.json`, ni aucune configuration OpenCode.
+Le plugin n'écrit ni `blocks.json`, ni `state.json`, ni aucune configuration
+OpenCode. Un incident ou une session mentionnant `ses_test123` est écarté de
+l'affichage, et l'entrée a été purgée de `.opencode/factory/state.json` avec
+sauvegarde `.bak-<horodatage>` (écriture atomique tmp + `os.replace`).
 
 ## Activation — v2, depuis le dossier, sans ligne de config
 
@@ -73,26 +131,17 @@ chargement ; la copie de sauvegarde et le `sed` ne servent qu'à nettoyer une
 éventuelle entrée `package` ajoutée à la main. Pour revenir en arrière :
 `mv /tmp/opencode/factory-ui.off Opencodev2/config/opencode/plugins/factory-ui`.
 
-## Actions indisponibles
-
-`/factory` **n'affiche aucune touche `s` / `p` / `m`**. `cli.py` n'expose
-aujourd'hui que `--ui-json` : il n'existe aucune sous-commande pour démarrer ou
-arrêter le bloc, mettre en pause, ou changer `max_sessions` (1 ou 2). Le plugin
-n'invente pas d'appel et ne propose pas une touche qui ne ferait rien.
-
-Quand le backend les exposera (par exemple `--bloc-start`, `--bloc-stop`,
-`--bloc-pause`, `--max-sessions`), il suffira d'ajouter l'entrée correspondante
-dans le bloc `CLI_APPELS` de `tui.ts` ; le test de contrat
-`mcp/opencode-factory/tests/test_tui_contract.py` refusera toute option absente
-de `cli.py`.
-
 ## Vérification
 
 ```sh
 python3 mcp/opencode-factory/tests/test_tui_contract.py
+python3 mcp/opencode-factory/tests/test_ui_json.py
 ```
 
-Le test lit le bloc `CLI_APPELS` de `tui.ts`, vérifie que chaque option existe
-dans `cli.py`, et vérifie qu'aucun fichier du plugin ne mentionne ni n'écrit
-`.opencode/opencode.json`. Il ne démarre pas le serveur : le rendu visuel dans
-la TUI reste à contrôler à la main par Marc.
+`test_ui_json.py` vérifie que `--ui-json` reste exploitable (sept sections,
+erreur par section sans plantage global) et que le groupement d'incidents donne
+les bons comptes et le bon ordre sur un jeu de 175 incidents à deux motifs.
+`test_tui_contract.py` vérifie que chaque option appelée par `tui.ts` existe
+dans `cli.py` et qu'aucun fichier du plugin n'écrit de configuration. Ni l'un ni
+l'autre ne démarre le serveur : le rendu visuel réel reste à contrôler à la main
+par Marc.

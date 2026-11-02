@@ -1,56 +1,161 @@
-// factory-ui — commande /factory (TUI)
+// factory-ui — commande /factory (TUI) : poste de pilotage
 //
-// Lit l'unique source de vérité produite par `mcp/opencode-factory/cli.py
-// --ui-json` et l'affiche en texte compact. Aucune logique métier ici : le
-// backend calcule, le plugin rend. Lecture seule : le plugin n'écrit aucun
-// fichier (surtout pas une configuration OpenCode).
+// Lit la source de vérité `cli.py --ui-json` et l'affiche en lignes mesurées.
+// Le plugin ne calcule aucune décision : il rend, regroupe les incidents pour
+// rester lisible, et appelle explicitement les sous-commandes existantes de
+// cli.py pour agir (`factory pause|resume`). Aucun `exec` de chaîne arbitraire,
+// aucune écriture de configuration.
 import { Plugin } from "@opencode/plugin/tui"
 import { execFileSync } from "node:child_process"
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 
 const PROJECT = "/media/marcs/Linux_Apps/Projets_AI"
-const CLI = `${PROJECT}/mcp/opencode-factory/cli.py`
+const FABRIQUE = `${PROJECT}/mcp/opencode-factory`
+const CLI = `${FABRIQUE}/cli.py`
+const BLOCS = `${PROJECT}/.opencode/factory/blocks.json`
+const RECURRENTS = `${PROJECT}/.opencode/recurring-tasks.json`
+const PAUSE = `${PROJECT}/.opencode/factory/paused.json`
 const PYTHON = process.env.FACTORY_PYTHON || "python3"
+
+// Mise en page : largeur mesurée sur le terminal, repli 100, plafond 200.
+const LARGEUR_REPLI = 100
+const LARGEUR_MAX = 200
+const GROUPES_MAX = 8
+const MESSAGE_MAX = 80
+const INCIDENTS_DEPLIES_MAX = 6
+const ID_TEST = "ses_test123"
 
 // Appels au backend. Le test de contrat
 // (mcp/opencode-factory/tests/test_tui_contract.py) lit ce bloc et vérifie que
 // chaque option existe réellement dans cli.py.
 //
-// Actions s/p/m (démarrer/arrêter le bloc, pause, max_sessions) : ABSENTES.
-// cli.py n'expose encore aucune sous-commande d'écriture pour ces gestes ; on
-// n'en invente pas et on n'affiche donc aucune touche qui ne ferait rien.
+// Ancien contrat (t30) : « Actions indisponibles ». t45 le remplace : pause et
+// reprise passent par les sous-commandes réelles ci-dessous, avec code de
+// sortie affiché. Aucune autre action n'est inventée.
 const CLI_APPELS: Record<string, string[]> = {
   etat: ["--ui-json"],
+  pause: ["factory", "pause", "--raison", "panneau"],
+  reprise: ["factory", "resume"],
 }
 
 type Ctx = any
+// Chaque section du relevé a exactement la forme {"valeur": …, "erreur": …}.
 type Section = { valeur: any; erreur: string | null }
+type Ligne = { texte: string; groupe?: string; action?: Action }
+type Action = "pause" | "rafraichir" | "quitter"
 
-/* ───────── Appel du backend ───────── */
+type Execution = { ok: boolean; code: number | null; sortie: string; erreur: string; commande: string }
 
-function appel(nom: string): any {
-  const args = CLI_APPELS[nom]
-  if (!args) return { error: `appel inconnu : ${nom}` }
-  if (!existsSync(CLI)) return { error: `backend absent : ${CLI}` }
+type Etat = {
+  data: any
+  erreur: string | null
+  blocs: any[]
+  regles: any[]
+  pause: boolean | null
+  progression: any
+}
+
+/* ───────── Appels explicites au backend ───────── */
+
+function executer(args: string[], cwd = PROJECT): Execution {
+  const commande = `python3 ${CLI} ${args.join(" ")}`
   try {
     const stdout = execFileSync(PYTHON, [CLI, ...args], {
       encoding: "utf8",
       timeout: 20000,
       maxBuffer: 8 * 1024 * 1024,
-      cwd: PROJECT,
+      cwd,
     })
-    return JSON.parse(stdout)
+    return { ok: true, code: 0, sortie: String(stdout).trim(), erreur: "", commande }
   } catch (error: any) {
-    const stderr = String(error?.stderr ?? "").trim()
-    const reason = error?.message ?? "échec de l'appel au backend"
-    return { error: `${reason}${stderr ? ` — ${stderr}` : ""}` }
+    const code = typeof error?.status === "number" ? error.status : null
+    const sortie = String(error?.stdout ?? "").trim()
+    const erreur = String(error?.stderr ?? "").trim() || String(error?.message ?? "échec")
+    return { ok: false, code, sortie, erreur, commande }
   }
 }
 
-/* ───────── Rendu : honnêteté avant tout ───────── */
+function lireJson(chemin: string): any | null {
+  try {
+    return JSON.parse(readFileSync(chemin, "utf8"))
+  } catch {
+    return null
+  }
+}
 
-// Une section absente ou illisible vaut {"valeur": null, "erreur": "..."}.
-// On affiche « — » + la raison ; jamais 0, jamais une valeur inventée.
+// Progression de l'objectif : lue par le module backend `milestones.py` (t42),
+// appelé explicitement. Toute panne rend `etat="inconnu"` — jamais un 0.
+const SCRIPT_PROGRESSION = [
+  "import json,sys",
+  "import milestones",
+  "bloc=json.loads(sys.argv[1])",
+  "print(json.dumps(milestones.progression(bloc)))",
+].join(";")
+
+function lireProgression(blocBrut: any): any {
+  if (!blocBrut || typeof blocBrut !== "object" || !blocBrut.objectif) {
+    return { etat: "inconnu", motif: "bloc sans objectif structuré" }
+  }
+  if (!existsSync(`${FABRIQUE}/milestones.py`)) {
+    return { etat: "inconnu", motif: "milestones.py absent" }
+  }
+  try {
+    const stdout = execFileSync(PYTHON, ["-c", SCRIPT_PROGRESSION, JSON.stringify(blocBrut)], {
+      encoding: "utf8",
+      timeout: 6000,
+      maxBuffer: 1024 * 1024,
+      cwd: FABRIQUE,
+    })
+    const valeur = JSON.parse(stdout)
+    return valeur && typeof valeur === "object" ? valeur : { etat: "inconnu", motif: "progression illisible" }
+  } catch (error: any) {
+    const brut = String(error?.stderr ?? error?.message ?? "?").trim()
+    const derniere = brut.split("\n").filter((l: string) => l.trim()).pop() || "progression indisponible"
+    return { etat: "inconnu", motif: derniere }
+  }
+}
+
+function chargerEtat(): Etat {
+  const execution = executer(CLI_APPELS.etat)
+  let data: any = null
+  let erreur: string | null = null
+  if (!execution.ok) {
+    erreur = `backend code ${execution.code ?? "?"} — ${execution.erreur || execution.sortie || "aucun message"}`
+  } else {
+    try {
+      data = JSON.parse(execution.sortie)
+    } catch {
+      erreur = "réponse --ui-json illisible (JSON invalide)"
+    }
+  }
+  if (data && data.error) {
+    erreur = String(data.error)
+    data = null
+  }
+
+  const paquetBlocs = lireJson(BLOCS)
+  const blocs = paquetBlocs && Array.isArray(paquetBlocs.blocks) ? paquetBlocs.blocks : []
+  const paquetRegles = lireJson(RECURRENTS)
+  const regles = paquetRegles && Array.isArray(paquetRegles.rules) ? paquetRegles.rules : []
+
+  let pause: boolean | null = null
+  if (existsSync(PAUSE)) {
+    const etatPause = lireJson(PAUSE)
+    pause = etatPause && typeof etatPause.paused === "boolean" ? etatPause.paused : true // fail-closed
+  } else {
+    pause = false
+  }
+
+  const blocValeur = data?.bloc?.valeur
+  const id = blocValeur && typeof blocValeur.id === "string" ? blocValeur.id : null
+  const blocBrut = id ? blocs.find((b: any) => b && b.id === id) || null : blocs[0] || null
+  const progression = lireProgression(blocBrut)
+
+  return { data, erreur, blocs, regles, pause, progression }
+}
+
+/* ───────── Format ───────── */
+
 function section(data: any, cle: string): Section {
   const s = data && typeof data === "object" ? data[cle] : null
   if (!s || typeof s !== "object") {
@@ -62,8 +167,10 @@ function section(data: any, cle: string): Section {
   }
 }
 
+// Une section en erreur affiche « — » + la raison : jamais 0, jamais une
+// valeur inventée (un zéro ferait croire que rien n'a été fait).
 function absent(s: Section): string {
-  return `—  (${s.erreur || "valeur absente"})`
+  return `— (${s.erreur || "valeur absente"})`
 }
 
 function texte(value: any, repli = "—"): string {
@@ -74,7 +181,6 @@ function nombre(value: any): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "—"
 }
 
-// Minutes -> « 42 min », « 2 h 05 », « 1 j 3 h ». Jamais appelé sur null.
 function duree(min: any): string {
   if (typeof min !== "number" || !Number.isFinite(min) || min < 0) return "—"
   if (min < 60) return `${Math.round(min)} min`
@@ -96,168 +202,478 @@ function heure(value: any): string {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
 }
 
-function idCourt(value: any): string {
+function idCourt(value: any, taille = 16): string {
   const id = texte(value, "?")
-  return id.length > 16 ? `${id.slice(0, 16)}…` : id
+  return id.length > taille ? `${id.slice(0, taille - 1)}…` : id
 }
 
-/* ───────── Blocs du panneau ───────── */
+function couper(value: string, max: number): string {
+  if (max <= 0) return ""
+  return value.length <= max ? value : `${value.slice(0, max - 1)}…`
+}
 
-function lignesBloc(s: Section): string[] {
-  if (s.valeur === null) return [`BLOC    ${absent(s)}`]
+// Tronqué à 80 caractères comme demandé, jamais plus.
+function resumeDetails(details: any): string {
+  if (!details || typeof details !== "object") return couper(texte(details), MESSAGE_MAX)
+  for (const cle of ["api_error", "message", "detail", "raison", "motif", "mode", "rule_id", "session_id"]) {
+    const v = details[cle]
+    if (typeof v === "string" && v.trim()) return couper(v.trim(), MESSAGE_MAX)
+  }
+  try {
+    return couper(JSON.stringify(details), MESSAGE_MAX)
+  } catch {
+    return "—"
+  }
+}
+
+function largeur(): number {
+  const cols = Number((process.stdout as any).columns)
+  const base = Number.isFinite(cols) && cols > 20 ? Math.floor(cols) : LARGEUR_REPLI
+  return Math.min(Math.max(base, 40), LARGEUR_MAX)
+}
+
+function aligner(value: string, taille: number): string {
+  return value.length >= taille ? couper(value, taille) : value + " ".repeat(taille - value.length)
+}
+
+/* ───────── Incidents : un groupe par motif ───────── */
+
+type Groupe = {
+  motif: string
+  nombre: number
+  premier: string
+  dernier: string
+  message: string
+  items: any[]
+}
+
+function contientIdTest(valeur: any): boolean {
+  try {
+    return JSON.stringify(valeur).includes(ID_TEST)
+  } catch {
+    return false
+  }
+}
+
+function grouperIncidents(items: any[]): Groupe[] {
+  const parMotif = new Map<string, Groupe>()
+  const source = Array.isArray(items) ? items : []
+  for (const inc of source) {
+    if (contientIdTest(inc)) continue // jamais de données de test à l'écran
+    const motif = texte(inc?.motif, "?")
+    const h = heure(inc?.heure)
+    let groupe = parMotif.get(motif)
+    if (!groupe) {
+      groupe = {
+        motif,
+        nombre: 0,
+        premier: h,
+        dernier: h,
+        message: resumeDetails(inc?.details),
+        items: [],
+      }
+      parMotif.set(motif, groupe)
+    }
+    groupe.nombre += 1
+    if (h !== "—" && (groupe.premier === "—" || h < groupe.premier)) groupe.premier = h
+    if (h !== "—" && (groupe.dernier === "—" || h > groupe.dernier)) groupe.dernier = h
+    groupe.items.push(inc)
+  }
+  // Fréquence décroissante, puis ordre alphabétique pour un affichage stable.
+  return [...parMotif.values()].sort((a, b) => b.nombre - a.nombre || a.motif.localeCompare(b.motif))
+}
+
+export function grouperIncidentsPourTest(items: any[]): Groupe[] {
+  return grouperIncidents(items)
+}
+
+/* ───────── Sections ───────── */
+
+function etatBloc(brut: any, pause: boolean | null): string {
+  if (pause === true) return "EN PAUSE"
+  if (brut?.dans_fenetre === true && brut?.actif_plan === true) return "ouverte"
+  if (brut?.dans_fenetre === false || brut?.actif_plan === false) return "fermée"
+  return "état inconnu"
+}
+
+function progressionTexte(p: any, objectifBloc: any): string {
+  if (!p || p.etat !== "connu") {
+    const motif = typeof p?.motif === "string" && p.motif ? ` : ${p.motif}` : ""
+    return `inconnu${motif}`
+  }
+  const fait = typeof p.fait === "number" && Number.isFinite(p.fait) ? String(p.fait) : "?"
+  if (typeof p.objectif === "number" && p.objectif > 0) {
+    if (p.atteinte === true) return `cible atteinte (${fait}/${p.objectif})`
+    return `${fait}/${p.objectif}`
+  }
+  if (objectifBloc?.mode === "max") return `${fait} faits (max)`
+  return "inconnu : objectif non chiffré"
+}
+
+function reglesDuBloc(etat: Etat, blocBrut: any): any[] {
+  const produits = Array.isArray(blocBrut?.produces) ? blocBrut.produces : []
+  if (!produits.length) return []
+  return etat.regles.filter((r: any) => r && produits.includes(r.id))
+}
+
+function etatRegle(regle: any, pause: boolean | null): string {
+  if (pause === true) return "EN PAUSE"
+  // Source réelle (recurring-tasks.json) : `paused` booléen.
+  if (typeof regle?.paused === "boolean") return regle.paused ? "suspendue" : "active"
+  if (regle?.actif === true) return "active"
+  if (regle?.actif === false) return "suspendue"
+  return "état inconnu"
+}
+
+function nomManifest(regle: any): string {
+  const manifeste = regle?.goal?.manifest
+  if (typeof manifeste !== "string" || !manifeste) return "—"
+  const morceaux = manifeste.split("/")
+  return morceaux[morceaux.length - 1] || manifeste
+}
+
+function lignesBloc(s: Section, etat: Etat): Ligne[] {
+  const out: Ligne[] = []
+  if (s.valeur === null) {
+    out.push({ texte: `BLOC     ${absent(s)}` })
+    return out
+  }
   const b = s.valeur
   const nom = texte(b.nom ?? b.id)
-  const fenetre =
-    b.fenetre && b.fenetre.debut && b.fenetre.fin ? `${b.fenetre.debut}→${b.fenetre.fin}` : "fenêtre —"
-  const etat = b.actif === true ? "actif" : b.actif === false ? "inactif" : "état —"
-  const out = [`BLOC    ${nom}  ${fenetre}  ${etat}`]
+  const fenetre = b.fenetre && b.fenetre.debut && b.fenetre.fin ? `${b.fenetre.debut}→${b.fenetre.fin}` : "fenêtre —"
+  const blocBrut = etat.blocs.find((x: any) => x && (x.id === b.id || x.id === b.nom)) || null
+  const objectif = blocBrut?.objectif
+  out.push({
+    texte: `BLOC     ${nom}  ${fenetre}  ${etatBloc(b, etat.pause)}  objectif ${progressionTexte(etat.progression, objectif)}`,
+  })
+
   if (b.dans_fenetre === true) {
-    out.push(
-      `        en fenêtre · ${
-        b.temps_restant_min === null ? "reste —" : `reste ${duree(b.temps_restant_min)}`
-      }`
-    )
+    out.push({ texte: `         en fenêtre · ${b.temps_restant_min === null ? "reste —" : `reste ${duree(b.temps_restant_min)}`}` })
   } else if (b.dans_fenetre === false) {
-    out.push(
-      `        hors fenêtre · ${
-        b.prochain_debut_min === null
-          ? "prochaine ouverture —"
-          : `ouvre dans ${duree(b.prochain_debut_min)}`
-      }`
-    )
+    out.push({
+      texte: `         hors fenêtre · ${b.prochain_debut_min === null ? "prochaine ouverture —" : `ouvre dans ${duree(b.prochain_debut_min)}`}`,
+    })
   } else {
-    out.push("        fenêtre —")
-  }
-  return out
-}
-
-function lignesSessions(s: Section): string[] {
-  if (s.valeur === null) return [`SESSIONS ${absent(s)}`]
-  const v = s.valeur
-  const items = Array.isArray(v.items) ? v.items : []
-  const out = [`SESSIONS ${nombre(v.total)}`]
-
-  const parEquipe = v.par_equipe && typeof v.par_equipe === "object" ? Object.entries(v.par_equipe) : []
-  if (parEquipe.length) {
-    out.push(`        ${parEquipe.map(([equipe, n]) => `${equipe} ${n}`).join(" · ")}`)
-  } else {
-    out.push("        par équipe —")
+    out.push({ texte: "         fenêtre —" })
   }
 
-  for (const it of items.slice(0, 6)) {
-    const age =
-      it && it.age_min === null
-        ? `âge —  (${texte(it.erreur, "date de lancement illisible")})`
-        : `il y a ${duree(it?.age_min)}`
-    out.push(
-      `        ${idCourt(it?.id)} · ${texte(it?.regle)} · ${texte(it?.equipe)} · ${age}`
-    )
-  }
-  if (items.length > 6) out.push(`        … ${items.length - 6} de plus`)
-  return out
-}
-
-function lignesSignaux(s: Section): string[] {
-  if (s.valeur === null) return [`SIGNAUX ${absent(s)}`]
-  const v = s.valeur
-  const items = Array.isArray(v.items) ? v.items : []
-  const fenetre = typeof v.fenetre_min === "number" ? ` (${v.fenetre_min} min)` : ""
-  const out = [`SIGNAUX ${nombre(v.total)}${fenetre}`]
-  if (!items.length) {
-    out.push("        aucun")
+  const regles = reglesDuBloc(etat, blocBrut)
+  out.push({ texte: `         règles rattachées : ${regles.length}` })
+  if (!regles.length) {
+    out.push({ texte: "           · aucune (produces vide ou bloc illisible)" })
   } else {
-    for (const sig of items.slice(0, 6)) {
-      out.push(
-        `        ${texte(sig?.gravite, "?")} ${texte(sig?.code, "?")} ${idCourt(sig?.cible)}`
-      )
+    for (const r of regles) {
+      const id = aligner(idCourt(r.id, 12), 12)
+      const st = aligner(etatRegle(r, etat.pause), 12)
+      const h = aligner(heure(r?.schedule?.time), 5)
+      out.push({ texte: `           · ${id}  ${st}  ${h}  ${nomManifest(r)}` })
     }
-    if (items.length > 6) out.push(`        … ${items.length - 6} de plus`)
   }
   return out
 }
 
-function lignesDecision(s: Section): string[] {
-  if (s.valeur === null) return [`DÉCISION ${absent(s)}`]
+function lignesSessions(s: Section): Ligne[] {
+  const out: Ligne[] = []
+  if (s.valeur === null) {
+    out.push({ texte: `SESSIONS ${absent(s)}` })
+    return out
+  }
+  const v = s.valeur
+  const items = (Array.isArray(v.items) ? v.items : []).filter((it: any) => !contientIdTest(it))
+  const ecartees = (Array.isArray(v.items) ? v.items : []).length - items.length
+  const equipes = v.par_equipe && typeof v.par_equipe === "object" ? Object.entries(v.par_equipe) : []
+  const resume = equipes.length ? equipes.map(([e, n]) => `${e} ${n}`).join(" · ") : "par équipe —"
+  const note = ecartees ? ` · ${ecartees} entrée(s) de test écartée(s)` : ""
+  out.push({ texte: `SESSIONS ${items.length} · ${resume}${note}` })
+  if (!items.length) {
+    out.push({ texte: "         aucune session suivie" })
+  } else {
+    for (const it of items.slice(0, 4)) {
+      const age = it?.age_min === null ? `âge — (${texte(it?.erreur, "date illisible")})` : `il y a ${duree(it?.age_min)}`
+      out.push({ texte: `         · ${idCourt(it?.id)} · ${texte(it?.regle)} · ${texte(it?.equipe)} · ${age}` })
+    }
+    if (items.length > 4) out.push({ texte: `         · … ${items.length - 4} de plus` })
+  }
+  return out
+}
+
+function lignesSignaux(s: Section): Ligne[] {
+  const out: Ligne[] = []
+  if (s.valeur === null) {
+    out.push({ texte: `SIGNAUX  ${absent(s)}` })
+    return out
+  }
+  const v = s.valeur
+  const tous = Array.isArray(v.items) ? v.items : []
+  const items = tous.filter((sig: any) => !contientIdTest(sig))
+  const fenetre = typeof v.fenetre_min === "number" ? ` (${v.fenetre_min} min)` : ""
+  out.push({ texte: `SIGNAUX  ${items.length}${fenetre}` })
+  if (!items.length) {
+    out.push({ texte: "         aucun" })
+  } else {
+    for (const sig of items.slice(0, 3)) {
+      out.push({ texte: `         · ${texte(sig?.gravite, "?")} ${texte(sig?.code, "?")} ${idCourt(sig?.cible)}` })
+    }
+    if (items.length > 3) out.push({ texte: `         · … ${items.length - 3} de plus` })
+  }
+  return out
+}
+
+function lignesDecision(s: Section): Ligne[] {
+  if (s.valeur === null) return [{ texte: `DÉCISION ${absent(s)}` }]
   const d = s.valeur
-  const actions = Array.isArray(d.actions) ? `${d.actions.length} action(s)` : "actions —"
-  const refus = Array.isArray(d.refus) ? `${d.refus.length} refus` : "refus —"
-  const cout = typeof d.cout === "number" && Number.isFinite(d.cout) ? `${d.cout.toFixed(2)} €` : "—"
-  const jev = typeof d.jev_consultations === "number" ? `${d.jev_consultations} consult.` : "—"
+  const actions = Array.isArray(d.actions) ? d.actions.length : "—"
+  const refus = Array.isArray(d.refus) ? d.refus.length : "—"
+  // Le journal écrit `cout` (journal.ecrire_decision) ; `jev_cout` n'existe que
+  // dans le dict interne de tick.py, réécrit avant l'écriture. On lit la clé
+  // réelle, et une absence s'affiche « — » : jamais un 0 inventé.
+  const coutBrut = typeof d.cout === "number" ? d.cout : d.jev_cout
+  const cout = typeof coutBrut === "number" && Number.isFinite(coutBrut) ? `${coutBrut.toFixed(2)} €` : "—"
   return [
-    `DÉCISION ${heure(d.at)} · ${texte(d.mode)} · ${actions} · ${refus}`,
-    `        coût ${cout} · JEV ${jev}`,
+    {
+      texte: `DÉCISION ${heure(d.at)} · ${texte(d.mode)} · ${actions} action(s) · ${refus} refus · coût ${cout}`,
+    },
   ]
 }
 
-function lignesIncidents(s: Section): string[] {
-  if (s.valeur === null) return [`INCIDENTS ${absent(s)}`]
-  const v = s.valeur
-  const items = Array.isArray(v.items) ? v.items : []
-  const fenetre = typeof v.fenetre_h === "number" ? `${v.fenetre_h} h` : "fenêtre —"
-  const out = [`INCIDENTS ${nombre(v.total)} sur ${fenetre}`]
-  if (!items.length) {
-    out.push("        aucun")
-  } else {
-    for (const inc of items.slice(0, 5)) {
-      out.push(
-        `        ${heure(inc?.heure)} ${texte(inc?.action, "?")} ${texte(inc?.cible, "?")} · ${texte(inc?.motif, "?")}`
-      )
-    }
-    if (items.length > 5) out.push(`        … ${items.length - 5} de plus`)
+function lignesIncidents(s: Section, ouverts: Set<string>): Ligne[] {
+  const out: Ligne[] = []
+  if (s.valeur === null) {
+    out.push({ texte: `INCIDENTS ${absent(s)}` })
+    return out
   }
+  const v = s.valeur
+  const brut = Array.isArray(v.items) ? v.items : []
+  const echappes = brut.filter((i: any) => contientIdTest(i)).length
+  const groupes = grouperIncidents(brut)
+  const fenetre = typeof v.fenetre_h === "number" ? `${v.fenetre_h} h` : "fenêtre —"
+  const note = echappes ? ` · ${echappes} entrée(s) de test écartée(s)` : ""
+  out.push({ texte: `INCIDENTS ${brut.length - echappes} sur ${fenetre} · ${groupes.length} motif(s)${note}` })
+  if (!groupes.length) {
+    out.push({ texte: "         aucun" })
+    return out
+  }
+  for (const g of groupes.slice(0, GROUPES_MAX)) {
+    const ouvert = ouverts.has(g.motif)
+    const marque = ouvert ? "▾" : "▸"
+    const ligne = couper(
+      `         ${marque} ${g.motif} — ${g.nombre} fois — ${g.premier} → ${g.dernier} — 1re : ${g.message}`,
+      largeur() - 2
+    )
+    out.push({ texte: ligne, groupe: g.motif })
+    if (ouvert) {
+      for (const inc of g.items.slice(0, INCIDENTS_DEPLIES_MAX)) {
+        out.push({
+          texte: couper(
+            `             ${heure(inc?.heure)} ${texte(inc?.action, "?")} ${idCourt(inc?.cible, 12)} · ${resumeDetails(inc?.details)}`,
+            largeur() - 2
+          ),
+        })
+      }
+      if (g.items.length > INCIDENTS_DEPLIES_MAX) {
+        out.push({ texte: `             … ${g.items.length - INCIDENTS_DEPLIES_MAX} incident(s) de plus` })
+      }
+    }
+  }
+  if (groupes.length > GROUPES_MAX) out.push({ texte: `         + ${groupes.length - GROUPES_MAX} autres motifs` })
   return out
 }
 
-function lignesTick(s: Section): string[] {
-  if (s.valeur === null) return [`TICK    ${absent(s)}`]
+function lignesTick(s: Section): Ligne[] {
+  if (s.valeur === null) return [{ texte: `TICK     ${absent(s)}` }]
   const t = s.valeur
   if (t.verrouille === true) {
     const battement =
-      t.dans_s === null
-        ? "battement —"
-        : `battement dans ${nombre(t.dans_s)} s${t.battement_perime ? " · périmé" : ""}`
-    return [`TICK    verrouillé · pid ${texte(t.pid, "—")} · ${battement}`]
+      t.dans_s === null ? "battement —" : `battement dans ${nombre(t.dans_s)} s${t.battement_perime ? " · périmé" : ""}`
+    return [{ texte: `TICK     verrouillé · pid ${texte(t.pid, "—")} · ${battement}` }]
   }
-  if (t.verrouille === false) return ["TICK    libre · aucun battement en cours"]
-  return ["TICK    verrou —"]
+  if (t.verrouille === false) return [{ texte: "TICK     libre · aucun battement en cours" }]
+  return [{ texte: "TICK     verrou —" }]
 }
 
-// Panneau complet. `data` = objet de cli.py --ui-json (ou {error} en échec).
-function panneau(data: any): string {
-  if (!data || typeof data !== "object" || data.error) {
+function lignesDigest(s: Section): Ligne[] {
+  if (s.valeur === null) return [{ texte: `JOUR     ${absent(s)}` }]
+  const d = s.valeur
+  const cout = typeof d.cout === "number" && Number.isFinite(d.cout) ? `${d.cout.toFixed(2)} €` : "—"
+  return [
+    {
+      texte: `JOUR     ${texte(d.date)} · ${nombre(d.runs)} run(s) · ${nombre(d.incidents)} incident(s) · coût ${cout}`,
+    },
+  ]
+}
+
+/* ───────── Composition du panneau ───────── */
+
+function composer(etat: Etat, ouverts: Set<string>, retour: string): Ligne[] {
+  if (etat.erreur) {
     return [
-      "Usine à blocs — panneau indisponible.",
-      "",
-      `Backend : ${texte(data?.error, "réponse vide")}`,
-      "",
-      "Vérifier :",
-      `  python3 ${CLI} --ui-json`,
-    ].join("\n")
+      { texte: "Usine à blocs — panneau indisponible." },
+      { texte: `Backend : ${etat.erreur}` },
+      { texte: `Vérifier : python3 ${CLI} --ui-json` },
+      { texte: "" },
+      { texte: "[r] ↻ Rafraîchir", action: "rafraichir" },
+      { texte: "[q] ✕ Quitter", action: "quitter" },
+    ]
   }
 
-  const lignes: string[] = []
-  lignes.push(`Usine — relevé ${heure(data.at)}${typeof data.schema === "number" ? ` · schéma ${data.schema}` : ""}`)
-  lignes.push("")
-  lignes.push(...lignesBloc(section(data, "bloc")))
+  const data = etat.data
+  const pauseTexte = etat.pause === true ? "oui" : etat.pause === false ? "non" : "inconnue"
+  const schema = typeof data?.schema === "number" ? ` · schéma ${data.schema}` : ""
+  const lignes: Ligne[] = []
+  lignes.push({
+    texte: `Usine à blocs — relevé ${heure(data?.at)}${schema} · pause ${pauseTexte}`,
+  })
+  lignes.push({ texte: "" })
+  lignes.push(...lignesBloc(section(data, "bloc"), etat))
   lignes.push(...lignesSessions(section(data, "sessions")))
   lignes.push(...lignesSignaux(section(data, "signaux")))
   lignes.push(...lignesDecision(section(data, "derniere_decision")))
-  lignes.push(...lignesIncidents(section(data, "incidents")))
+  lignes.push(...lignesIncidents(section(data, "incidents"), ouverts))
   lignes.push(...lignesTick(section(data, "prochain_tick")))
-  lignes.push("")
-  lignes.push("Lecture seule. Actions indisponibles : cli.py n'expose encore aucune")
-  lignes.push("sous-commande d'écriture (démarrer/arrêter le bloc, pause, max_sessions);")
-  lignes.push("aucune touche s/p/m n'est affichée pour ne pas proposer un geste inerte.")
-  return lignes.join("\n")
+  lignes.push(...lignesDigest(section(data, "digest_resume")))
+  lignes.push({ texte: "" })
+  if (retour) {
+    lignes.push({ texte: couper(retour, largeur() - 2) })
+    lignes.push({ texte: "" })
+  }
+  const pause = etat.pause === true
+  lignes.push({ texte: pause ? "[p] ▶ Reprendre les récurrents" : "[p] ⏸ Mettre en pause", action: "pause" })
+  lignes.push({ texte: "[r] ↻ Rafraîchir", action: "rafraichir" })
+  lignes.push({ texte: "[q] ✕ Quitter", action: "quitter" })
+
+  return lignes.map((l) => ({ ...l, texte: couper(l.texte, largeur() - 2) }))
+}
+
+function panneau(etat: Etat, ouverts: Set<string>, retour: string): string {
+  return composer(etat, ouverts, retour)
+    .map((l) => l.texte)
+    .join("\n")
+}
+
+/* ───────── Actions ───────── */
+
+function basculerPause(etat: Etat): string {
+  const enPause = etat.pause === true
+  const args = enPause ? CLI_APPELS.reprise : CLI_APPELS.pause
+  const execution = executer(args)
+  if (execution.ok) {
+    return `OK   ${execution.commande} → code ${execution.code} · ${execution.sortie || "fait"}`
+  }
+  return `ÉCHEC ${execution.commande} → code ${execution.code ?? "?"} · ${execution.erreur || execution.sortie || "aucun message"}`
+}
+
+/* ───────── Boucle de pilotage ───────── */
+
+async function piloter(ctx: Ctx): Promise<void> {
+  let etat = chargerEtat()
+  const ouverts = new Set<string>()
+  let retour = ""
+  ctx.ui.dialog.set({ size: "xlarge" })
+
+  for (;;) {
+    const lignes = composer(etat, ouverts, retour)
+    const options = lignes.map((l, index) => {
+      if (l.action) {
+        return {
+          title: l.texte,
+          value: { type: "action" as const, action: l.action },
+        }
+      }
+      if (l.groupe) {
+        return {
+          title: l.texte,
+          value: { type: "groupe" as const, groupe: l.groupe },
+          description: ouverts.has(l.groupe) ? "entrée : replier" : "entrée : déplier",
+        }
+      }
+      return { title: l.texte || " ", value: { type: "info" as const, index }, disabled: true }
+    })
+
+    const declencheur: { action: Action | null } = { action: null }
+    let choix: any = null
+    try {
+      choix = await ctx.ui.dialog.select({
+        title: "Usine à blocs — poste de pilotage",
+        placeholder: "p pause/reprise · r rafraîchir · entrée déplier/replier · q quitter",
+        options,
+        actions: [
+          {
+            bind: "p",
+            title: "pause / reprise",
+            selection: "none" as const,
+            onTrigger: () => {
+              declencheur.action = "pause"
+              try { ctx.ui.dialog.clear() } catch { /* déjà fermé */ }
+            },
+          },
+          {
+            bind: "r",
+            title: "rafraîchir",
+            selection: "none" as const,
+            onTrigger: () => {
+              declencheur.action = "rafraichir"
+              try { ctx.ui.dialog.clear() } catch { /* déjà fermé */ }
+            },
+          },
+          {
+            bind: "q",
+            title: "quitter",
+            selection: "none" as const,
+            onTrigger: () => {
+              declencheur.action = "quitter"
+              try { ctx.ui.dialog.clear() } catch { /* déjà fermé */ }
+            },
+          },
+        ],
+      })
+    } catch (error: any) {
+      // Dernier recours : le panneau texte, sans prétendre que l'action a eu lieu.
+      await ctx.ui.dialog.alert({
+        title: "Usine à blocs",
+        message: `${panneau(etat, ouverts, retour)}\n\naction impossible : ${String(error?.message ?? error)}`,
+      })
+      return
+    }
+
+    if (declencheur.action !== null) {
+      const action = declencheur.action
+      if (action === "quitter") return
+      if (action === "rafraichir") {
+        etat = chargerEtat()
+        retour = `↻ relevé rafraîchi à ${heure(new Date().toISOString())}`
+        continue
+      }
+      const resultat = basculerPause(etat)
+      etat = chargerEtat()
+      retour = resultat
+      continue
+    }
+
+    if (!choix || choix.type === "info") {
+      if (!choix) return
+      continue
+    }
+    if (choix.type === "action") {
+      if (choix.action === "quitter") return
+      if (choix.action === "rafraichir") {
+        etat = chargerEtat()
+        retour = `↻ relevé rafraîchi à ${heure(new Date().toISOString())}`
+        continue
+      }
+      const resultat = basculerPause(etat)
+      etat = chargerEtat()
+      retour = resultat
+      continue
+    }
+    if (choix.type === "groupe") {
+      if (ouverts.has(choix.groupe)) ouverts.delete(choix.groupe)
+      else ouverts.add(choix.groupe)
+      continue
+    }
+  }
 }
 
 /* ───────── Commande /factory ───────── */
-
-async function ouvrirPanneau(ctx: Ctx) {
-  const data = appel("etat")
-  ctx.ui.dialog.set({ size: "large" })
-  await ctx.ui.dialog.alert({ title: "Usine à blocs — /factory", message: panneau(data) })
-}
 
 function Commands(ctx: Ctx) {
   ctx.keymap.layer(() => ({
@@ -266,14 +682,14 @@ function Commands(ctx: Ctx) {
     commands: [
       {
         id: "factory.open",
-        title: "Usine à blocs — état",
-        description: "Bloc, sessions, signaux, dernière décision, incidents, prochain tick",
+        title: "Usine à blocs — pilotage",
+        description: "Bloc, règles, sessions, signaux, incidents groupés, tick · p pause/reprise · r rafraîchir",
         group: "OpenCode",
         palette: true,
         slash: { name: "factory" },
         run: async () => {
           try {
-            await ouvrirPanneau(ctx)
+            await piloter(ctx)
           } catch (error: any) {
             await ctx.ui.dialog.alert({
               title: "Usine à blocs",
