@@ -104,6 +104,15 @@ function cleanModelId(id) {
 
 const SHELL_TOOL = /^(shell|bash|pty)$/i
 const SPAWN_TOOL = /^(subagent|task)$/i
+// Coupe-circuit blocs consécutifs : un agent bloqué en boucle par ce guard ne
+// déclenche jamais loop-guard (execute.after ne s'exécute pas sur un refus du
+// before). 5 refus consécutifs sans UN SEUL appel exécuté entre deux ⇒ abort de
+// la session. Le compteur est remis à zéro sur tout appel exécuté avec succès
+// (execute.after) et à la fin de session ; webnav et les outils cloak sont
+// exclus (leurs réessais quasi identiques sont légitimes — même arbitrage que
+// loop-guard IGNORE_AGENTS / pattern cloak).
+const KILL_BLOCKS_THRESHOLD = 5
+const BLOCKS = new Map()
 const WRITE_TOOL =
   /(apply_patch|multi.?edit|^edit$|^write$|write_file|create_file|replace_file_content|insert_file_content|delete_file|remove_file|move_file|rename_file)/i
 
@@ -997,15 +1006,23 @@ export function parseSteps(txt) {
           .replace(/[^a-z0-9-]/g, "")
       }
     }
+    // Dernière ligne `- Verdict:` du bloc : c'est le verdict final qui compte
+    // (un FIX re-jugé PASS ne doit pas être lu comme un FIX, et inversement).
+    const verdicts = Array.from(block.matchAll(/^-\s*Verdict\s*:\s*(.+)$/gim))
+    const verdict = verdicts.length ? verdicts[verdicts.length - 1][1].trim() : ""
     const step = {
       title: rawTitle,
       id: id || "",
       explicitId: !!explicitId,
       qui: get(/^-\s*Qui\s*:\s*(.+)$/im).toLowerCase(),
       scope: get(/^-\s*P[ée]rim[èe]tre\s*:\s*(.+)$/im),
+      // `- Après:` : ids des étapes qui doivent être closes AVANT de lancer
+      // celle-ci. Même forme que `- Périmètre` (casse libre, accent optionnel).
+      after: get(/^-\s*Apr[èe]s\s*:\s*(.+)$/im),
       paid: get(/^-\s*Modèle payant\s*:\s*(.+)$/im),
       model: get(/^-\s*Modèle\s*:\s*(.+)$/im),
       statut: get(/^-\s*Statut\s*:\s*(.+)$/im).toLowerCase(),
+      verdict,
     }
     if (step.id) {
       if (seen[step.id]) {
@@ -1030,6 +1047,58 @@ function scopeList(step) {
     .split(/,|·|\n/)
     .map((s) => s.trim().replace(/^`|`$/g, "").replace(/^\.\./, "").replace(/^\.\//, ""))
     .filter(Boolean)
+}
+
+// ---------- gate `- Après:` ----------
+// Une étape qui porte `- Après: t1, t2` ne peut être lancée que si CHAQUE id
+// cité existe dans le manifest, est close, et porte `- Verdict: PASS`.
+// Sans le champ, rien ne change : les manifests existants passent tels quels.
+function afterList(step) {
+  return String(step && step.after ? step.after : "")
+    .split(/,|·|\n/)
+    .map((s) => s.trim().replace(/^`|`$/g, ""))
+    .filter(Boolean)
+}
+
+// Statuts considérés comme clos. `close` est la forme canonique ; les variantes
+// déjà présentes dans les manifests (« close (PASS) », clôturée, terminée) sont
+// acceptées pour ne pas bloquer un manifest ancien — c'est le `- Verdict: PASS`
+// qui porte la preuve, pas le libellé du statut.
+const CLOSED_STATUS = new Set(["close", "cloturee", "clôturée", "terminee", "terminée", "completed", "done"])
+
+function stepClosed(step) {
+  const s = normalizeStatut(step && step.statut).replace(/[`*]/g, "").trim()
+  if (!s) return false
+  if (CLOSED_STATUS.has(s)) return true
+  return /^close\b/.test(s) || /^cloturee\b/.test(s) || /^terminee\b/.test(s)
+}
+
+function verdictPass(step) {
+  const v = String(step && step.verdict ? step.verdict : "").replace(/[`*_]/g, "").trim()
+  return /^pass\b/i.test(v)
+}
+
+// Liste des refus (vide = gate franchi). Chaque message nomme l'étape bloquante.
+function afterGate(txt, step) {
+  const ids = afterList(step)
+  if (!ids.length) return []
+  const steps = parseSteps(txt).filter((s) => !s.superseded)
+  const out = []
+  for (const depId of ids) {
+    const dep = steps.find((s) => s.id === depId)
+    if (!dep) {
+      out.push("Après: l'étape « " + depId + " » est citée par " + step.id + " mais n'existe pas dans le manifest")
+    } else if (!stepClosed(dep)) {
+      out.push(
+        "Après: l'étape « " + depId + " » n'est pas close (Statut: " + (dep.statut || "(vide)") + ") — elle bloque le lancement de " + step.id,
+      )
+    } else if (!verdictPass(dep)) {
+      out.push(
+        "Après: l'étape « " + depId + " » n'a pas de « - Verdict: PASS » (Verdict: " + (dep.verdict || "(absent)") + ") — elle bloque le lancement de " + step.id,
+      )
+    }
+  }
+  return out
 }
 
 function normScope(s) {
@@ -1792,6 +1861,14 @@ export function check(input) {
               notes.push("modèle manuel de Marc respecté pour l'étape " + step.id + " : " + step.model)
             }
           }
+          // Gate `- Après:` : refuse le spawn d'une étape dont les prérequis ne
+          // sont pas clos avec PASS. Le refus entre dans `blocked` comme les
+          // autres : il est audité dans .opencode/orch-audit.jsonl et lève.
+          const afterRefusals = afterGate(txt, step)
+          if (afterRefusals.length) {
+            blocked.push(...afterRefusals)
+            notes.push("gate Après refusé pour l'étape " + step.id + " : " + afterList(step).join(", "))
+          }
         }
       }
       if (!blocked.length) {
@@ -2035,6 +2112,33 @@ export default {
         })
       }
       if (blocked.length) {
+        const killSid = sessionId(input)
+        if (killSid && agent !== "webnav" && !/cloak/i.test(tool)) {
+          const prev = BLOCKS.get(killSid) || { count: 0 }
+          prev.count += 1
+          prev.lastAt = Date.now()
+          BLOCKS.set(killSid, prev)
+          audit({
+            agent,
+            tool,
+            sessionID: killSid,
+            manifest: manifestFor(killSid) || null,
+            blocked: null,
+            notes: [`coupe-circuit blocs consécutifs : ${prev.count}/${KILL_BLOCKS_THRESHOLD}`],
+            input: text,
+          })
+          if (prev.count >= KILL_BLOCKS_THRESHOLD) {
+            BLOCKS.delete(killSid)
+            try {
+              await ctx.client.session.abort({ path: { id: killSid } })
+            } catch {}
+            throw new Error(
+              "orch-guard : session interrompue (coupe-circuit : " + prev.count +
+                " appels refusés d'affilée sans un seul succès). " +
+                "ARRÊTE d'appeler des outils : rends la main à Marc maintenant, en expliquant où tu en es et ce qui bloque.",
+            )
+          }
+        }
         throw new Error(
           "orch-guard : action refusée (" + blocked.join(" · ") + "). " +
             "Rappel : le frontière planifie et juge, le flash exécute. Annonce l'étape dans ton manifest (.opencode/orch/<session>/orchestration.md).",
@@ -2064,6 +2168,11 @@ export default {
       // Ce hook ne doit JAMAIS lever : une exception ici casserait l'agent.
       try {
         const tool = String((input && input.tool) || "")
+        // Reset du compteur de blocs consécutifs sur tout appel réellement exécuté
+        // (execute.after ne s'exécute pas après un refus du before, donc un refus
+        // n'efface jamais la série).
+        const resetSid = sessionId(input)
+        if (resetSid) BLOCKS.delete(resetSid)
         if (!SPAWN_TOOL.test(tool)) return
         const output = (input && input.output) || {}
         const outText = [output.title, output.output, output.metadata].map((v) => (v == null ? "" : String(v))).join(" ")
@@ -2130,6 +2239,7 @@ export default {
             type === "session.execution.failed" ||
             type === "session.deleted"
           ) {
+            BLOCKS.delete(sid)
             POOL.releaseByChild(sid, "fin subagent")
           }
         }
