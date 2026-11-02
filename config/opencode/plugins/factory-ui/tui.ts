@@ -36,13 +36,16 @@ const CLI_APPELS: Record<string, string[]> = {
   etat: ["--ui-json"],
   pause: ["factory", "pause", "--raison", "panneau"],
   reprise: ["factory", "resume"],
+  // t59 : écriture d'un bloc depuis le panneau (touches e et m). Les valeurs
+  // sont passées en arguments séparés à execFileSync, jamais dans une chaîne.
+  bloc_set: ["bloc", "set"],
 }
 
 type Ctx = any
 // Chaque section du relevé a exactement la forme {"valeur": …, "erreur": …}.
 type Section = { valeur: any; erreur: string | null }
 type Ligne = { texte: string; groupe?: string; action?: Action }
-type Action = "pause" | "rafraichir" | "quitter"
+type Action = "pause" | "rafraichir" | "quitter" | "fenetre" | "sessions"
 
 type Execution = { ok: boolean; code: number | null; sortie: string; erreur: string; commande: string }
 
@@ -53,6 +56,7 @@ type Etat = {
   regles: any[]
   pause: boolean | null
   progression: any
+  blocBrut: any | null
 }
 
 /* ───────── Appels explicites au backend ───────── */
@@ -70,7 +74,10 @@ function executer(args: string[], cwd = PROJECT): Execution {
   } catch (error: any) {
     const code = typeof error?.status === "number" ? error.status : null
     const sortie = String(error?.stdout ?? "").trim()
-    const erreur = String(error?.stderr ?? "").trim() || String(error?.message ?? "échec")
+    const brut = String(error?.stderr ?? "").trim() || String(error?.message ?? "échec")
+    // CLI absent (binaire python3 ou cli.py introuvable) : message explicite,
+    // le panneau reste ouvert au lieu de planter.
+    const erreur = error?.code === "ENOENT" ? `CLI introuvable : ${PYTHON} ${CLI}` : brut
     return { ok: false, code, sortie, erreur, commande }
   }
 }
@@ -151,7 +158,7 @@ function chargerEtat(): Etat {
   const blocBrut = id ? blocs.find((b: any) => b && b.id === id) || null : blocs[0] || null
   const progression = lireProgression(blocBrut)
 
-  return { data, erreur, blocs, regles, pause, progression }
+  return { data, erreur, blocs, regles, pause, progression, blocBrut }
 }
 
 /* ───────── Format ───────── */
@@ -357,6 +364,12 @@ function lignesBloc(s: Section, etat: Etat): Ligne[] {
     out.push({ texte: "         fenêtre —" })
   }
 
+  // Quota de sessions lu dans le bloc brut : une clé absente s'affiche « — »,
+  // jamais 0 (0 ferait croire qu'aucune session ne peut tourner).
+  const quota =
+    blocBrut && typeof blocBrut.max_sessions === "number" ? String(blocBrut.max_sessions) : "—"
+  out.push({ texte: `         sessions max : ${quota}` })
+
   const regles = reglesDuBloc(etat, blocBrut)
   out.push({ texte: `         règles rattachées : ${regles.length}` })
   if (!regles.length) {
@@ -510,6 +523,7 @@ function composer(etat: Etat, ouverts: Set<string>, retour: string): Ligne[] {
       { texte: "Usine à blocs — panneau indisponible." },
       { texte: `Backend : ${etat.erreur}` },
       { texte: `Vérifier : python3 ${CLI} --ui-json` },
+      ...(retour ? [{ texte: "" }, { texte: couper(retour, largeur() - 2) }] : []),
       { texte: "" },
       { texte: "[r] ↻ Rafraîchir", action: "rafraichir" },
       { texte: "[q] ✕ Quitter", action: "quitter" },
@@ -537,7 +551,19 @@ function composer(etat: Etat, ouverts: Set<string>, retour: string): Ligne[] {
     lignes.push({ texte: "" })
   }
   const pause = etat.pause === true
+  const quotaCourant =
+    etat.blocBrut && typeof etat.blocBrut.max_sessions === "number"
+      ? etat.blocBrut.max_sessions
+      : "—"
   lignes.push({ texte: pause ? "[p] ▶ Reprendre les récurrents" : "[p] ⏸ Mettre en pause", action: "pause" })
+  lignes.push({
+    texte: `[e] ✎ Fenêtre du bloc ${texte(etat.blocBrut?.id, "?")}`,
+    action: "fenetre",
+  })
+  lignes.push({
+    texte: `[m] ⚙ Sessions max du bloc (${quotaCourant})`,
+    action: "sessions",
+  })
   lignes.push({ texte: "[r] ↻ Rafraîchir", action: "rafraichir" })
   lignes.push({ texte: "[q] ✕ Quitter", action: "quitter" })
 
@@ -562,7 +588,105 @@ function basculerPause(etat: Etat): string {
   return `ÉCHEC ${execution.commande} → code ${execution.code ?? "?"} · ${execution.erreur || execution.sortie || "aucun message"}`
 }
 
+/* ───────── Écriture d'un bloc : fenêtre (e) et quota (m) ───────── */
+
+const HHMM_RE = /^([01][0-9]|2[0-3]):[0-5][0-9]$/
+const FENETRE_RE = /^\s*([0-9]{1,2}:[0-9]{2})\s*-\s*([0-9]{1,2}:[0-9]{2})\s*$/
+
+// Analyse locale, avant tout appel : une saisie invalide ne doit rien écrire.
+function analyserFenetre(valeur: string): { debut: string; fin: string } | string {
+  const brut = String(valeur ?? "").trim()
+  const m = FENETRE_RE.exec(brut)
+  if (!m) return `format attendu HH:MM-HH:MM (reçu ${JSON.stringify(brut)})`
+  const debut = m[1] ?? ""
+  const fin = m[2] ?? ""
+  if (!HHMM_RE.test(debut) || !HHMM_RE.test(fin)) {
+    return `heure invalide : ${debut}-${fin} (00:00 à 23:59 attendu)`
+  }
+  if (!(debut < fin)) return `fenêtre ${debut}-${fin} refusée : debut doit être strictement avant fin`
+  return { debut, fin }
+}
+
+function analyserQuota(valeur: string): number | string {
+  const brut = String(valeur ?? "").trim()
+  if (!/^[0-9]+$/.test(brut)) return `entier >= 1 attendu (reçu ${JSON.stringify(brut)})`
+  const n = Number(brut)
+  if (!Number.isSafeInteger(n) || n < 1) return `entier >= 1 attendu (reçu ${JSON.stringify(brut)})`
+  return n
+}
+
+// Bilan d'un appel : le code de sortie réel, jamais une réussite supposée.
+function bilan(execution: Execution): string {
+  if (execution.ok) {
+    const detail = execution.sortie.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 2).join(" · ")
+    return `OK ${execution.commande} → code 0${detail ? ` · ${detail}` : ""}`
+  }
+  const message = execution.erreur || execution.sortie || "aucun message"
+  const premiere = message.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 2).join(" · ")
+  return `ÉCHEC code ${execution.code ?? "?"} — ${premiere}`
+}
+
+function idBlocSelectionne(etat: Etat): string | null {
+  const id = etat.blocBrut?.id ?? etat.data?.bloc?.valeur?.id
+  return typeof id === "string" && id ? id : null
+}
+
+async function editerFenetre(ctx: Ctx, etat: Etat): Promise<string> {
+  const id = idBlocSelectionne(etat)
+  if (!id) return "ÉCHEC code ? — aucun bloc sélectionné, rien n'a été écrit"
+  const brut = etat.blocBrut
+  const debut = brut && typeof brut.debut === "string" ? brut.debut : "09:00"
+  const fin = brut && typeof brut.fin === "string" ? brut.fin : "14:00"
+  const saisie = await ctx.ui.dialog.prompt({
+    title: `Fenêtre de ${id} — HH:MM-HH:MM`,
+    placeholder: "09:00-14:00",
+    value: `${debut}-${fin}`,
+  })
+  if (saisie === undefined) return "fenêtre : annulé (Échap), rien n'a été écrit"
+  const verif = analyserFenetre(saisie)
+  if (typeof verif === "string") return `ÉCHEC — ${verif} · rien n'a été écrit`
+  // Arguments séparés : aucune chaîne utilisateur n'entre dans une commande.
+  const execution = executer([
+    ...CLI_APPELS.bloc_set,
+    "--bloc", id,
+    "--debut", verif.debut,
+    "--fin", verif.fin,
+  ])
+  return bilan(execution)
+}
+
+async function editerQuota(ctx: Ctx, etat: Etat): Promise<string> {
+  const id = idBlocSelectionne(etat)
+  if (!id) return "ÉCHEC code ? — aucun bloc sélectionné, rien n'a été écrit"
+  const actuel =
+    etat.blocBrut && typeof etat.blocBrut.max_sessions === "number"
+      ? String(etat.blocBrut.max_sessions)
+      : ""
+  const saisie = await ctx.ui.dialog.prompt({
+    title: `Sessions max de ${id} — entier ≥ 1`,
+    placeholder: "1",
+    value: actuel,
+  })
+  if (saisie === undefined) return "sessions max : annulé (Échap), rien n'a été écrit"
+  const verif = analyserQuota(saisie)
+  if (typeof verif === "string") return `ÉCHEC — ${verif} · rien n'a été écrit`
+  const execution = executer([
+    ...CLI_APPELS.bloc_set,
+    "--bloc", id,
+    "--max-sessions", String(verif),
+  ])
+  return bilan(execution)
+}
+
 /* ───────── Boucle de pilotage ───────── */
+
+async function executerActionPanneau(ctx: Ctx, etat: Etat, action: Action): Promise<string | null> {
+  if (action === "quitter") return null
+  if (action === "rafraichir") return `↻ relevé rafraîchi à ${heure(new Date().toISOString())}`
+  if (action === "pause") return basculerPause(etat)
+  if (action === "fenetre") return editerFenetre(ctx, etat)
+  return editerQuota(ctx, etat)
+}
 
 async function piloter(ctx: Ctx): Promise<void> {
   let etat = chargerEtat()
@@ -594,7 +718,8 @@ async function piloter(ctx: Ctx): Promise<void> {
     try {
       choix = await ctx.ui.dialog.select({
         title: "Usine à blocs — poste de pilotage",
-        placeholder: "p pause/reprise · r rafraîchir · entrée déplier/replier · q quitter",
+        placeholder:
+          "p pause/reprise · e fenêtre · m sessions max · r rafraîchir · entrée déplier/replier · q quitter",
         options,
         actions: [
           {
@@ -603,6 +728,24 @@ async function piloter(ctx: Ctx): Promise<void> {
             selection: "none" as const,
             onTrigger: () => {
               declencheur.action = "pause"
+              try { ctx.ui.dialog.clear() } catch { /* déjà fermé */ }
+            },
+          },
+          {
+            bind: "e",
+            title: "fenêtre du bloc",
+            selection: "none" as const,
+            onTrigger: () => {
+              declencheur.action = "fenetre"
+              try { ctx.ui.dialog.clear() } catch { /* déjà fermé */ }
+            },
+          },
+          {
+            bind: "m",
+            title: "sessions max du bloc",
+            selection: "none" as const,
+            onTrigger: () => {
+              declencheur.action = "sessions"
               try { ctx.ui.dialog.clear() } catch { /* déjà fermé */ }
             },
           },
@@ -638,14 +781,9 @@ async function piloter(ctx: Ctx): Promise<void> {
     if (declencheur.action !== null) {
       const action = declencheur.action
       if (action === "quitter") return
-      if (action === "rafraichir") {
-        etat = chargerEtat()
-        retour = `↻ relevé rafraîchi à ${heure(new Date().toISOString())}`
-        continue
-      }
-      const resultat = basculerPause(etat)
+      const resultat = await executerActionPanneau(ctx, etat, action)
       etat = chargerEtat()
-      retour = resultat
+      retour = resultat ?? ""
       continue
     }
 
@@ -655,14 +793,9 @@ async function piloter(ctx: Ctx): Promise<void> {
     }
     if (choix.type === "action") {
       if (choix.action === "quitter") return
-      if (choix.action === "rafraichir") {
-        etat = chargerEtat()
-        retour = `↻ relevé rafraîchi à ${heure(new Date().toISOString())}`
-        continue
-      }
-      const resultat = basculerPause(etat)
+      const resultat = await executerActionPanneau(ctx, etat, choix.action)
       etat = chargerEtat()
-      retour = resultat
+      retour = resultat ?? ""
       continue
     }
     if (choix.type === "groupe") {
@@ -683,7 +816,7 @@ function Commands(ctx: Ctx) {
       {
         id: "factory.open",
         title: "Usine à blocs — pilotage",
-        description: "Bloc, règles, sessions, signaux, incidents groupés, tick · p pause/reprise · r rafraîchir",
+        description: "Bloc, règles, sessions, signaux, incidents groupés, tick · p pause/reprise · e fenêtre · m sessions max · r rafraîchir",
         group: "OpenCode",
         palette: true,
         slash: { name: "factory" },
