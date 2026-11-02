@@ -148,4 +148,5 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 # --- lancement : TUI attaché au serveur de fond unique -----------------------
-exec OPENCODE_PASSWORD="$pass" "$BIN" --server "$SERVER_URL" "${KEEP[@]+"${KEEP[@]}"}"
+export OPENCODE_PASSWORD="$pass"
+exec "$BIN" --server "$SERVER_URL" "${KEEP[@]+"${KEEP[@]}"}"
