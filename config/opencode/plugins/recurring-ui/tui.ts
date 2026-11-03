@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { execFileSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 
 const PROJECT = "/media/marcs/Linux_Apps/Projets_AI"
 const PYTHON = `${PROJECT}/mcp/opencode-recurring/venv/bin/python`
@@ -133,12 +133,27 @@ function detailText(rule: Rule) {
   ]
   if (rule.goal?.enabled) {
     lines.push(`Goal : oui — ${rule.goal.objective || rule.title}`)
+    lines.push(`Manifest : ${rule.goal.manifest || "aucun (goal libre)"}`)
     lines.push("Lancement : session agent build à l'échéance, reprise auto si usageLimited")
-    if (rule.goal.agents) {
+    const parsed = manifestSteps(rule)
+    if (parsed) {
+      const byRole: Record<string, { count: number; models: Set<string> }> = {}
+      for (const step of parsed.steps) {
+        const r = step.role
+        if (!byRole[r]) byRole[r] = { count: 0, models: new Set() }
+        byRole[r].count++
+        if (step.model) byRole[r].models.add(step.model)
+      }
+      const roleLines = Object.entries(byRole)
+        .map(([role, info]) => `${role} ${info.count}× ${Array.from(info.models).join(", ") || "aucun modèle"}`)
+        .join(" · ")
+      lines.push(`Modèles réels (manifeste) : ${roleLines}`)
+      lines.push(`Détail par étape : 🧩 Rôles & modèles`)
+    } else if (rule.goal.agents) {
       const agentsStr = formatAgents(rule.goal)
-      if (agentsStr) lines.push(`Modèles : ${agentsStr}`)
+      if (agentsStr) lines.push(`Défaut de rôle (aucun manifeste) : ${agentsStr}`)
     } else if (rule.goal.model) {
-      lines.push(`Modèle : ${rule.goal.model}`)
+      lines.push(`Défaut de rôle (aucun manifeste) : Modèle : ${rule.goal.model}`)
     }
     const run = rule.goalRun
     if (run) {
@@ -152,6 +167,123 @@ function detailText(rule: Rule) {
     lines.push("Goal : non")
   }
   return lines.join("\n")
+}
+
+/* ───────── bloc « Avancement » (disque seul, aucun événement de session) ───────── */
+
+const ORCH_ROOT = `${PROJECT}/.opencode/orch`
+const PROGRESS_STEPS = 12
+
+type StepAdvance = { id: string; title: string; status: string }
+
+// Dernier manifeste `.opencode/orch/ses_*/orchestration.md` par mtime : un run
+// peut mourir en silence, on se fie au fichier, jamais à l'état de session.
+function latestManifest(): string | null {
+  let best: string | null = null
+  let bestAt = -1
+  let dirs: string[] = []
+  try {
+    dirs = readdirSync(ORCH_ROOT).filter((name) => name.startsWith("ses_"))
+  } catch {
+    return null
+  }
+  for (const name of dirs) {
+    const path = `${ORCH_ROOT}/${name}/orchestration.md`
+    if (!existsSync(path)) continue
+    try {
+      const info = statSync(path)
+      if (!info.isFile()) continue
+      if (info.mtimeMs > bestAt) {
+        bestAt = info.mtimeMs
+        best = path
+      }
+    } catch {
+      // manifeste illisible : on l'ignore, un autre run est peut-être vivant
+    }
+  }
+  return best
+}
+
+function shortText(value: string, max: number) {
+  const text = value.replace(/\s+/g, " ").trim()
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+function clockLabel(at: number) {
+  const date = new Date(at)
+  return `${pad(date.getDate())}/${pad(date.getMonth() + 1)} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// Couples `## <id> — <titre>` / `- Statut:`. Une étape réapparue (relance) garde
+// sa DERNIÈRE occurrence ; les titres sans statut (sections) ne sont pas des étapes.
+function parseAdvance(content: string): StepAdvance[] {
+  const steps: StepAdvance[] = []
+  let current: StepAdvance | null = null
+  for (const raw of content.split("\n")) {
+    const line = raw.trim()
+    const heading = /^##\s+(.+)$/.exec(line)
+    if (heading) {
+      if (current) steps.push(current)
+      const text = heading[1].trim()
+      const parts = /^([A-Za-z0-9_-]+)\s+[—-]\s+(.+)$/.exec(text)
+      current = parts
+        ? { id: parts[1], title: parts[2].trim(), status: "" }
+        : { id: text, title: text, status: "" }
+      continue
+    }
+    if (!current) continue
+    const status = /^-\s*Statut\s*:\s*(.+)$/.exec(line)
+    if (status) current.status = status[1].trim()
+  }
+  if (current) steps.push(current)
+
+  const kept: StepAdvance[] = []
+  const seen: { [id: string]: number } = {}
+  for (const step of steps) {
+    if (!step.status) continue
+    const position = seen[step.id]
+    if (position === undefined) {
+      seen[step.id] = kept.length
+      kept.push(step)
+    } else {
+      kept[position] = step
+    }
+  }
+  return kept
+}
+
+// Relu sur le disque à CHAQUE appel (donc à chaque tick du timer) : aucun état
+// de session, aucun cache entre deux ticks.
+function progressText(): string {
+  const path = latestManifest()
+  if (!path) return "Avancement — aucun run"
+  let content = ""
+  let at = Date.now()
+  try {
+    content = readFileSync(path, "utf8")
+    at = statSync(path).mtimeMs
+  } catch {
+    return "Avancement — aucun run"
+  }
+  const dirs = path.split("/")
+  const session = dirs[dirs.length - 2] || "?"
+  const head = `Avancement — ${session} · maj ${clockLabel(at)}`
+  const steps = parseAdvance(content).slice(-PROGRESS_STEPS)
+  if (!steps.length) return `${head}\n(aucune étape dans le manifeste)`
+  return [
+    head,
+    ...steps.map((step) => `${step.id} · ${shortText(step.title, 56)} — Statut : ${shortText(step.status, 56)}`),
+  ].join("\n")
+}
+
+// Ligne unique affichée dans le panneau (/recurring) ; réécrite par le timer.
+let progressLine = "Avancement — aucun run"
+
+function refreshProgress() {
+  const lines = progressText().split("\n")
+  const head = lines[0] ?? "Avancement — aucun run"
+  const last = lines.length > 1 ? lines[lines.length - 1] : ""
+  progressLine = shortText(last ? `${head} · ${last}` : head, 140)
 }
 
 function scheduleLabel(kind: string, values: any, time: string) {
@@ -526,6 +658,342 @@ function getAgentOptions(isOrchestratorMode: boolean): Array<{ title: string; va
   return options
 }
 
+/* ───────── Manifest parsing (adapté depuis orch-ui/tui.ts) ───────── */
+
+type ManifestStep = {
+  id: string
+  title: string
+  role: string
+  model: string
+  summary: string
+  modelLine: number
+  blockStart: number
+  blockEnd: number
+}
+
+function canonLine(line: string): string {
+  return String(line)
+    .replace(/^\s*-\s*\*\*([^*]+?)\*\*\s*:/, "- $1:")
+    .replace(/^\s*-\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ ]*?)\s*:/, "- $1:")
+}
+
+function manifestSteps(rule: Rule): { path: string; steps: ManifestStep[] } | null {
+  const manifestPath = rule.goal?.manifest
+  if (!manifestPath) return null
+  const resolved = manifestPath.startsWith("/") ? manifestPath : `${PROJECT}/${manifestPath}`
+  if (!existsSync(resolved)) return null
+  let content: string
+  try {
+    content = readFileSync(resolved, "utf8")
+  } catch {
+    return null
+  }
+  const lines = content.split("\n")
+  const headerRE = /^#{2,4}\s/
+  const steps: ManifestStep[] = []
+  const seenId: Record<string, ManifestStep> = {}
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!headerRE.test(lines[i])) continue
+    const headerText = lines[i].replace(/^#{2,4}\s*/, "").trim()
+    const headerIdMatch = /^([A-Za-z0-9_-]+)\s+[—-]\s+(.+)$/.exec(headerText)
+    let stepId = ""
+    let stepTitle = headerText
+    if (headerIdMatch) {
+      stepId = headerIdMatch[1]
+      stepTitle = headerIdMatch[2].trim()
+    }
+    // Find block end (next header or EOF)
+    let blockEnd = i + 1
+    while (blockEnd < lines.length && !headerRE.test(lines[blockEnd])) blockEnd++
+    // Scan block for fields
+    let role = ""
+    let model = ""
+    let summary = ""
+    let modelLine = -1
+    let hasIdLine = false
+    for (let j = i + 1; j < blockEnd; j++) {
+      const canon = canonLine(lines[j])
+      if (/^-\s*id\s*:/.test(canon)) hasIdLine = true
+      if (/^-\s*Qui\s*:/.test(canon)) role = canon.replace(/^-\s*Qui\s*:\s*/, "").trim()
+      if (/^-\s*Modèle\s*:/.test(canon)) {
+        model = canon.replace(/^-\s*Modèle\s*:\s*/, "").trim()
+        modelLine = j
+      }
+      if (/^-\s*Résumé\s*:/.test(canon)) summary = canon.replace(/^-\s*Résumé\s*:\s*/, "").trim()
+    }
+    if (!hasIdLine) continue
+    // Clean title: remove (worker) / (reviewer) / (webnav) suffix
+    const cleanTitle = stepTitle.replace(/\s*\((worker|reviewer|webnav)\)\s*$/, "")
+    const step: ManifestStep = {
+      id: stepId,
+      title: cleanTitle,
+      role: role || "inconnu",
+      model,
+      summary,
+      modelLine,
+      blockStart: i,
+      blockEnd,
+    }
+    seenId[stepId] = step // keep last occurrence
+  }
+
+  // Preserve manifest order for steps with same role, but group by role order
+  const roleOrder = ["worker", "reviewer", "merger", "webnav", "orchestrator"]
+  const ordered: ManifestStep[] = []
+  for (const role of roleOrder) {
+    for (const step of Object.values(seenId)) {
+      if (step.role === role) ordered.push(step)
+    }
+  }
+  // Unknown roles alphabetically
+  const unknownRoles = Array.from(new Set(Object.values(seenId).map(s => s.role)))
+    .filter(r => !roleOrder.includes(r))
+    .sort()
+  for (const role of unknownRoles) {
+    for (const step of Object.values(seenId)) {
+      if (step.role === role) ordered.push(step)
+    }
+  }
+
+  return ordered.length ? { path: resolved, steps: ordered } : null
+}
+
+function stepSummary(step: ManifestStep): string {
+  const text = step.summary || step.title
+  return text.length > 90 ? `${text.slice(0, 89)}…` : text
+}
+
+function roleIcon(role: string): string {
+  if (role === "worker") return "🔨"
+  if (role === "reviewer") return "🔎"
+  if (role === "merger") return "🔀"
+  if (role === "webnav") return "🌐"
+  if (role === "orchestrator") return "⚙"
+  return "❓"
+}
+
+async function manifestFlow(ctx: Ctx, rule: Rule) {
+  const parsed = manifestSteps(rule)
+  if (!parsed) {
+    await ctx.ui.dialog.alert({
+      title: "Manifeste",
+      message: "Aucun manifeste lisible pour cette règle (goal libre ou fichier absent).",
+    })
+    return
+  }
+  const { steps } = parsed
+
+  for (;;) {
+    const options: Array<{ title: string; value: string; description: string }> = []
+    // Steps grouped by role (already ordered in manifestSteps)
+    for (const step of steps) {
+      options.push({
+        title: `${roleIcon(step.role)} ${step.role} · ${step.id} · ${stepSummary(step)}`,
+        value: `step:${step.id}`,
+        description: `${step.model || "aucun modèle"}${step.summary ? "" : " · résumé déduit du titre"}`,
+      })
+    }
+    // Role bulk edit options
+    const rolesPresent = Array.from(new Set(steps.map(s => s.role))).filter(r => r !== "orchestrator")
+    for (const role of rolesPresent) {
+      const roleSteps = steps.filter(s => s.role === role)
+      options.push({
+        title: `⚙ Modifier le modèle des ${roleSteps.length} étapes ${role}`,
+        value: `role:${role}`,
+        description: `${roleSteps.length} étape(s) du rôle ${role}`,
+      })
+    }
+    // Session model (orchestrator) option
+    options.push({
+      title: "⚙ Modifier le modèle de session (orchestrator)",
+      value: "role:orchestrator",
+      description: "Modèle de la session orchestrateur (goal.agents.orchestrator ou goal.model)",
+    })
+    options.push({ title: "↩ Retour", value: "back" })
+
+    const choice = await ctx.ui.dialog.select<string>({
+      title: `${rule.title} — ${steps.length} étapes`,
+      options,
+      search: (q: string, opts: any[]) => {
+        const s = q.trim().toLowerCase()
+        if (!s) return opts
+        return opts.filter(o => `${o.title} ${o.description ?? ""}`.toLowerCase().includes(s))
+      },
+    })
+    if (!choice || choice === "back") return
+
+    if (choice.startsWith("step:")) {
+      const stepId = choice.slice(5)
+      const step = steps.find(s => s.id === stepId)
+      if (step) await setStepModels(ctx, rule, [step], step.role, `${step.role} · ${step.id}`)
+      continue
+    }
+    if (choice.startsWith("role:")) {
+      const role = choice.slice(5)
+      if (role === "orchestrator") {
+        await setSessionModel(ctx, rule)
+      } else {
+        const roleSteps = steps.filter(s => s.role === role)
+        if (roleSteps.length) await setStepModels(ctx, rule, roleSteps, role, role)
+      }
+      continue
+    }
+  }
+}
+
+async function setStepModels(ctx: Ctx, rule: Rule, target: ManifestStep[], role: string, label: string) {
+  const parsed = manifestSteps(rule)
+  if (!parsed) return
+  const { path, steps: allSteps } = parsed
+
+  // Current model(s)
+  const models = Array.from(new Set(target.map(s => s.model).filter(Boolean)))
+  const current = models.join(" · ")
+
+  const model = await askModel(ctx, `Modèle ${label}`, current, role)
+  if (model === undefined) return
+
+  // Confirm
+  const lines = [
+    `${target.length} étape(s)`,
+    ...target.slice(0, 15).map(s => `${s.id} · ${s.model || "aucun"} → ${model}`),
+    ...(target.length > 15 ? ["…"] : []),
+  ]
+  if (rule.goalRun?.status === "active") {
+    lines.push("Un run est en cours : il garde l'ancien modèle (snapshot), le changement s'applique au prochain run.")
+  }
+  const confirmed = await ctx.ui.dialog.confirm({
+    title: `Confirmer le changement de modèle`,
+    message: lines.join("\n"),
+    label: { confirm: "Appliquer", cancel: "Annuler" },
+  })
+  if (!confirmed) return
+
+  // Read fresh, edit, write with backup
+  let content = readFileSync(path, "utf8")
+  let lines2 = content.split("\n")
+
+  for (const step of target) {
+    const blockStart = step.blockStart
+    const blockEnd = step.blockEnd
+    let wrote = false
+    // Replace existing - Modèle: in block
+    for (let i = blockStart + 1; i < blockEnd; i++) {
+      if (/^- Modèle:/.test(canonLine(lines2[i]))) {
+        const indent = lines2[i].match(/^\s*/)?.[0] ?? ""
+        lines2[i] = `${indent}- Modèle: ${model}`
+        wrote = true
+        break
+      }
+    }
+    // Insert after - Qui: if not found
+    if (!wrote) {
+      for (let i = blockStart + 1; i < blockEnd; i++) {
+        if (/^- Qui:/.test(canonLine(lines2[i]))) {
+          const indent = lines2[i].match(/^\s*/)?.[0] ?? ""
+          lines2.splice(i + 1, 0, `${indent}- Modèle: ${model}`)
+          wrote = true
+          break
+        }
+      }
+    }
+    // Fallback: insert after header
+    if (!wrote && blockEnd > blockStart) {
+      const indent = lines2[blockStart].match(/^\s*/)?.[0] ?? ""
+      lines2.splice(blockStart + 1, 0, `${indent}- Modèle: ${model}`)
+      wrote = true
+    }
+    if (!wrote) {
+      await ctx.ui.dialog.alert({
+        title: "Échec",
+        message: `Bloc de l'étape « ${step.id} » inexploitable — aucune écriture.`,
+      })
+      return
+    }
+  }
+
+  // Backup
+  const now = new Date()
+  const bak = `${path}.bak-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  writeFileSync(bak, content, "utf8")
+
+  // Write
+  writeFileSync(path, lines2.join("\n"), "utf8")
+
+  // Verify
+  const verifyContent = readFileSync(path, "utf8")
+  const verifyLines = verifyContent.split("\n")
+  let ok = true
+  const errors: string[] = []
+  for (const step of target) {
+    let found = false
+    for (let i = step.blockStart + 1; i < step.blockEnd; i++) {
+      const canon = canonLine(verifyLines[i])
+      if (/^-\s*Modèle\s*:/.test(canon)) {
+        const val = canon.replace(/^-\s*Modèle\s*:\s*/, "").trim()
+        if (val === model) found = true
+        else errors.push(`${step.id} : attendu ${model}, trouvé ${val}`)
+        break
+      }
+    }
+    if (!found) errors.push(`${step.id} : ligne Modèle absente après écriture`)
+  }
+  if (errors.length) {
+    // Restore
+    writeFileSync(path, content, "utf8")
+    await ctx.ui.dialog.alert({
+      title: "Échec — backup restauré",
+      message: errors.join("\n"),
+    })
+    ok = false
+  }
+
+  // Trace
+  try {
+    writeFileSync(
+      "/tmp/recurring-ui-last-manifest-edit.json",
+      JSON.stringify({
+        at: new Date().toISOString(),
+        manifest: path,
+        ids: target.map(s => s.id),
+        role,
+        from: current,
+        to: model,
+        ok,
+      }, null, 2),
+      "utf8",
+    )
+  } catch {}
+
+  if (ok) {
+    ctx.ui.toast.show({
+      title: "Modèle mis à jour",
+      message: `${target.length} étape(s) · ${label} → ${model}`,
+      variant: "success",
+      duration: 4000,
+    })
+  }
+}
+
+async function setSessionModel(ctx: Ctx, rule: Rule) {
+  const current = rule.goal?.agents?.orchestrator || rule.goal?.model || ""
+  const model = await askModel(ctx, "Modèle orchestrator (session)", current, "orchestrator")
+  if (model === undefined) return
+
+  const result = call(["--update", rule.id, "--patch-json", JSON.stringify({ goal: { agents: { orchestrator: model } } })])
+  if (result.error) {
+    await ctx.ui.dialog.alert({ title: "Échec", message: result.error })
+    return
+  }
+  ctx.ui.toast.show({
+    title: "Modèle de session mis à jour",
+    message: `orchestrator → ${model}`,
+    variant: "success",
+    duration: 4000,
+  })
+}
+
 async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
   const prefill = opts?.prefill
   const isEdit = !!opts?.id
@@ -779,6 +1247,9 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       variant: "success",
       duration: 4000,
     })
+    if (result.warning) {
+      await ctx.ui.dialog.alert({ title: "Attention — manifest incohérent", message: result.warning })
+    }
   } else {
     const result = call(["--add-json", JSON.stringify(payload)])
     if (result.error) {
@@ -791,6 +1262,9 @@ async function addFlow(ctx: Ctx, opts?: { prefill?: Rule; id?: string }) {
       variant: "success",
       duration: 4000,
     })
+    if (result.warning) {
+      await ctx.ui.dialog.alert({ title: "Attention — manifest incohérent", message: result.warning })
+    }
   }
 }
 
@@ -808,6 +1282,7 @@ async function openList(ctx: Ctx) {
     const choice = await ctx.ui.dialog.select<string>({
       title: rules.length ? `Tâches récurrentes (${rules.length})` : "Tâches récurrentes",
       options: [
+        { title: "📈 Avancement", value: "__advance__", description: progressLine },
         { title: "➕ Ajouter une tâche récurrente", value: "__add__", description: "Formulaire guidé" },
         ...rules.map((rule) => ({
           title: `${rule.paused ? "⏸" : "▶"} ${rule.title}`,
@@ -817,6 +1292,11 @@ async function openList(ctx: Ctx) {
       ],
     })
     if (!choice) return
+
+    if (choice === "__advance__") {
+      await ctx.ui.dialog.alert({ title: "Avancement", message: progressText() })
+      continue
+    }
 
     if (choice === "__add__") {
       await addFlow(ctx)
@@ -830,6 +1310,15 @@ async function openList(ctx: Ctx) {
       title: rule.title,
       options: [
         { title: "👁 Voir le détail", value: "detail", description: describeRule(rule) },
+        ...(rule.goal?.manifest
+          ? [
+              {
+                title: "🧩 Rôles & modèles du manifeste",
+                value: "manifest",
+                description: "Chaque worker/reviewer/merger, son job en une phrase et son modèle — modifiable",
+              },
+            ]
+          : []),
         ...(rule.goal?.enabled
           ? [
               {
@@ -869,6 +1358,11 @@ async function openList(ctx: Ctx) {
 
     if (action === "detail") {
       await ctx.ui.dialog.alert({ title: rule.title, message: detailText(rule) })
+      continue
+    }
+
+    if (action === "manifest") {
+      await manifestFlow(ctx, rule)
       continue
     }
 
@@ -974,10 +1468,15 @@ function Commands(ctx: Ctx) {
 export default Plugin.define({
   id: "recurring-ui",
   setup(context) {
+    // Bloc « Avancement » : timer de 2 s qui RELIT le manifeste sur le disque,
+    // indépendant de tout événement de session. Nettoyé à la destruction.
+    refreshProgress()
+    const progressTimer = setInterval(refreshProgress, 2000)
     // `keymap.layer` doit vivre dans un scope Solid : on le monte via le slot `app`,
     // comme le plugin goal. Le layer est libéré avec le slot.
     const dispose = context.ui.slot({ append: "app", render: () => Commands(context) })
     return () => {
+      clearInterval(progressTimer)
       if (typeof dispose === "function") dispose()
     }
   },
