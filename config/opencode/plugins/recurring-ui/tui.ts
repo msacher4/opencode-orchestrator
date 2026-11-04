@@ -209,6 +209,15 @@ function shortText(value: string, max: number) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
+// Segment du bas de l'id, sans provider ni vendor : ce que Marc voit dans la
+// liste du select (qui n'affiche QUE le titre). Rend "" si le modèle est vide ou
+// commence par "—".
+function shortModel(model: string): string {
+  if (!model || model.startsWith("—")) return ""
+  const segments = model.split("/")
+  return segments[segments.length - 1]
+}
+
 function clockLabel(at: number) {
   const date = new Date(at)
   return `${pad(date.getDate())}/${pad(date.getMonth() + 1)} ${pad(date.getHours())}:${pad(date.getMinutes())}`
@@ -786,13 +795,38 @@ async function manifestFlow(ctx: Ctx, rule: Rule) {
 
   for (;;) {
     const options: Array<{ title: string; value: string; description: string }> = []
-    // Steps grouped by role (already ordered in manifestSteps)
+    // Étapes groupées par rôle (déjà ordonnées dans manifestSteps)
+    const byRole = new Map<string, ManifestStep[]>()
     for (const step of steps) {
+      if (!byRole.has(step.role)) byRole.set(step.role, [])
+      byRole.get(step.role)!.push(step)
+    }
+    // Une en-tête non actionnable par rôle, placée AVANT ses étapes : le modèle
+    // court y est mis en titre (le select n'affiche que le titre).
+    for (const role of Array.from(byRole.keys())) {
+      const roleSteps = byRole.get(role)!
+      const distinctModels = Array.from(new Set(roleSteps.map(s => s.model).filter(Boolean)))
+      const modelsLabel = distinctModels.length > 1
+        ? "modèles mixtes"
+        : shortModel(distinctModels[0] || "")
+      const headerTitle = shortText(`──── ${role} · ${roleSteps.length} étape(s) · ${modelsLabel}`, 60)
       options.push({
-        title: `${roleIcon(step.role)} ${step.role} · ${step.id} · ${stepSummary(step)}`,
-        value: `step:${step.id}`,
-        description: `${step.model || "aucun modèle"}${step.summary ? "" : " · résumé déduit du titre"}`,
+        title: headerTitle,
+        value: `__hdr__:${role}`,
+        description: "",
       })
+      for (const step of roleSteps) {
+        const roleModels = Array.from(new Set(roleSteps.map(s => s.model).filter(Boolean)))
+        const singleModel = roleModels.length === 1
+        const title = singleModel
+          ? `${roleIcon(step.role)} ${step.id} · ${shortText(step.summary, 40)}`
+          : `${roleIcon(step.role)} ${step.id} · ${shortModel(step.model)} · ${shortText(step.summary, 26)}`
+        options.push({
+          title,
+          value: `step:${step.id}`,
+          description: `${role} · ${step.model || "aucun modèle"}`,
+        })
+      }
     }
     // Role bulk edit options
     const rolesPresent = Array.from(new Set(steps.map(s => s.role))).filter(r => r !== "orchestrator")
@@ -822,6 +856,10 @@ async function manifestFlow(ctx: Ctx, rule: Rule) {
       },
     })
     if (!choice || choice === "back") return
+
+    if (choice.startsWith("__hdr__")) {
+      continue
+    }
 
     if (choice.startsWith("step:")) {
       const stepId = choice.slice(5)
