@@ -209,13 +209,27 @@ function shortText(value: string, max: number) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
-// Segment du bas de l'id, sans provider ni vendor : ce que Marc voit dans la
-// liste du select (qui n'affiche QUE le titre). Rend "" si le modèle est vide ou
+// Segment du bas de l'id, sans provider ni vendor et sans les suffixes de
+// quantification (a3b, a55b, iq3, q4, q8, gguf) : ce que Marc voit dans la liste
+// du select (qui n'affiche QUE le titre). Rend "" si le modèle est vide ou
 // commence par "—".
 function shortModel(model: string): string {
   if (!model || model.startsWith("—")) return ""
   const segments = model.split("/")
-  return segments[segments.length - 1]
+  let base = segments[segments.length - 1]
+  const suffixes = ["a3b", "a55b", "iq3", "q4", "q8", "gguf"]
+  for (;;) {
+    let stripped = false
+    for (const suffix of suffixes) {
+      const tail = `-${suffix}`
+      if (base.length > tail.length && base.toLowerCase().endsWith(tail)) {
+        base = base.slice(0, base.length - tail.length)
+        stripped = true
+      }
+    }
+    if (!stripped) break
+  }
+  return base
 }
 
 function clockLabel(at: number) {
@@ -795,36 +809,33 @@ async function manifestFlow(ctx: Ctx, rule: Rule) {
 
   for (;;) {
     const options: Array<{ title: string; value: string; description: string }> = []
-    // Étapes groupées par rôle (déjà ordonnées dans manifestSteps)
-    const byRole = new Map<string, ManifestStep[]>()
+    // Un groupe par couple (rôle, modèle) : les rôles dans leur ordre
+    // d'apparition, et dans chaque rôle les modèles dans leur ordre
+    // d'apparition. L'en-tête porte le modèle court (le select n'affiche QUE le
+    // titre), la phrase de l'étape reste entière sous lui.
+    const groups: Array<{ role: string; model: string; steps: ManifestStep[] }> = []
     for (const step of steps) {
-      if (!byRole.has(step.role)) byRole.set(step.role, [])
-      byRole.get(step.role)!.push(step)
+      let group = groups.find(g => g.role === step.role && g.model === step.model)
+      if (!group) {
+        group = { role: step.role, model: step.model, steps: [] }
+        groups.push(group)
+      }
+      group.steps.push(step)
     }
-    // Une en-tête non actionnable par rôle, placée AVANT ses étapes : le modèle
-    // court y est mis en titre (le select n'affiche que le titre).
-    for (const role of Array.from(byRole.keys())) {
-      const roleSteps = byRole.get(role)!
-      const distinctModels = Array.from(new Set(roleSteps.map(s => s.model).filter(Boolean)))
-      const modelsLabel = distinctModels.length > 1
-        ? "modèles mixtes"
-        : shortModel(distinctModels[0] || "")
-      const headerTitle = shortText(`──── ${role} · ${roleSteps.length} étape(s) · ${modelsLabel}`, 60)
+    for (const group of groups) {
+      const label = shortModel(group.model) || "(modèle de la session)"
+      const count = group.steps.length
+      const headerTitle = shortText(`──── ${group.role} · ${count} ${count > 1 ? "étapes" : "étape"} · ${label}`, 60)
       options.push({
         title: headerTitle,
-        value: `__hdr__:${role}`,
+        value: `__hdr__:${group.role}:${group.model}`,
         description: "",
       })
-      for (const step of roleSteps) {
-        const roleModels = Array.from(new Set(roleSteps.map(s => s.model).filter(Boolean)))
-        const singleModel = roleModels.length === 1
-        const title = singleModel
-          ? `${roleIcon(step.role)} ${step.id} · ${shortText(step.summary, 40)}`
-          : `${roleIcon(step.role)} ${step.id} · ${shortModel(step.model)} · ${shortText(step.summary, 26)}`
+      for (const step of group.steps) {
         options.push({
-          title,
+          title: `${roleIcon(step.role)} ${step.id} · ${shortText(step.summary, 46)}`,
           value: `step:${step.id}`,
-          description: `${role} · ${step.model || "aucun modèle"}`,
+          description: `${step.role} · ${step.model || "aucun modèle"}`,
         })
       }
     }
