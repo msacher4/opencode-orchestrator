@@ -111,7 +111,7 @@ const SPAWN_TOOL = /^(subagent|task)$/i
 // (execute.after) et à la fin de session ; webnav et les outils cloak sont
 // exclus (leurs réessais quasi identiques sont légitimes — même arbitrage que
 // loop-guard IGNORE_AGENTS / pattern cloak).
-const KILL_BLOCKS_THRESHOLD = 5
+const KILL_BLOCKS_THRESHOLD = 15
 const BLOCKS = new Map()
 const WRITE_TOOL =
   /(apply_patch|multi.?edit|^edit$|^write$|write_file|create_file|replace_file_content|insert_file_content|delete_file|remove_file|move_file|rename_file)/i
@@ -1019,8 +1019,10 @@ export function parseSteps(txt) {
       // `- Après:` : ids des étapes qui doivent être closes AVANT de lancer
       // celle-ci. Même forme que `- Périmètre` (casse libre, accent optionnel).
       after: get(/^-\s*Apr[èe]s\s*:\s*(.+)$/im),
-      paid: get(/^-\s*Modèle payant\s*:\s*(.+)$/im),
-      model: get(/^-\s*Modèle\s*:\s*(.+)$/im),
+      paid: get(/^-\s*Mod[eè]le payant\s*:\s*(.+)$/im),
+      model: get(/^-\s*Mod[eè]le\s*:\s*(.+)$/im),
+      ecrit: get(/^-\s*[ÉéEe]crit\s*:\s*(.+)$/im),
+      outils: get(/^-\s*Outils\s*:\s*(.+)$/im),
       statut: get(/^-\s*Statut\s*:\s*(.+)$/im).toLowerCase(),
       verdict,
     }
@@ -1047,6 +1049,64 @@ function scopeList(step) {
     .split(/,|·|\n/)
     .map((s) => s.trim().replace(/^`|`$/g, "").replace(/^\.\./, "").replace(/^\.\//, ""))
     .filter(Boolean)
+}
+
+// ---------- Écrit / Outils (sessions récurrentes) ----------
+//
+// Parse la liste `- Écrit:` : remplace <stamp> par *, résout chemins relatifs contre PROJECT,
+// accepte chemins absolus (y compris hors PROJECT comme /tmp/opencode/...). Match glob segment par segment.
+function ecritList(step) {
+  return String(step && step.ecrit ? step.ecrit : "")
+    .split(/,|·|\n/)
+    .map((s) => s.trim().replace(/^`|`$/g, ""))
+    .filter(Boolean)
+    .map((entry) => {
+      // Remplace <stamp> par *
+      let e = entry.replace(/<stamp>/g, "*")
+      // Chemin absolu : on garde tel quel (même hors PROJECT)
+      if (e.startsWith("/")) return e
+      // Chemin relatif : on résout contre PROJECT
+      return PROJECT + "/" + e
+    })
+}
+
+// Parse la liste `- Outils:` : compare le premier mot de la commande et son basename
+// aux entrées (elles-mêmes basenamées). `git` autorisé en entier.
+// `aucun (lecture seule)` = zéro shell.
+function outilsList(step) {
+  const raw = String(step && step.outils ? step.outils : "")
+    .split(/,|·|\n/)
+    .map((s) => s.trim().replace(/^`|`$/g, ""))
+    .filter(Boolean)
+  // "aucun (lecture seule)" → liste vide = interdire tout shell
+  if (raw.length === 1 && /^aucun\s*\(lecture\s*seule\)$/i.test(raw[0])) {
+    return { allowAll: false, entries: [] }
+  }
+  // Normalise chaque entrée : prend le premier token (après assignations et wrappers env/time)
+  // et son basename — exactement comme firstWord() le fait pour la commande exécutée.
+  const entries = raw.map((e) => baseName(firstWord(e)))
+  return { allowAll: false, entries }
+}
+
+// Vérifie si une commande shell est autorisée par la liste Outils de l'étape
+function outilsAllow(cmd, step) {
+  const { allowAll, entries } = outilsList(step)
+  if (entries.length === 0) return false // "aucun (lecture seule)" ou liste vide
+  const segs = segments(cmd)
+  for (const seg of segs) {
+    const fw = firstWord(seg)
+    if (!fw) continue
+    const base = baseName(fw)
+    // git : autorisé en entier (premier mot complet)
+    if (fw === "git") continue
+    // Match sur premier mot complet ou son basename
+    let ok = false
+    for (const e of entries) {
+      if (fw === e || base === e) { ok = true; break }
+    }
+    if (!ok) return false
+  }
+  return true
 }
 
 // ---------- gate `- Après:` ----------
@@ -1255,42 +1315,65 @@ function stepDiag(txt, agent) {
 }
 
 // ---------- binding subagent → manifest ----------
-
+//
+// L'id d'étape vient du prompt de spawn (étape <id>), stocké dans PENDING au lancement.
+// bindWorker utilise cet id au lieu de re-détecter l'étape active.
+// Résolution parent/enfant : le worker appelle avec son sid (enfant). L'entrée pending
+// porte le sid du spawner (parent). On résout via POOL.load() : child === sid → son parent.
 function bindWorker(sid, writingPath) {
   const known = readJson(KNOWN, {})
   if (known[sid]) return { ...known[sid], ambiguous: false }
   const pending = readJson(PENDING, []).filter((e) => Date.now() - (e.at || 0) < PENDING_TTL)
-  const candidates = pending.filter((e) => e.agent === "worker" || e.agent === "webnav")
+
+  // 1) Cherche d'abord une entrée pending dont le sid MATCH l'enfant (cas direct)
+  let candidates = pending.filter((e) => (e.agent === "worker" || e.agent === "webnav") && e.sid === sid)
+
+  // 2) Sinon, résout le parent via POOL : cherche un slot dont child === sid, prend son parent
+  if (candidates.length === 0) {
+    const live = POOL.load()
+    for (const slot of live) {
+      if (String(slot.child || "") === sid && slot.parent) {
+        const parentSid = String(slot.parent)
+        candidates = pending.filter((e) => (e.agent === "worker" || e.agent === "webnav") && e.sid === parentSid)
+        break
+      }
+    }
+  }
   if (candidates.length === 0) return null
 
-  // If writingPath is provided, deterministically match by scope
+  // If writingPath is provided, deterministically match by scope using stored stepId
   if (writingPath) {
     const normPath = writingPath.replace(/^\.\./, "").replace(/^\.\//, "")
     const matching = []
     for (const c of candidates) {
       const txt = readText(c.manifest)
       if (!txt) continue
-      const agent = c.agent
-      const step = activeStep(txt, agent)
+      // Utilise l'id d'étape stocké au spawn (depuis le prompt "étape <id>")
+      const stepId = c.stepId
+      if (!stepId) continue
+      const steps = parseSteps(txt).filter((s) => !s.superseded)
+      const step = steps.find((s) => s.id === stepId)
       if (!step) continue
       const scope = scopeList(step)
       if (scope.length && inScope(normPath, scope)) {
+        // Mute l'entrée au lieu de la copier : ajoute stepId pour la traçabilité
+        c.stepId = stepId
         matching.push(c)
       }
     }
     if (matching.length === 1) {
       const entry = matching[0]
-      writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, at: Date.now() } })
+      writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, stepId: entry.stepId, at: Date.now() } })
       writeJson(PENDING, pending.filter((e) => e !== entry))
-      return { agent: entry.agent, manifest: entry.manifest, ambiguous: false }
+      return { agent: entry.agent, manifest: entry.manifest, stepId: entry.stepId, ambiguous: false }
     }
     if (matching.length === 0 && candidates.length === 1) {
       // Single pending manifest but no scope match (e.g. multiple open steps, or path outside scope)
       // Bind to it but mark ambiguous so scope check is skipped with "liaison ambiguë" note
       const entry = candidates[0]
-      writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, at: Date.now() } })
+      writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, stepId: entry.stepId, at: Date.now() } })
       writeJson(PENDING, pending.filter((e) => e !== entry))
-      return { agent: entry.agent, manifest: entry.manifest, ambiguous: true }
+      return { agent: entry.agent, manifest: entry.manifest, stepId: entry.stepId, ambiguous: true }
     }
     if (matching.length > 1) {
       // Multiple manifests match the path: do NOT guess, do NOT bind
@@ -1300,19 +1383,20 @@ function bindWorker(sid, writingPath) {
     return null
   }
 
-  // No writingPath provided: fall back to single pending entry
-  if (candidates.length === 1) {
-    const entry = candidates[0]
-    writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, at: Date.now() } })
+  // No writingPath provided: fall back to single pending entry FOR THIS SID
+  const myCandidates = candidates.filter((c) => c.sid === sid)
+  if (myCandidates.length === 1) {
+    const entry = myCandidates[0]
+    writeJson(KNOWN, { ...known, [sid]: { agent: entry.agent, manifest: entry.manifest, stepId: entry.stepId, at: Date.now() } })
     writeJson(PENDING, pending.filter((e) => e !== entry))
-    return { agent: entry.agent, manifest: entry.manifest, ambiguous: false }
+    return { agent: entry.agent, manifest: entry.manifest, stepId: entry.stepId, ambiguous: false }
   }
   return null
 }
 
-function rememberSpawn(agent, manifest) {
+function rememberSpawn(agent, manifest, stepId, spawnSid) {
   const pending = readJson(PENDING, []).filter((e) => Date.now() - (e.at || 0) < PENDING_TTL)
-  pending.push({ agent, manifest, at: Date.now() })
+  pending.push({ agent, manifest, stepId, sid: spawnSid, at: Date.now() })
   writeJson(PENDING, pending)
 }
 
@@ -1868,6 +1952,22 @@ export function check(input) {
                     "Périmètre gravé pour l'étape " + step.id + " : " + src.scope + " — reçu : " + step.scope + ". Pour changer le périmètre, édite le fichier Recurring."
                   )
                 }
+                // Écrit : compare les listes normalisées (chemins absolus, <stamp> → *)
+                const srcEcrit = ecritList(src).sort().join(",")
+                const curEcrit = ecritList(step).sort().join(",")
+                if (srcEcrit !== curEcrit) {
+                  blocked.push(
+                    "Écrit gravé pour l'étape " + step.id + " : " + srcEcrit + " — reçu : " + curEcrit + ". Pour changer la liste Écrit, édite le fichier Recurring."
+                  )
+                }
+                // Outils : compare les listes normalisées (premier token + basename)
+                const srcOutils = outilsList(src).entries.sort().join(",")
+                const curOutils = outilsList(step).entries.sort().join(",")
+                if (srcOutils !== curOutils) {
+                  blocked.push(
+                    "Outils gravé pour l'étape " + step.id + " : " + srcOutils + " — reçu : " + curOutils + ". Pour changer la liste Outils, édite le fichier Recurring."
+                  )
+                }
               }
             }
             // Note d'audit pour chaque refus recurring-drift
@@ -1993,8 +2093,8 @@ export function check(input) {
       }
       if (!blocked.length) {
         const m = cleanModelId(String(args.model || ""))
+        const st = step // utilise l'étape résolue (Point 4)
         if (m) {
-          const st = step // utilise l'étape résolue (Point 4)
           const refused = POOL.add(m, {
             sessionID: String(args.sessionID || args.session_id || sid),
             parent: sid,
@@ -2006,7 +2106,7 @@ export function check(input) {
           })
           if (refused) blocked.push(refused)
         }
-        rememberSpawn(sub, manifestPath)
+        rememberSpawn(sub, manifestPath, st ? st.id : "", sid)
       }
     }
     // A. Verrou de nuit : blocage question pour orchestrator
@@ -2067,8 +2167,13 @@ export function check(input) {
           break
         }
         if (/^(python3?|uv|poetry)$/.test(w) && !/-m\s+(pytest|unittest)/.test(seg)) {
-          blocked.push("script python ad hoc interdit au reviewer : lance les tests (pytest -q)")
-          break
+          // Autoriser gsheet_append.py --list (sans --init, --rows, --rows-file) pour le reviewer
+          if (/gsheet_append\.py/.test(seg) && /--list\b/.test(seg) && !/--init\b/.test(seg) && !/--rows\b/.test(seg) && !/--rows-file\b/.test(seg)) {
+            // ok : liste blanche pour --list reviewer
+          } else {
+            blocked.push("script python ad hoc interdit au reviewer : lance les tests (pytest -q)")
+            break
+          }
         }
         if (w === "node" && nodeInlineBad(seg)) {
           blocked.push("node inline interdit au reviewer : -e/-p/--eval exécutent du code (" + seg + ")")
@@ -2187,6 +2292,27 @@ if (agent === "worker") {
       }
       if (/\bsudo\b|\bsystemctl\b/.test(cmd)) blocked.push("action système interdite au worker")
       if (/\bgit\s+push\b/.test(cmd)) blocked.push("git push interdit au worker")
+      // Sessions récurrentes : contrôle Outils (whitelist de commandes)
+      if (sid) {
+        const rec = recurringFor(sid) || sourceFromManifest(sid)
+        if (rec) {
+          const bound = bindWorker(sid, "")
+          if (bound && !bound.ambiguous && bound.stepId) {
+            const txt = readText(bound.manifest)
+            const steps = parseSteps(txt).filter((s) => !s.superseded)
+            const step = steps.find((s) => s.id === bound.stepId)
+            if (step && !outilsAllow(cmd, step)) {
+              blocked.push("hors Outils " + step.id + " : " + cmd + " (autorisé : " + outilsList(step).entries.join(", ") + ")")
+            }
+          } else if (bound && !bound.ambiguous) {
+            // Fallback : activeStep si pas de stepId lié
+            const step = activeStep(readText(bound.manifest), "worker")
+            if (step && !outilsAllow(cmd, step)) {
+              blocked.push("hors Outils " + step.id + " : " + cmd + " (autorisé : " + outilsList(step).entries.join(", ") + ")")
+            }
+          }
+        }
+      }
     }
     if (isWrite) {
       const path = firstPath(args)
@@ -2200,7 +2326,37 @@ if (agent === "worker") {
           notes.push("session worker non associée à une étape : contrôle de périmètre sauté")
         } else if (bound.ambiguous) {
           notes.push("liaison ambiguë : contrôle de périmètre sauté")
+        } else if (bound.stepId) {
+          const txt = readText(bound.manifest)
+          const steps = parseSteps(txt).filter((s) => !s.superseded)
+          const step = steps.find((s) => s.id === bound.stepId)
+          if (step) {
+            const scope = scopeList(step)
+            if (scope.length) {
+              if (!path) blocked.push("écriture sans chemin identifiable (périmètre " + step.id + ")")
+              else if (!inScope(path, scope)) blocked.push("hors périmètre " + step.id + " : " + path + " (autorisé : " + scope.join(", ") + ")")
+            } else notes.push("étape " + step.id + " sans périmètre : contrôle de périmètre sauté")
+            // Sessions récurrentes : contrôle Écrit (whitelist de chemins)
+            const rec = recurringFor(sid) || sourceFromManifest(sid)
+            if (rec) {
+              const ecrit = ecritList(step)
+              if (ecrit.length > 0) {
+                const normPath = normalizeUnderProject(absPath(path))
+                const absPathResolved = normPath || absPath(path)
+                let allowed = false
+                for (const pattern of ecrit) {
+                  // Glob segment par segment : /tmp/opencode/* matche /tmp/opencode/x.json mais pas /tmp/opencode-x.json
+                  const regex = new RegExp("^" + pattern.replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]") + "$")
+                  if (regex.test(absPathResolved)) { allowed = true; break }
+                }
+                if (!allowed) blocked.push("hors Écrit " + step.id + " : " + path + " (autorisé : " + ecrit.join(", ") + ")")
+              }
+            }
+          } else {
+            notes.push("étape liée introuvable dans le manifest : " + bound.stepId)
+          }
         } else {
+          // Fallback : activeStep si pas de stepId lié
           const step = activeStep(readText(bound.manifest), "worker")
           if (step) {
             const scope = scopeList(step)
@@ -2208,6 +2364,22 @@ if (agent === "worker") {
               if (!path) blocked.push("écriture sans chemin identifiable (périmètre " + step.id + ")")
               else if (!inScope(path, scope)) blocked.push("hors périmètre " + step.id + " : " + path + " (autorisé : " + scope.join(", ") + ")")
             } else notes.push("étape " + step.id + " sans périmètre : contrôle de périmètre sauté")
+            // Sessions récurrentes : contrôle Écrit (whitelist de chemins)
+            const rec = recurringFor(sid) || sourceFromManifest(sid)
+            if (rec) {
+              const ecrit = ecritList(step)
+              if (ecrit.length > 0) {
+                const normPath = normalizeUnderProject(absPath(path))
+                const absPathResolved = normPath || absPath(path)
+                let allowed = false
+                for (const pattern of ecrit) {
+                  // Glob segment par segment : /tmp/opencode/* matche /tmp/opencode/x.json mais pas /tmp/opencode-x.json
+                  const regex = new RegExp("^" + pattern.replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]") + "$")
+                  if (regex.test(absPathResolved)) { allowed = true; break }
+                }
+                if (!allowed) blocked.push("hors Écrit " + step.id + " : " + path + " (autorisé : " + ecrit.join(", ") + ")")
+              }
+            }
           } else {
             notes.push("plusieurs étapes worker actives : contrôle de périmètre sauté")
           }
