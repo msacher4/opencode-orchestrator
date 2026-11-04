@@ -1,5 +1,6 @@
 // runs-logic.ts — module pur, ZÉRO import
-// Exporte : RunRow, RunGroup, buildRuns, formatAge, summarize
+// Exporte : RunRow, RunGroup, buildRuns, formatAge, summarize,
+//           dialogSize, contentWidth, shortModel, stripAgentTag, sessionRow
 // Signatures et règles exactes de la spec §runs-logic.ts
 
 export type RunRow = {
@@ -273,4 +274,96 @@ export function summarize(groups: RunGroup[]): { total: number; running: number 
     }
   }
   return { total, running }
+}
+
+/**
+ * Taille du dialog selon la largeur du terminal.
+ * - cols >= 128 -> "xlarge" / 116
+ * - cols >= 96  -> "large"  / 88
+ * - sinon       -> "medium" / 60
+ * Entrée invalide (NaN, <= 0, non-number) -> "medium" / 60. Jamais d'exception.
+ */
+export function dialogSize(cols: number): { size: "medium" | "large" | "xlarge"; width: number } {
+  const valid = typeof cols === "number" && isFinite(cols) && cols > 0
+  if (valid && cols >= 128) return { size: "xlarge", width: 116 }
+  if (valid && cols >= 96) return { size: "large", width: 88 }
+  return { size: "medium", width: 60 }
+}
+
+/**
+ * Largeur de contenu disponible dans le dialog.
+ * Math.max(30, Math.min(d.width, cols - 2) - 6). Jamais d'exception.
+ */
+export function contentWidth(d: { width: number }, cols: number): number {
+  const w = d && typeof d.width === "number" && isFinite(d.width) ? d.width : 0
+  const c = typeof cols === "number" && isFinite(cols) ? cols : 0
+  return Math.max(30, Math.min(w, c - 2) - 6)
+}
+
+/**
+ * Nom court d'un modèle : segment après le dernier "/" si présent ;
+ * "" ou "?" -> "?" ; longueur > 20 -> 19 premiers caractères + "…".
+ */
+export function shortModel(model: string): string {
+  let m = typeof model === "string" ? model : ""
+  if (m === "" || m === "?") return "?"
+  const idx = m.lastIndexOf("/")
+  if (idx >= 0) m = m.slice(idx + 1)
+  if (m === "") return "?"
+  if (m.length > 20) m = m.slice(0, 19) + "…"
+  return m
+}
+
+/**
+ * Retire un suffixe de la forme " (@<n'importe quoi> subagent)" en fin de
+ * chaîne, puis trim(). Titre vide -> "?".
+ */
+export function stripAgentTag(title: string): string {
+  let t = typeof title === "string" ? title : ""
+  t = t.replace(/\s*\(@[^()]*\s+subagent\)\s*$/, "")
+  t = t.trim()
+  return t === "" ? "?" : t
+}
+
+/**
+ * Compose la ligne d'une session : title (lane + ●/· + titre nettoyé) et
+ * detail (detailLane + agent · model · âge · idCourt [, parent] [, via]).
+ * Le tout tronqué à opts.width avec "…". Champs manquants -> "?". Jamais d'exception.
+ */
+export function sessionRow(row: RunRow, opts: {
+  now: number
+  lane: string
+  detailLane: string
+  width: number
+  parentTitle?: string
+  via?: string
+}): { title: string; detail: string } {
+  const width = typeof opts?.width === "number" && isFinite(opts.width) && opts.width > 0
+    ? Math.floor(opts.width)
+    : 0
+  const lane = typeof opts?.lane === "string" ? opts.lane : ""
+  const detailLane = typeof opts?.detailLane === "string" ? opts.detailLane : ""
+  const agent = row && typeof row.agent === "string" && row.agent ? row.agent : "?"
+  const model = row && typeof row.model === "string" && row.model ? row.model : "?"
+  const title = row && typeof row.title === "string" && row.title ? row.title : "?"
+  const id = row && typeof row.id === "string" && row.id ? row.id : "?"
+  const updated = row && typeof row.updated === "number" && isFinite(row.updated) ? row.updated : 0
+  const now = typeof opts?.now === "number" && isFinite(opts.now) ? opts.now : 0
+  const running = Boolean(row && row.running === true)
+  const parentTitle = typeof opts?.parentTitle === "string" && opts.parentTitle ? opts.parentTitle : undefined
+  const via = typeof opts?.via === "string" && opts.via ? opts.via : undefined
+
+  // idCourt = "ses_" + 8 premiers caractères de l'id sans son préfixe "ses_"
+  const idCourt = id.startsWith("ses_") ? "ses_" + id.slice(4, 12) : id
+
+  const t = lane + (running ? "●" : "·") + " " + stripAgentTag(title)
+  const d = detailLane
+    + agent + " · " + shortModel(model) + " · " + formatAge(now - updated) + " · " + idCourt
+    + (parentTitle !== undefined ? " · parent : « " + parentTitle + " »" : "")
+    + (via !== undefined ? " · via " + via : "")
+
+  return {
+    title: t.length > width ? t.slice(0, width - 1) + "…" : t,
+    detail: d.length > width ? d.slice(0, width - 1) + "…" : d,
+  }
 }

@@ -2,7 +2,7 @@
 // Affiche les sessions actives (racines + subagents en arbre) avec kill vérifié.
 // Suit le modèle orch-ui (ctx.keymap.layer, ctx.ui.dialog, ctx.ui.slot).
 import { Plugin } from "@opencode/plugin/tui"
-import { buildRuns, formatAge, summarize, type RunRow, type RunGroup } from "./runs-logic.ts"
+import { buildRuns, summarize, dialogSize, contentWidth, sessionRow } from "./runs-logic.ts"
 import { buildAuth, parseService, mergeActive, instanceFor, type Instance } from "./instances.ts"
 import { readFileSync } from "node:fs"
 
@@ -16,28 +16,6 @@ function shortID(id: string): string {
 
 function shortKey(id: string): string {
   return `ses_${String(id || "").replace(/^ses_/, "").slice(0, 8)}`
-}
-
-function buildSessionLine(row: RunRow, isChild: boolean, parentTitle?: string): string {
-  const dot = row.running ? "●" : "·"
-  const agent = row.agent || "?"
-  const model = row.model || "?"
-  const age = formatAge(Date.now() - row.updated)
-  const title = (row.title || "?").slice(0, 48)
-  const prefix = isChild ? "  └ " : ""
-  return `${prefix}${dot} ${agent} · ${model} · il y a ${age} · ${title}`
-}
-
-function buildDescription(row: RunRow, parentTitle?: string, instanceLabel?: string): string {
-  const idShort = shortID(row.id)
-  let desc = idShort
-  if (parentTitle) {
-    desc += ` — parent: ${shortID(row.parentID || "?")} "${parentTitle}"`
-  }
-  if (instanceLabel) {
-    desc += ` (via ${instanceLabel})`
-  }
-  return desc
 }
 
 /* ───────── API helpers ───────── */
@@ -193,7 +171,13 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
   }
 
   for (;;) {
-    ctx.ui.dialog.set({ size: "large" })
+    // Taille du dialogue calculée depuis la largeur du terminal (≥128 → xlarge/116,
+    // ≥96 → large/88, sinon medium/60). Le renderer borne déjà la boîte à colonnes - 2.
+    const cols = Number(ctx.renderer?.width ?? process.stdout.columns)
+    const safeCols = Number.isFinite(cols) && cols >= 40 ? cols : 200
+    const d = dialogSize(safeCols)
+    ctx.ui.dialog.set({ size: d.size })
+    const w = contentWidth(d, safeCols)
 
     // Charger sessions (global) + active (fusion multi-instance)
     let sessions: any[] = []
@@ -260,7 +244,7 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
       disabled: true,
     })
 
-    // 2. Groupes : racine puis enfants préfixés "  └ "
+    // 2. Groupes : deux lignes par session (title en clair, description atténuée par le renderer)
     let lineCount = 0
     const MAX_LINES = all ? 50 : 200 // all a un plafond de 50 lignes
 
@@ -269,56 +253,66 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
 
       if (g.root) {
         // Racine
-        const rootInstanceLabel = owner[g.root.id] && owner[g.root.id] !== ownInstance.id ? owner[g.root.id] : undefined
-        const opt: any = {
-          title: buildSessionLine(g.root, false),
+        const rootVia = owner[g.root.id] && owner[g.root.id] !== ownInstance.id ? owner[g.root.id] : undefined
+        const root = sessionRow(g.root, { now: Date.now(), lane: "", detailLane: "  ", width: w, via: rootVia })
+        options.push({
+          title: root.title,
           value: { kind: "session", sessionID: g.root.id, groupParentID: g.parentID },
-          description: buildDescription(g.root, undefined, rootInstanceLabel),
+          description: root.detail,
           category: shortKey(g.parentID),
-        }
-        options.push(opt)
+        })
         lineCount++
 
         // Enfants
-        for (const child of g.children) {
+        for (let i = 0; i < g.children.length; i++) {
           if (lineCount >= MAX_LINES) break
-          const childInstanceLabel = owner[child.id] && owner[child.id] !== ownInstance.id ? owner[child.id] : undefined
-          const childOpt: any = {
-            title: buildSessionLine(child, true, g.root.title),
+          const child = g.children[i]
+          const isLast = i === g.children.length - 1
+          const childVia = owner[child.id] && owner[child.id] !== ownInstance.id ? owner[child.id] : undefined
+          const childRow = sessionRow(child, {
+            now: Date.now(),
+            lane: "  " + (isLast ? "└ " : "├ "),
+            detailLane: "  " + (isLast ? "    " : "│   "),
+            width: w,
+            parentTitle: g.root.title,
+            via: childVia,
+          })
+          options.push({
+            title: childRow.title,
             value: { kind: "session", sessionID: child.id, groupParentID: g.parentID },
-            description: buildDescription(child, g.root.title, childInstanceLabel),
+            description: childRow.detail,
             category: shortKey(g.parentID),
-          }
-          options.push(childOpt)
+          })
           lineCount++
         }
       } else {
-        // Groupe orphelin : ligne "(orphelin) parent — titre"
+        // Groupe orphelin : en-tête désactivé, puis enfants avec le titre du parent
         if (lineCount >= MAX_LINES) break
-        const firstChild = g.children[0]
-        const orphanInstanceLabel = owner[firstChild?.id] && owner[firstChild?.id] !== ownInstance.id ? owner[firstChild?.id] : undefined
-        const orphanTitle = `(orphelin) ${g.parentTitle} — ${firstChild?.title || "?"}`
-        const opt: any = {
-          title: `${firstChild?.running ? "●" : "·"} ${orphanTitle.slice(0, 60)}`,
-          value: { kind: "session", sessionID: firstChild?.id, groupParentID: g.parentID },
-          description: buildDescription(firstChild, g.parentTitle, orphanInstanceLabel),
-          category: shortKey(g.parentID),
-        }
-        options.push(opt)
-        lineCount++
+        options.push({
+          title: `(parent hors liste) ${g.parentTitle}`,
+          value: { kind: "orphan-header", groupParentID: g.parentID },
+          disabled: true,
+        })
 
-        // Enfants supplémentaires de l'orphelin
-        for (let i = 1; i < g.children.length; i++) {
+        for (let i = 0; i < g.children.length; i++) {
           if (lineCount >= MAX_LINES) break
           const child = g.children[i]
-          const childInstanceLabel = owner[child.id] && owner[child.id] !== ownInstance.id ? owner[child.id] : undefined
-          const childOpt: any = {
-            title: buildSessionLine(child, true, g.parentTitle),
+          const isLast = i === g.children.length - 1
+          const childVia = owner[child.id] && owner[child.id] !== ownInstance.id ? owner[child.id] : undefined
+          const childRow = sessionRow(child, {
+            now: Date.now(),
+            lane: "  " + (isLast ? "└ " : "├ "),
+            detailLane: "  " + (isLast ? "    " : "│   "),
+            width: w,
+            parentTitle: g.parentTitle,
+            via: childVia,
+          })
+          options.push({
+            title: childRow.title,
             value: { kind: "session", sessionID: child.id, groupParentID: g.parentID },
-            description: buildDescription(child, g.parentTitle, childInstanceLabel),
+            description: childRow.detail,
             category: shortKey(g.parentID),
-          }
-          options.push(childOpt)
+          })
           lineCount++
         }
       }
@@ -358,7 +352,7 @@ async function openRunsDialog(ctx: Ctx, all: boolean) {
 
     if (!choice || typeof choice !== "object") return
 
-    if (choice.kind === "cancel" || choice.kind === "empty" || choice.kind === "header") {
+    if (choice.kind === "cancel" || choice.kind === "empty" || choice.kind === "header" || choice.kind === "orphan-header") {
       return
     }
 

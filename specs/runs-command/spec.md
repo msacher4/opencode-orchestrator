@@ -86,6 +86,12 @@ export function buildRuns(input: {
 
 export function formatAge(ms: number): string
 export function summarize(groups: RunGroup[]): { total: number; running: number }
+
+export function dialogSize(cols: number): { size: "medium" | "large" | "xlarge"; width: number }
+export function contentWidth(d: { width: number }, cols: number): number
+export function shortModel(model: string): string
+export function stripAgentTag(title: string): string
+export function sessionRow(row: RunRow, opts: { now: number; lane: string; detailLane: string; width: number; parentTitle?: string; via?: string }): { title: string; detail: string }
 ```
 
 Règles :
@@ -113,6 +119,11 @@ Règles :
 7. `summarize` : `total` = nombre exact de lignes affichées = `(1 si root existe) + children.length`,
    **parents de contexte inclus** ; `running` = nombre de lignes avec `running === true`.
 8. Jamais d'exception sur une entrée malformée : champs manquants → `"?"`, tableaux vides → `[]`.
+9. `dialogSize(cols)` : `cols >= 128` → `{ size: "xlarge", width: 116 }` ; `cols >= 96` → `{ size: "large", width: 88 }` ; sinon `{ size: "medium", width: 60 }` ; entrée invalide (NaN, ≤0, non-number) → `{ size: "medium", width: 60 }`, jamais d'exception.
+10. `contentWidth(d, cols)` : `Math.max(30, Math.min(d.width, cols - 2) - 6)` (jamais d'exception).
+11. `shortModel(model)` : segment après le dernier `/` ; `"?"` ou vide → `"?"` ; longueur > 20 → 19 premiers caractères + `"…"`.
+12. `stripAgentTag(title)` : retire un suffixe ` (@<n'importe quoi> subagent)` en fin de chaîne, puis `trim()` ; titre vide → `"?"`.
+13. `sessionRow(row, opts)` : compose les deux lignes — `title` = `lane` + `●`/`·` + titre nettoyé (tronqué à width) ; `detail` = `detailLane` + `agent · modèle court · âge · id court`, puis ` · parent : « … »` et ` · via …` si fournis (tronqué à width).
 
 ## Détection multi-instance (correctif du 2026-10-29)
 
@@ -193,6 +204,7 @@ Attendu : `OK ["ses_a","ses_b"]` (code 0).
   `{data:{...}}` ou objet direct — accepter les deux) et de `GET {service.base}/api/session/active`
   (daemon, avec `Authorization: service.auth`). Utiliser `mergeActive` de `./instances.ts`.
   Une session est `running` si elle figure dans la fusion.
+- **Taille** : la taille du dialogue est choisie d'après la largeur du terminal (≥128 → 116, ≥96 → 88, sinon 60).
 - **Kill** : router vers l'instance propriétaire (`instanceFor`). Si c'est l'instance courante →
   `ctx.client.session.interrupt(...)` puis fallback REST local ; sinon → `POST {base}/api/session/{id}/interrupt`
   avec l'en-tête d'auth de cette instance. En dernier recours seulement, réessayer sur l'instance courante.
@@ -214,9 +226,9 @@ Attendu : `OK ["ses_a","ses_b"]` (code 0).
      précédés de `"  └ "` ;
   3. `"⛔ Tout arrêter (N)"` si plus d'une session active ;
   4. `"Annuler"`.
-- Format d'une ligne :
-  `(● ou ·) agent · model · il y a X · titre` (titre tronqué à 48 caractères),
-  `description` = `"ses_…47 — parent: ses_…12 \"titre parent\""`.
+- `title` = nom de la session seul, avec `●`/`·` et le préfixe d'arbre (`├ ` sauf le dernier enfant, `└ ` pour le dernier).
+- `description` = `agent · modèle court · âge · ses_xxxxxxxx`, plus `parent : « titre »` et `via <instance>` quand ces informations existent ; c'est `sessionRow` qui compose cette ligne entière, l'appelant ne recolle rien.
+- La couleur grise n'est pas codée (le renderer atténue le champ `description`).
 - Sélection d'une session → **confirmation obligatoire** (`dialog.select` :
   `"⛔ Kill cette session"` / `"Annuler"`) avant tout appel.
 - `⛔ Tout arrêter` → confirmation, puis interrupt séquentiel de chaque session active,
@@ -274,6 +286,25 @@ import("file:///media/marcs/Linux_Apps/Projets_AI/Opencodev2/config/opencode/plu
   });
   const flat = g2.reduce((acc, x) => acc.concat(x.root ? [x.root] : [], x.children), []);
   if (!flat.some((x) => x.id === "ses_g")) throw new Error("petit-enfant invisible");
+
+  // --- Assertions t3 : taille, largeur, modèles courts, tags, ligne ---
+  const ds = m.dialogSize(200);
+  if (ds.size !== "xlarge" || ds.width !== 116) throw new Error("dialogSize 200: " + JSON.stringify(ds));
+  const dl = m.dialogSize(100);
+  if (dl.size !== "large" || dl.width !== 88) throw new Error("dialogSize 100: " + JSON.stringify(dl));
+  const dm = m.dialogSize(70);
+  if (dm.size !== "medium" || dm.width !== 60) throw new Error("dialogSize 70: " + JSON.stringify(dm));
+  const dn = m.dialogSize(NaN);
+  if (dn.size !== "medium" || dn.width !== 60) throw new Error("dialogSize NaN: " + JSON.stringify(dn));
+  if (m.contentWidth({ width: 120 }, 128) !== 114) throw new Error("contentWidth: " + m.contentWidth({ width: 120 }, 128));
+  if (m.shortModel("p/m") !== "m") throw new Error("shortModel: " + m.shortModel("p/m"));
+  if (m.shortModel("?") !== "?") throw new Error("shortModel ?");
+  if (m.shortModel("") !== "?") throw new Error("shortModel vide");
+  if (m.stripAgentTag("Map fixer (@explore subagent)") !== "Map fixer") throw new Error("stripAgentTag: " + m.stripAgentTag("Map fixer (@explore subagent)"));
+  if (m.stripAgentTag("") !== "?") throw new Error("stripAgentTag vide");
+  const r = m.sessionRow({ id: "ses_abcdef12", agent: "build", model: "p/qwen3.8-27b", title: "Refonte du pipeline", updated: 12 * 60000, running: true }, { now: 100000, lane: "", detailLane: "  ", width: 110, parentTitle: "Parent", via: "service" });
+  if (typeof r.title !== "string" || typeof r.detail !== "string" || r.title.length === 0 || r.detail.length === 0) throw new Error("sessionRow");
+
   console.log("OK", JSON.stringify(s));
 });
 '
