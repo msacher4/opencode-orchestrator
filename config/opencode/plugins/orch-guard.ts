@@ -1023,6 +1023,7 @@ export function parseSteps(txt) {
       model: get(/^-\s*Mod[eè]le\s*:\s*(.+)$/im),
       ecrit: get(/^-\s*[ÉéEe]crit\s*:\s*(.+)$/im),
       outils: get(/^-\s*Outils\s*:\s*(.+)$/im),
+      verif: get(/^-\s*V[ée]rif\s*:\s*(.+)$/im),
       statut: get(/^-\s*Statut\s*:\s*(.+)$/im).toLowerCase(),
       verdict,
     }
@@ -1107,6 +1108,56 @@ function outilsAllow(cmd, step) {
     if (!ok) return false
   }
   return true
+}
+
+// Basenames des scripts .py déclarés dans `- Outils:` d'une étape.
+export function outilsScripts(step) {
+  return String(step && step.outils ? step.outils : "")
+    .split(/,|·|\n/)
+    .map((s) => s.trim().replace(/^`|`$/g, ""))
+    .filter(Boolean)
+    .flatMap((e) => e.split(/\s+/))
+    .filter((t) => /\.py$/.test(t))
+    .map((t) => baseName(t))
+}
+
+// Un reviewer peut lancer un script .py que SON étape déclare dans `- Outils:`.
+export function reviewerScriptAllowed(seg, step) {
+  const m = seg.match(/(?:^|\s)([^\s-][^\s]*\.py)\b/)
+  if (!m) return false
+  return outilsScripts(step).includes(baseName(m[1]))
+}
+
+// Comparaison normalisée d'un segment de commande (espaces compactés).
+function normCmd(s) {
+  return String(s || "").replace(/\s+/g, " ").trim()
+}
+
+// Segments de la `- Vérif:` de l'étape : la seule commande que le reviewer a le droit
+// de rejouer, telle qu'elle a été écrite et validée dans le manifest.
+export function verifSegments(step) {
+  const v = String(step && step.verif ? step.verif : "")
+  if (!v) return []
+  return segments(v).map(normCmd).filter(Boolean)
+}
+
+// Vrai si CE segment est l'un des segments de la Vérif de CETTE étape.
+export function verifAllowed(seg, step) {
+  const s = normCmd(seg)
+  return !!s && verifSegments(step).includes(s)
+}
+
+// Étape liée au reviewer : le slot du pool, rempli au spawn, porte déjà
+// `step` et `manifest` (POOL.add). On ne repasse pas par bindWorker : sans
+// chemin d'écriture, il compare le sid de l'enfant à `c.sid`, qui est celui
+// du parent, et rend null.
+export function reviewerStep(sid) {
+  if (!sid) return null
+  const bound = bindWorker(sid, "")
+  if (!bound || bound.ambiguous || !bound.stepId) return null
+  const txt = readText(bound.manifest)
+  if (!txt) return null
+  return parseSteps(txt).filter((s) => !s.superseded).find((s) => s.id === bound.stepId) || null
 }
 
 // ---------- gate `- Après:` ----------
@@ -1326,7 +1377,7 @@ function bindWorker(sid, writingPath) {
   const pending = readJson(PENDING, []).filter((e) => Date.now() - (e.at || 0) < PENDING_TTL)
 
   // 1) Cherche d'abord une entrée pending dont le sid MATCH l'enfant (cas direct)
-  let candidates = pending.filter((e) => (e.agent === "worker" || e.agent === "webnav") && e.sid === sid)
+  let candidates = pending.filter((e) => (e.agent === "worker" || e.agent === "webnav" || e.agent === "reviewer" || e.agent === "merger") && e.sid === sid)
 
   // 2) Sinon, résout le parent via POOL : cherche un slot dont child === sid, prend son parent
   if (candidates.length === 0) {
@@ -1334,7 +1385,7 @@ function bindWorker(sid, writingPath) {
     for (const slot of live) {
       if (String(slot.child || "") === sid && slot.parent) {
         const parentSid = String(slot.parent)
-        candidates = pending.filter((e) => (e.agent === "worker" || e.agent === "webnav") && e.sid === parentSid)
+        candidates = pending.filter((e) => (e.agent === "worker" || e.agent === "webnav" || e.agent === "reviewer" || e.agent === "merger") && e.sid === parentSid)
         break
       }
     }
@@ -2155,8 +2206,10 @@ export function check(input) {
         }
         const w = firstWord(seg)
         if (w && !READONLY_CMD.test(w) && !TEST_RUNNER.test(w)) {
-          blocked.push("seules la lecture et les runners de test sont autorisés au reviewer (" + w + ")")
-          break
+          if (!verifAllowed(seg, reviewerStep(sid))) {
+            blocked.push("seules la lecture et les runners de test sont autorisés au reviewer (" + w + ")")
+            break
+          }
         }
         if (w === "tar" && !tarOk(seg)) {
           blocked.push("tar refusé au reviewer : seule la liste d'une archive (tar -t) est lecture seule (" + seg + ")")
@@ -2170,6 +2223,8 @@ export function check(input) {
           // Autoriser gsheet_append.py --list (sans --init, --rows, --rows-file) pour le reviewer
           if (/gsheet_append\.py/.test(seg) && /--list\b/.test(seg) && !/--init\b/.test(seg) && !/--rows\b/.test(seg) && !/--rows-file\b/.test(seg)) {
             // ok : liste blanche pour --list reviewer
+          } else if (reviewerStep(sid) && (reviewerScriptAllowed(seg, reviewerStep(sid)) || verifAllowed(seg, reviewerStep(sid)))) {
+            // ok : script .py déclaré dans les `- Outils:` de l'étape liée au reviewer
           } else {
             blocked.push("script python ad hoc interdit au reviewer : lance les tests (pytest -q)")
             break
@@ -2542,7 +2597,20 @@ export default {
           if (!sid) continue
           if (type === "session.created") {
             const parent = String((ev && ev.data && ev.data.parentID) || "")
-            if (parent && sid) POOL.setChildByParent(parent, sid)
+            if (parent && sid) {
+              POOL.setChildByParent(parent, sid)
+              // Un spawn en background rend la main immédiatement : son slot est
+              // libéré (« fin spawn ») avant que l'enfant ne travaille, et la
+              // liaison enfant → étape disparaît avec lui. On la persiste dans
+              // KNOWN, que bindWorker lit en premier, pour les rôles qui n'ont
+              // aucun autre chemin de liaison.
+              const slot = POOL.load().find((s) => String(s.child || "") === sid)
+              if (slot && slot.manifest && slot.step && (slot.agent === "reviewer" || slot.agent === "merger")) {
+                const known = readJson(KNOWN, {})
+                known[sid] = { agent: slot.agent, manifest: slot.manifest, stepId: slot.step, at: Date.now() }
+                writeJson(KNOWN, known)
+              }
+            }
           } else if (
             type === "session.idle" ||
             type === "session.execution.succeeded" ||
