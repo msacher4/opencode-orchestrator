@@ -21,6 +21,7 @@
 // CE FICHIER EST RECHARGÉ À CHAUD : l'écrire toujours d'un seul coup. Une version
 // incohérente lève une erreur sur TOUS les tool calls de TOUTES les sessions.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { dirname, resolve, relative, sep } from "node:path"
 
@@ -1026,6 +1027,13 @@ export function parseSteps(txt) {
       verif: get(/^-\s*V[ée]rif\s*:\s*(.+)$/im),
       statut: get(/^-\s*Statut\s*:\s*(.+)$/im).toLowerCase(),
       verdict,
+      improvisée: get(/^-\s*Improvis[ée]e\s*:\s*(.+)$/im).toLowerCase(),
+      motif: get(/^-\s*Motif\s*:\s*(.+)$/im),
+      canal: get(/^-\s*canal\s*:\s*(.+)$/im),
+      child: get(/^-\s*Child\s*:\s*(.+)$/im),
+      question: get(/^-\s*Question\s*:\s*(.+)$/im),
+      reponse: get(/^-\s*R[ée]ponse\s*:\s*(.+)$/im),
+      reprise: get(/^-\s*Reprise\s*:\s*(.+)$/im),
     }
     if (step.id) {
       if (seen[step.id]) {
@@ -1262,6 +1270,28 @@ function auditRelectureQuestion(entry) {
   }
 }
 
+// Dernière session child connue pour une étape : lue dans le journal d'audit, qui survit aux
+// redémarrages — le slot, lui, est libéré à la fin du spawn et la mémoire disparaît avec lui.
+function lastChildOf(sid, stepId) {
+  let last = ""
+  for (const line of readText(AUDIT).split("\n")) {
+    const s = line.trim()
+    if (!s) continue
+    let e
+    try {
+      e = JSON.parse(s)
+    } catch {
+      continue
+    }
+    if (!e || e.kind !== "slot-release") continue
+    if (String(e.parent || "") !== String(sid || "")) continue
+    if (String(e.step || "") !== String(stepId || "")) continue
+    if (!String(e.child || "").trim()) continue
+    last = String(e.child).trim()
+  }
+  return last
+}
+
 // Dernière question « relire le plan à froid » tracée pour cette session, si elle existe.
 function lastRelectureQuestion(sid) {
   let last = null
@@ -1296,6 +1326,50 @@ function firstOpenWorker(txt) {
   return parseSteps(txt)
     .filter((s) => !s.superseded)
     .find((s) => s.qui === "worker" && !stepClosed(s)) || null
+}
+
+// Canal de radio : la carte d'une étape worker doit nommer son fichier de canal
+// (`- canal: <chemin>`), sinon le worker n'a aucun endroit où journaliser, poser ses
+// questions et répondre à la sonde — et l'orchestrateur croit que « ça ne communique pas ».
+// Le refus donne la ligne exacte à ajouter : un orchestrateur périmé apprend en le lisant.
+function canalGate(step, manifestPath) {
+  if (!step || step.qui !== "worker") return []
+  if (String(step.canal || "").trim()) return []
+  const dir = String(manifestPath || "").replace(/\/[^/]*$/, "")
+  return [
+    "carte worker sans canal : l'étape " + step.id + " n'a pas de ligne `- canal: <chemin>`. " +
+      "Ajoute `- canal: " + dir + "/canal-" + step.id + ".md` à sa carte, crée ce fichier vide, " +
+      "et dis au worker d'y journaliser une ligne `worker > HH:MM · <où> · <état>` à chaque checkpoint, " +
+      "d'y poser ses questions (`worker > QUESTION: …`, avant de travailler si un point est ambigu), " +
+      "et d'y répondre `worker > ÉTAT: …` quand il lit `orch > STATUT ?` — puis de continuer sa carte. " +
+      "N'oublie pas le veilleur (6.9) : pendant que l'étape tourne, réveille-toi ~toutes les 5 min, " +
+      "relis ce canal, poste une ligne de statut dans le chat, miroite chaque question et sa réponse " +
+      "(dans le chat ET dans `miroir-" + step.id + ".md`), et envoie un seul `[RADIO]` sur Telegram à " +
+      "`bloqué` ou en fin d'étape — jamais sur la `question` d'un worker : ta réponse t'appartient (6.7), " +
+      "et le guard relaie automatiquement tes propres appels à l'outil `question`.",
+  ]
+}
+
+// Continuation : une question ouverte n'accepte pas un spawn neuf. Le worker porte un contexte
+// (fichiers lus, code écrit, décisions prises) ; le relancer à neuf le lui fait tout refaire.
+// Le refus rend le `child` à passer, tel quel : l'orchestrateur n'a rien à retrouver.
+// Porte de sortie explicite : `- Reprise: neuve` sur l'étape (justifiée), pour le cas où la
+// continuation porterait une incompréhension de la carte ou une session morte.
+function continuationGate(step, args, sid) {
+  if (!step || step.qui !== "worker") return []
+  const child = String(step.child || "").trim() || lastChildOf(sid, step.id)
+  if (!child) return []
+  if (/neuve/i.test(String(step.reprise || ""))) return []
+  const asked = String((args && (args.sessionID || args.session_id)) || "").trim()
+  if (asked && asked === child) return []
+  return [
+    "continuation obligatoire : l'étape " + step.id + " a déjà une session child `" + child +
+      "` (spawn précédent, avec ou sans question). Relance-la avec `sessionID: \"" + child +
+      "\"` et un prompt minimal (`orch > Réponse: <réponse>` ou la consigne suivante, + « reprends " +
+      "au point où tu t'es arrêté — ne relis rien, ne recommence rien »), sans recopier la carte : " +
+      "un spawn neuf détruit son contexte et lui fait tout refaire. Si tu veux vraiment repartir " +
+      "de zéro, écris `- Reprise: neuve — <pourquoi>` sur l'étape.",
+  ]
 }
 
 // Refus (vide = gate franchi) pour la première carte worker non close. L'identité d'un
@@ -1501,6 +1575,7 @@ const POOL = {
           kind: "slot-release",
           reason: "TTL",
           step: String(s.step || ""),
+          child: String(s.child || ""),
           agent: String(s.agent || ""),
           model: String(s.model || ""),
           parent: String(s.parent || ""),
@@ -1647,6 +1722,7 @@ const POOL = {
         kind: "slot-release",
         reason,
         step: String(removed.step || ""),
+        child: String(removed.child || ""),
         agent: a,
         model: m,
         parent: p,
@@ -1687,6 +1763,7 @@ const POOL = {
         kind: "slot-release",
         reason,
         step: String(removed.step || ""),
+        child: String(removed.child || ""),
         agent: String(removed.agent || ""),
         model: String(removed.model || ""),
         parent: p,
@@ -1717,6 +1794,7 @@ const POOL = {
         kind: "slot-release",
         reason,
         step: String(removed.step || ""),
+        child: String(removed.child || ""),
         agent: String(removed.agent || ""),
         model: String(removed.model || ""),
         parent: String(removed.parent || ""),
@@ -1772,6 +1850,7 @@ const POOL = {
           kind: "slot-release",
           reason: reason || "étape close",
           step: String(s.step || ""),
+          child: String(s.child || ""),
           agent: String(s.agent || ""),
           model: String(s.model || ""),
           parent: String(s.parent || ""),
@@ -1890,7 +1969,11 @@ export function check(input) {
           break
         }
         const w = firstWord(seg)
-        if (w && !READONLY_CMD.test(w) && !(w === "node" && nodeCheckOk(seg))) {
+        // Envoi de la notification radio [RADIO] : seul script exécutable au frontière.
+        // `firstWord` renvoie un basename : on exige en plus le chemin exact (PROJECT).
+        // Le script fige le chat_id de Marc — aucune autre cible possible.
+        const radioSend = w === "send_telegram.sh" && String(seg).includes(PROJECT + "/.opencode/skills/contact_telegram/scripts/send_telegram.sh")
+        if (w && !radioSend && !READONLY_CMD.test(w) && !(w === "node" && nodeCheckOk(seg))) {
           blocked.push("seules les commandes de lecture sont autorisées au frontière (" + w + ")")
           break
         }
@@ -1986,9 +2069,15 @@ export function check(input) {
             } else {
               const src = srcSteps.find((s) => s.id === step.id)
               if (!src) {
-                blocked.push(
-                  "l'étape " + step.id + " n'existe pas dans le manifest récurrent gravé (" + rec.manifest + ") — un run récurrent ne peut pas ajouter d'étape. Édite le fichier Recurring."
-                )
+                // Vérifier si la carte candidate porte - Improvisée: oui avec - motif: non vide
+                const stepHasImprovisation = step.improvisée === "oui" && step.motif && step.motif.trim().length > 0
+                if (stepHasImprovisation) {
+                  notes.push("recurring-drift " + step.id + " (improvisée)")
+                } else {
+                  blocked.push(
+                    "l'étape " + step.id + " n'existe pas dans le manifest récurrent gravé (" + rec.manifest + ") — un run récurrent ne peut pas ajouter d'étape. Édite le fichier Recurring."
+                  )
+                }
               } else {
                 if (src.qui !== sub) {
                   blocked.push("Qui gravé pour l'étape " + step.id + " : « " + src.qui + " » — reçu « " + sub + " »")
@@ -2138,6 +2227,23 @@ export function check(input) {
             if (relectureRefusals.length) {
               blocked.push(...relectureRefusals)
               notes.push("relecture refusée pour l'étape " + step.id)
+            }
+          }
+          // Canal de radio : un worker ne peut pas être muet (voir canalGate).
+          if (step.qui === "worker") {
+            const canalRefusals = canalGate(step, manifestPath)
+            if (canalRefusals.length) {
+              blocked.push(...canalRefusals)
+              notes.push("canal refusé pour l'étape " + step.id)
+            }
+          }
+          // Relance d'une question ouverte : continuation de la session child, jamais un spawn
+          // neuf (voir continuationGate).
+          if (step.qui === "worker") {
+            const contRefusals = continuationGate(step, args, sid)
+            if (contRefusals.length) {
+              blocked.push(...contRefusals)
+              notes.push("continuation refusée pour l'étape " + step.id)
             }
           }
         }
@@ -2461,6 +2567,145 @@ export default {
       POOL.purgeClosedSteps()
       const agent = input && input.agent ? String(input.agent) : ""
       if (!AGENTS.has(agent)) return
+
+      // Radio : la question de l'orchestrateur à Marc — le seul relais vers Telegram.
+      // Best-effort : ne lève jamais, ne modifie jamais args ni le flux de l'outil.
+      try {
+        const tool = String((input && input.tool) || "")
+        if (agent === "orchestrator") {
+          // Dédup : clé = sha1(header + "\n" + resume) sur 16 car. — un même intitulé portant
+          // deux questions distinctes ne se neutralise plus, et trois questions sous le même
+          // header n'en donnent plus qu'une.
+          const radioDkey = (h, r) => createHash("sha1").update(String(h) + "\n" + String(r)).digest("hex").slice(0, 16)
+          const radioSeen = (dkey) => {
+            const seen = readText(AUDIT).split("\n")
+            const now = Date.now()
+            for (let i = 0; i < seen.length; i++) {
+              const raw = String(seen[i])
+              if (!raw) continue
+              try {
+                const e = JSON.parse(raw)
+                if (
+                  e &&
+                  e.kind === "radio" &&
+                  String(e.source || "") === "orchestrator-question" &&
+                  String(e.dkey || "") === dkey
+                ) {
+                  const at = Date.parse(String(e.at || ""))
+                  if (Number.isFinite(at) && now - at < 10 * 60 * 1000) return true
+                }
+              } catch {
+                // ligne d'audit non JSON : on ignore
+              }
+            }
+            return false
+          }
+          const radioEnvoyer = (texte, dkey, qh, relance) => {
+            const radioResult = spawnSync("bash", [PROJECT + "/.opencode/skills/contact_telegram/scripts/send_telegram.sh", "--silent"], {
+              input: texte,
+              encoding: "utf8",
+              timeout: 15000,
+            })
+            audit({
+              kind: "radio",
+              source: "orchestrator-question",
+              header: qh,
+              dkey,
+              relance: !!relance,
+              exit: radioResult && radioResult.status != null ? radioResult.status : -1,
+            })
+          }
+
+          if (tool === "question") {
+            const radioArgs = (input && input.input) || {}
+            const liste = Array.isArray(radioArgs.questions) ? radioArgs.questions : (radioArgs.question || radioArgs.header ? [radioArgs] : [])
+            const rq = liste.filter((q) => q && typeof q === "object").slice(0, 3)
+            const header = String((rq[0] && rq[0].header) || "")
+            const resume = rq.map((q) => String(q.question || "")).filter(Boolean).join(" | ")
+            // Garde-fou : rien à relayer (header et resume vides) → on n'envoie pas de message vide.
+            // Pas de `return` ici : il sortirait du hook et sauterait check(input) — donc tout le guard.
+            const radioVide = header === "" && resume === ""
+            if (radioVide) audit({ kind: "radio-debug", keys: Object.keys(radioArgs).join(","), sample: JSON.stringify(radioArgs).slice(0, 200) })
+
+            if (!radioVide) {
+              // Une question = un message : autant d'envois que d'entrées dans `questions`,
+              // chacun portant son header, ses options et son dépôt dans radio-pending.json.
+              const sid = sessionId(input)
+              const mp = manifestFor(sid)
+              // Même prédicat que firstOpenWorker (worker non close, non superseded) + canal exigé.
+              const wsteps = mp ? parseSteps(readText(mp)).filter((s) => !s.superseded && s.qui === "worker" && !stepClosed(s)) : []
+              const wstep = wsteps.find((s) => String(s.canal || "").trim()) || null
+              const canal = wstep ? String(wstep.canal || "").trim() : ""
+              const stepId = wstep ? String(wstep.id || "") : ""
+              for (let qi = 0; qi < rq.length; qi++) {
+                const q = rq[qi]
+                const qh = String(q.header || "")
+                const qr = String(q.question || "")
+                // Libellés d'options : label seul (jamais le description), 140 car. max chacun.
+                const labels = (Array.isArray(q.options) ? q.options : [])
+                  .map((o) => (o && typeof o === "object" ? String(o.label || "") : String(o || "")))
+                  .map((s) => s.trim().slice(0, 140))
+                  .filter(Boolean)
+                const bloc = labels.length ? "\nRéponses possibles :\n" + labels.map((l, i) => i + 1 + ") " + l).join("\n") : ""
+                // Budget total par message : 1500 car. (le script en accepte 4000).
+                const texte = ("[RADIO] question à Marc — " + qh + " : " + qr + bloc).slice(0, 1500)
+                const dkey = radioDkey(qh, qr)
+                if (radioSeen(dkey)) continue
+                radioEnvoyer(texte, dkey, qh, false)
+                // Dépôt de la réponse : radio-pending.json en lecture-écriture — entrée ajoutée,
+                // purge de celles de plus de 60 min (au-delà, la réponse n'est plus routée).
+                try {
+                  const pendingPath = PROJECT + "/.opencode/radio-pending.json"
+                  const pend = readJson(pendingPath, { entries: [] })
+                  const entries = Array.isArray(pend && pend.entries) ? pend.entries : []
+                  const now = Date.now()
+                  entries.push({ sid, canal, step: stepId, header: qh, question: qr, at: now, relance: false })
+                  writeJson(pendingPath, { entries: entries.filter((e) => e && Number.isFinite(e.at) && now - e.at <= 60 * 60 * 1000) })
+                } catch {
+                  // le dépôt est best-effort : jamais de levée ici
+                }
+              }
+            }
+          }
+
+          // Relance unique (décision Marc) : à chaque exécution du bloc radio, une entrée de
+          // radio-pending.json vieille d'au moins 10 min et `relance: false` repart UNE SEULE
+          // fois (« ⏳ Toujours en attente de ta réponse : <header> », budget 350) puis passe à
+          // true ; les entrées de plus de 60 min sont purgées sans relance. Jamais de 2e.
+          try {
+            const pendingPath = PROJECT + "/.opencode/radio-pending.json"
+            const pend = readJson(pendingPath, { entries: [] })
+            const entries = Array.isArray(pend && pend.entries) ? pend.entries : []
+            const now = Date.now()
+            const kept = []
+            let ecrit = false
+            for (const e of entries) {
+              if (!e || !Number.isFinite(e.at)) {
+                ecrit = true
+                continue
+              }
+              if (now - e.at > 60 * 60 * 1000) {
+                ecrit = true
+                continue // expirée : purgée sans relance
+              }
+              if (!e.relance && now - e.at >= 10 * 60 * 1000) {
+                const eh = String(e.header || "")
+                const texte = ("⏳ Toujours en attente de ta réponse : " + eh).slice(0, 350)
+                const dkey = radioDkey(eh, texte)
+                if (!radioSeen(dkey)) radioEnvoyer(texte, dkey, eh, true)
+                e.relance = true // jamais de deuxième relance
+                ecrit = true
+              }
+              kept.push(e)
+            }
+            if (ecrit) writeJson(pendingPath, { entries: kept })
+          } catch {
+            // la relance est best-effort : jamais de levée ici
+          }
+        }
+      } catch {
+        // jamais de levée ici
+      }
 
       const detResult = check(input)
       const result = await jevSecondOpinion(input, detResult)
