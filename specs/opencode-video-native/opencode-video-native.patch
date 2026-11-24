@@ -1,0 +1,213 @@
+diff --git a/packages/core/src/mime.ts b/packages/core/src/mime.ts
+index cbbdd45..8e631df 100644
+--- a/packages/core/src/mime.ts
++++ b/packages/core/src/mime.ts
+@@ -19,6 +19,8 @@ export function detectMedia(bytes: Uint8Array) {
+   if (startsWith(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf"
+   if (startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes.subarray(8), [0x57, 0x45, 0x42, 0x50]))
+     return "image/webp"
++  if (startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes.subarray(8), [0x57, 0x45, 0x42, 0x4d]))
++    return "video/webm"
+   if (bytes.length >= 12 && ascii(bytes, 4, 8) === "ftyp") {
+     // AVIF, HEIC, QuickTime and M4A share MP4's container; the major brand tells them apart, and generic HEIF brands
+     // list `avif`/`avis` among the compatible brands that follow the minor version.
+diff --git a/packages/core/src/session/prompt.ts b/packages/core/src/session/prompt.ts
+index 1ce940e..d839133 100644
+--- a/packages/core/src/session/prompt.ts
++++ b/packages/core/src/session/prompt.ts
+@@ -9,6 +9,7 @@ import { FSUtil } from "@opencode/util/fs-util"
+ import { Effect, Option, Schema } from "effect"
+ import path from "path"
+ import { fileURLToPath } from "url"
++import { Config } from "../config.js"
+ import { Database } from "../database/database.js"
+ import { Image } from "../image.js"
+ import { Mime } from "../mime.js"
+@@ -117,13 +118,14 @@ const materializeAttachment = Effect.fn("SessionPrompt.materializeAttachment")(f
+         mime: undefined,
+       }
+     : yield* readFileAttachment(input.uri)
+-  if (resolved.bytes.byteLength > MAX_ATTACHMENT_BYTES)
++  const mime = resolved.mime ?? Mime.detect(resolved.bytes)
++  const limit = yield* attachmentLimit(mime)
++  if (resolved.bytes.byteLength > limit)
+     return yield* new AttachmentError({
+       uri: label,
+-      message: `Attachment exceeds the ${MAX_ATTACHMENT_BYTES} byte limit: ${label}`,
++      message: `Attachment exceeds the ${limit} byte limit: ${label}`,
+     })
+ 
+-  const mime = resolved.mime ?? Mime.detect(resolved.bytes)
+   const content =
+     mime === "text/plain" && resolved.start !== undefined
+       ? Buffer.from(
+@@ -210,10 +212,11 @@ const readFileAttachment = Effect.fn("SessionPrompt.readFileAttachment")(functio
+     }
+   }
+   if (info.type !== "File") return yield* new AttachmentError({ uri, message: `Attachment is not a file: ${uri}` })
+-  if (Number(info.size) > MAX_ATTACHMENT_BYTES)
++  const ceiling = yield* attachmentCeiling()
++  if (Number(info.size) > ceiling)
+     return yield* new AttachmentError({
+       uri,
+-      message: `Attachment exceeds the ${MAX_ATTACHMENT_BYTES} byte limit: ${uri}`,
++      message: `Attachment exceeds the ${ceiling} byte limit: ${uri}`,
+     })
+   const bytes = yield* fs
+     .readFile(target)
+@@ -223,6 +226,22 @@ const readFileAttachment = Effect.fn("SessionPrompt.readFileAttachment")(functio
+ 
+ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+ 
++// A video may be larger than the general attachment limit, but only when the config says so. The
++// stat pre-check reads against the largest allowance; the per-type limit applies after the sniff.
++const attachmentCeiling = Effect.fn("SessionPrompt.attachmentCeiling")(function* () {
++  const config = yield* Effect.serviceOption(Config.Service)
++  if (Option.isNone(config)) return MAX_ATTACHMENT_BYTES
++  const max = Config.latest(yield* config.value.entries(), "media")?.video?.max_bytes
++  return max === undefined ? MAX_ATTACHMENT_BYTES : Math.max(MAX_ATTACHMENT_BYTES, max)
++})
++
++const attachmentLimit = Effect.fn("SessionPrompt.attachmentLimit")(function* (mime: string) {
++  if (!mime.startsWith("video/")) return MAX_ATTACHMENT_BYTES
++  const config = yield* Effect.serviceOption(Config.Service)
++  if (Option.isNone(config)) return MAX_ATTACHMENT_BYTES
++  return Config.latest(yield* config.value.entries(), "media")?.video?.max_bytes ?? MAX_ATTACHMENT_BYTES
++})
++
+ // A data URL is the whole file; errors and logs must name the attachment, not echo its bytes.
+ function attachmentLabel(input: PromptInput.FileAttachment) {
+   return input.name ?? (input.uri.startsWith("data:") ? "inline attachment" : input.uri)
+diff --git a/packages/core/src/session/runner/to-llm-message.ts b/packages/core/src/session/runner/to-llm-message.ts
+index b45fb8e..a9028f5 100644
+--- a/packages/core/src/session/runner/to-llm-message.ts
++++ b/packages/core/src/session/runner/to-llm-message.ts
+@@ -18,6 +18,10 @@ import { SessionRecentText } from "../recent-text.js"
+ import type { FileAttachment } from "@opencode/schema/prompt"
+ 
+ const imageMimes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
++// Video reaches the provider as inline media, the way images do; a model without video input gets the
++// short note from `SessionModelRequest.unsupportedMedia` instead.
++const videoMimes = new Set(["video/mp4", "video/webm", "video/quicktime"])
++const mediaMimes = new Set([...imageMimes, ...videoMimes])
+ 
+ const media = (file: FileAttachment): MediaPart => ({
+   type: "media",
+@@ -63,7 +67,7 @@ const directoryAttachment = (file: FileAttachment): TextPart => ({
+ const attachmentContent = (file: FileAttachment): Array<TextPart | MediaPart> => {
+   if (file.mime === "text/plain") return [textAttachment(file)]
+   if (file.mime === "application/x-directory") return [directoryAttachment(file)]
+-  if (imageMimes.has(file.mime) || file.mime === "application/pdf") {
++  if (mediaMimes.has(file.mime) || file.mime === "application/pdf") {
+     const location = attachmentLocation(file)
+     return [...(location === undefined ? [] : [Message.text(`Attached file: ${location}`)]), media(file)]
+   }
+diff --git a/packages/core/test/attachment-video.test.ts b/packages/core/test/attachment-video.test.ts
+new file mode 100644
+index 0000000..7ba52e7
+--- /dev/null
++++ b/packages/core/test/attachment-video.test.ts
+@@ -0,0 +1,86 @@
++import { describe, expect, test } from "bun:test"
++import { Message } from "@opencode/ai/effect"
++import { Model } from "@opencode/core/model"
++import { Mime } from "@opencode/core/mime"
++import { Provider } from "@opencode/core/provider"
++import { unsupportedParts } from "@opencode/core/session/model-request"
++import { SessionMessage } from "@opencode/core/session/message"
++import { toLLMMessages } from "@opencode/core/session/runner/to-llm-message"
++import { Base64, FileAttachment } from "@opencode/schema/prompt"
++import { DateTime } from "effect"
++import { pathToFileURL } from "url"
++
++const header = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"))
++const created = DateTime.makeUnsafe(0)
++const model = Model.Ref.make({ id: Model.ID.make("model"), providerID: Provider.ID.make("opencode-go") })
++const capabilities = (input: string[]) => ({ tools: true, input, output: ["text"] })
++
++const MP4 = "000000206674797069736f6d0000020069736f6d69736f32617663316d703431"
++const QUICKTIME = "00000014667479707174202000000200717420200000000877696465"
++const WEBM = "52494646240000005745424d5638504d0000000000000000"
++const WEBP = "524946461a000000574542505650384c0000000000000000"
++
++const userId = SessionMessage.ID.make("msg_video")
++const clip = (source: FileAttachment["source"]) =>
++  FileAttachment.make({
++    data: Base64.make(Buffer.from(MP4, "hex").toString("base64")),
++    mime: "video/mp4",
++    source,
++    name: "clip.mp4",
++  })
++const userMessage = (files: FileAttachment[]) =>
++  SessionMessage.User.make({
++    id: userId,
++    type: "user",
++    text: "Watch this",
++    files,
++    time: { created },
++  })
++
++describe("Mime.detect video containers", () => {
++  test("detects MP4, QuickTime and WebM from their bytes", () => {
++    expect(Mime.detect(header(MP4))).toBe("video/mp4")
++    expect(Mime.detect(header(QUICKTIME))).toBe("video/quicktime")
++    expect(Mime.detect(header(WEBM))).toBe("video/webm")
++  })
++
++  test("leaves the RIFF/WebP container to image/webp", () => {
++    expect(Mime.detect(header(WEBP))).toBe("image/webp")
++  })
++})
++
++describe("video attachments reach the model request", () => {
++  test("a video attachment becomes an inline video media part, with the file location", () => {
++    const uri = pathToFileURL("/project/clip.mp4").href
++    const [message] = toLLMMessages([userMessage([clip({ type: "uri", uri })])], model)
++    const content = message?.content ?? []
++    const media = content.flatMap((part) => (part.type === "media" ? [part] : []))
++
++    expect(message?.role).toBe("user")
++    expect(content).toContainEqual(Message.text("Attached file: /project/clip.mp4"))
++    expect(media.length).toBe(1)
++    expect(media[0]?.media.kind).toBe("video")
++    expect(media[0]?.media.mediaType).toBe("video/mp4")
++    expect(media[0]?.filename).toBe("clip.mp4")
++  })
++
++  test("a model without video input gets the short note in place of the part", () => {
++    const [message] = toLLMMessages([userMessage([clip({ type: "inline" })])], model)
++    const [replaced] = unsupportedParts([message!], capabilities(["text", "image"]), "opencode-go")
++    const text = replaced?.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
++
++    expect(text).toEqual([
++      "Watch this",
++      'ERROR: Cannot read "clip.mp4" (this model does not support video input). Inform the user.',
++    ])
++  })
++
++  test("a model with video input keeps the part", () => {
++    const [message] = toLLMMessages([userMessage([clip({ type: "inline" })])], model)
++    const [kept] = unsupportedParts([message!], capabilities(["text", "video"]), "opencode-go")
++    const media = (kept?.content ?? []).flatMap((part) => (part.type === "media" ? [part] : []))
++
++    expect(media.length).toBe(1)
++    expect(media[0]?.media.kind).toBe("video")
++  })
++})
+diff --git a/packages/schema/src/config/media.ts b/packages/schema/src/config/media.ts
+index ffba254..2bde979 100644
+--- a/packages/schema/src/config/media.ts
++++ b/packages/schema/src/config/media.ts
+@@ -10,6 +10,12 @@ export class Image extends Schema.Class<Image>("Config.Media.Image")({
+   max_base64_bytes: PositiveInt.pipe(optional),
+ }) {}
+ 
++export class Video extends Schema.Class<Video>("Config.Media.Video")({
++  /** Decoded bytes allowed per video attachment. Defaults to the 20 MiB attachment limit. */
++  max_bytes: PositiveInt.pipe(optional),
++}) {}
++
+ export class Info extends Schema.Class<Info>("Config.Media")({
+   image: Image.pipe(optional),
++  video: Video.pipe(optional),
+ }) {}

@@ -19,3 +19,6 @@ opencode-v2-plugins-prompt.txt
 # Exception orch-guard : le plugin vit sous config/opencode (ignoré par le motif générique « opencode »)
 !config/opencode/
 !config/opencode/**
+
+# Clone upstream anomalyco/opencode (chantier opencode-video-native, artefact de build jetable)
+opencode-src/
